@@ -13,6 +13,8 @@ The calibration library should follow these requirements:
   - length of checkerboard grids
   - picture of calibrated camera positions
   - undistorted images to check intrinsics
+- [ ] triangulation function
+- [ ] end to end function to calibrate full set of cameras from list of videos
 
 Nice to haves
 - [ ] reject outlier points
