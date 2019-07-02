@@ -44,7 +44,7 @@ def fix_rvec(rvec, tvec):
         forward = np.array([0, 0, 1])
         tnorm = T / np.linalg.norm(T)
         axis = np.cross(tnorm, forward)
-        angle = -2*math.acos(tnorm @ forward)
+        angle = -2*np.arccos(tnorm @ forward)
         R = cv2.Rodrigues(angle * axis)[0] @ R
 
     return cv2.Rodrigues(R)[0]
@@ -84,6 +84,52 @@ def merge_rows(all_rows, cam_names=None):
     return merged
 
 
+def extract_points(merged, board, cam_names=None, min_cameras=1):
+    """Takes a list of merged rows (output of merge_rows) and a board object.
+    Returns an array of object points and another array of image points, both of size CxNx2,
+    where C is the number of cameras, N is the number of points.
+    Optionally takes a list of cam_names, which determines what the keys are for each row. If cam_names are not given, then it is automatically determined from the rows, used in sorted order.
+    It also takes a parameter min_cameras, which specifies how many cameras must see a point in order to keep it.
+    """
+
+    if cam_names is None:
+        s = set.union(*[set(r.keys()) for r in merged])
+        cam_names = sorted(s)
+
+    test = board.get_empty_detection().reshape(-1, 2)
+    n_cams = len(cam_names)
+    n_points_per_detect = test.shape[0]
+    n_detects = len(merged)
+
+    objp_template = board.get_object_points().reshape(-1, 3)
+
+    objp = np.empty((n_cams, n_detects, n_points_per_detect, 3), dtype='float32')
+    objp[:] = np.nan
+
+    imgp = np.empty((n_cams, n_detects, n_points_per_detect, 2), dtype='float32')
+    imgp[:] = np.nan
+
+    for rix, row in enumerate(merged):
+        for cix, cname in enumerate(cam_names):
+            if cname in row:
+                filled = row[cname]['filled'].reshape(-1, 2)
+                imgp[cix, rix] = filled
+                objp_here = np.copy(objp_template)
+                bad = np.any(np.isnan(filled), axis=1)
+                objp_here[bad] = np.nan
+                objp[cix, rix] = objp_here
+
+    objp = np.reshape(objp, (n_cams, -1, 3))
+    imgp = np.reshape(imgp, (n_cams, -1, 2))
+
+    num_good = np.sum(np.isnan(imgp), axis=0)[:, 0]
+    good = num_good >= min_cameras
+
+    objp = objp[:, good]
+    imgp = imgp[:, good]
+
+    return objp, imgp
+
 
 class CalibrationObject(ABC):
 
@@ -101,6 +147,14 @@ class CalibrationObject(ABC):
 
     @abstractmethod
     def estimate_pose_points(self, camera, corners, ids):
+        pass
+
+    @abstractmethod
+    def fill_points(self, corners, ids):
+        pass
+
+    @abstractmethod
+    def get_empty_detection(self):
         pass
 
     def estimate_pose_image(self, camera, image):
@@ -131,6 +185,9 @@ class CalibrationObject(ABC):
                 rows.append(row)
 
         cap.release()
+
+        rows = self.fill_points_rows(rows)
+
         return rows
 
 
@@ -154,7 +211,7 @@ class CalibrationObject(ABC):
                 continue
 
             corners, ids = self.detect_image(frame)
-            if corners is not None:
+            if corners is not None and len(corners) > 0:
                 go = int(skip/2)
                 row = {
                     'framenum': framenum,
@@ -166,15 +223,48 @@ class CalibrationObject(ABC):
             go = max(0, go-1)
 
         cap.release()
+
+        rows = self.fill_points_rows(rows)
+
         return rows
 
-    def estimate_pose_rows(camera, rows):
+    def estimate_pose_rows(self, camera, rows):
         for row in rows:
             rvec, tvec = self.estimate_pose_points(
                 camera, row['corners'], row['ids'])
             row['rvec'] = rvec
             row['tvec'] = tvec
         return rows
+
+    def fill_points_rows(self, rows):
+        for row in rows:
+            row['filled'] = self.fill_points(row['corners'], row['ids'])
+        return rows
+
+    def get_all_calibration_points(self, rows):
+        rows = self.fill_points_rows(rows)
+
+        objpoints = self.get_object_points()
+        objpoints = objpoints.reshape(-1, 3)
+
+        all_obj = []
+        all_img = []
+
+        for row in rows:
+            filled_test = row['filled'].reshape(-1, 2)
+            good = np.all(~np.isnan(filled_test), axis=1)
+            filled_app = row['filled'].reshape(-1, 2)
+            objp = np.copy(objpoints)
+            all_obj.append(objp[good])
+            all_img.append(filled_app[good])
+
+        all_obj = np.vstack(all_obj)
+        all_img = np.vstack(all_img)
+
+        all_obj = np.array(all_obj, dtype='float32')
+        all_img = np.array(all_img, dtype='float32')
+
+        return all_obj, all_img
 
 
 class Checkerboard(CalibrationObject):
@@ -228,7 +318,7 @@ class Checkerboard(CalibrationObject):
         if ids is None:
             return corners
         else:
-            ids = np.squeeze(ids)
+            ids = ids.ravel()
             for i, cxs in zip(ids, corners):
                 out[i] = cxs
             return out
@@ -344,7 +434,7 @@ class CharucoBoard(CalibrationObject):
         out = self.get_empty_detection()
         if corners is None or len(corners) == 0:
             return out
-        ids = np.squeeze(ids)
+        ids = ids.ravel()
         for i, cxs in zip(ids, corners):
             out[i] = cxs
         return out
