@@ -3,6 +3,7 @@ from cv2 import aruco
 import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix
+from scipy import optimize
 
 def make_M(rvec, tvec):
     out = np.zeros((4,4))
@@ -64,16 +65,16 @@ class Camera:
 
 
     def set_distortions(self, dist):
-        self.dist = np.array(dist)
+        self.dist = np.array(dist).ravel()
 
     def set_rotation(self, rvec):
-        self.rvec = np.array(rvec)
+        self.rvec = np.array(rvec).ravel()
 
     def get_rotation(self):
         return self.rvec
 
     def set_translation(self, tvec):
-        self.tvec = np.array(tvec)
+        self.tvec = np.array(tvec).ravel()
 
     def get_translation(self):
         return self.tvec
@@ -96,12 +97,14 @@ class Camera:
         return self.size
 
     def get_params(self):
-        params = np.zeros(8, dtype='float32')
+        params = np.zeros(9, dtype='float32')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
+        params[8] = dist[1]
+        
         return params
 
     def set_params(self, params):
@@ -111,6 +114,7 @@ class Camera:
 
         dist = np.zeros(5, dtype='float32')
         dist[0] = params[7]
+        dist[1] = params[8]
         self.set_distortions(dist)
 
 
@@ -230,7 +234,6 @@ class CameraGroup:
 
 
     def _make_error_fun(self, p2ds, n_cam_params):
-
         cam_group = self.copy()
         good = ~np.isnan(p2ds)
 
@@ -314,3 +317,25 @@ class CameraGroup:
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
         return CameraGroup(cameras)
+
+    def set_rotations(self, rvecs):
+        for cam, rvec in zip(self.cameras, rvecs):
+            cam.set_rotation(rvec)
+
+    def set_translations(self, tvecs):
+        for cam, tvec in zip(self.cameras, tvecs):
+            cam.set_translation(tvec)
+            
+    def get_rotations(self):
+        rvecs = []
+        for cam in self.cameras:
+            rvec = cam.get_rotation()
+            rvecs.append(rvec)
+        return np.array(rvecs)
+        
+    def get_translations(self):
+        tvecs = []
+        for cam in self.cameras:
+            tvec = cam.get_translation()
+            tvecs.append(tvec)
+        return np.array(tvecs)

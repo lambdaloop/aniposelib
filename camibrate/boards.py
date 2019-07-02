@@ -71,7 +71,6 @@ def merge_rows(all_rows, cam_names=None):
             framenums.add(num)
 
     framenums = sorted(framenums)
-
     merged = []
 
     for num in framenums:
@@ -84,7 +83,7 @@ def merge_rows(all_rows, cam_names=None):
     return merged
 
 
-def extract_points(merged, board, cam_names=None, min_cameras=1):
+def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,
     where C is the number of cameras, N is the number of points.
@@ -113,16 +112,19 @@ def extract_points(merged, board, cam_names=None, min_cameras=1):
         for cix, cname in enumerate(cam_names):
             if cname in row:
                 filled = row[cname]['filled'].reshape(-1, 2)
-                imgp[cix, rix] = filled
                 objp_here = np.copy(objp_template)
                 bad = np.any(np.isnan(filled), axis=1)
+                num_good = np.sum(~bad)
+                if num_good < min_points:
+                    continue
+                imgp[cix, rix] = filled
                 objp_here[bad] = np.nan
                 objp[cix, rix] = objp_here
 
     objp = np.reshape(objp, (n_cams, -1, 3))
     imgp = np.reshape(imgp, (n_cams, -1, 2))
 
-    num_good = np.sum(np.isnan(imgp), axis=0)[:, 0]
+    num_good = np.sum(~np.isnan(imgp), axis=0)[:, 0]
     good = num_good >= min_cameras
 
     objp = objp[:, good]
@@ -216,7 +218,7 @@ class CalibrationObject(ABC):
         corners, ids = self.detect_image(image)
         return self.estimate_pose_points(camera, corners, ids)
 
-    def detect_images(self, images, progress=False):
+    def detect_images(self, images, progress=False, prefix=None):
         length = len(images)
         rows = []
 
@@ -231,8 +233,13 @@ class CalibrationObject(ABC):
 
             corners, ids = self.detect_image(frame)
             if corners is not None:
+                if prefix is None:
+                    key = framenum
+                else:
+                    key = (prefix, framenum)
+
                 row = {
-                    'framenum': framenum,
+                    'framenum': key,
                     'corners': corners,
                     'ids': ids,
                     'fname': imname
@@ -246,7 +253,7 @@ class CalibrationObject(ABC):
         return rows
 
 
-    def detect_video(self, vidname, skip=20, progress=False):
+    def detect_video(self, vidname, prefix=None, skip=20, progress=False):
         cap = cv2.VideoCapture(vidname)
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         rows = []
@@ -267,9 +274,13 @@ class CalibrationObject(ABC):
 
             corners, ids = self.detect_image(frame)
             if corners is not None and len(corners) > 0:
+                if prefix is None:
+                    key = framenum
+                else:
+                    key = (prefix, framenum)
                 go = int(skip/2)
                 row = {
-                    'framenum': framenum,
+                    'framenum': key,
                     'corners': corners,
                     'ids': ids
                 }
