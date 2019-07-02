@@ -83,7 +83,7 @@ def merge_rows(all_rows, cam_names=None):
     return merged
 
 
-def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3):
+def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3, ignore_no_pose=False):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,
     where C is the number of cameras, N is the number of points.
@@ -112,11 +112,15 @@ def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3):
         for cix, cname in enumerate(cam_names):
             if cname in row:
                 filled = row[cname]['filled'].reshape(-1, 2)
-                objp_here = np.copy(objp_template)
                 bad = np.any(np.isnan(filled), axis=1)
                 num_good = np.sum(~bad)
-                if num_good < min_points:
+                if num_good < min_points or \
+                   ignore_no_pose and \
+                   (row[cname].get('rvec', None) is None or \
+                    row[cname].get('tvec', None) is None):
                     continue
+
+                objp_here = np.copy(objp_template)
                 imgp[cix, rix] = filled
                 objp_here[bad] = np.nan
                 objp[cix, rix] = objp_here

@@ -79,24 +79,37 @@ def get_transform(rtvecs, left, right):
     return M_mean
 
 
-def get_calibration_graph(rtvecs, cam_names=None):
-    n_cams = rtvecs.shape[0]
-    connections = defaultdict(int)
-
-    n_points = rtvecs.shape[1]
+def get_connections(xs, cam_names=None, both=True):
+    n_cams = xs.shape[0]
+    n_points = xs.shape[1]
 
     if cam_names is None:
-        cam_names = list(range(n_cams))
+        cam_names = np.arange(n_cams)
+
+    connections = defaultdict(int)
 
     for rnum in range(n_points):
-        ixs = np.where(~np.isnan(rtvecs[:, rnum, 0]))[0]
+        ixs = np.where(~np.isnan(xs[:, rnum, 0]))[0]
         keys = [cam_names[ix] for ix in ixs]
         for i in range(len(keys)):
             for j in range(i+1, len(keys)):
                 a = keys[i]
                 b = keys[j]
                 connections[(a,b)] += 1
-                connections[(b,a)] += 1
+                if both:
+                    connections[(b,a)] += 1
+
+    return connections
+
+
+def get_calibration_graph(rtvecs, cam_names=None):
+    n_cams = rtvecs.shape[0]
+    n_points = rtvecs.shape[1]
+
+    if cam_names is None:
+        cam_names = np.arange(n_cams)
+
+    connections = get_connections(rtvecs, cam_names)
 
     components = dict(zip(cam_names, range(n_cams)))
     edges = set(connections.items())

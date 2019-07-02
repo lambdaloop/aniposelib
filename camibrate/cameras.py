@@ -97,14 +97,14 @@ class Camera:
         return self.size
 
     def get_params(self):
-        params = np.zeros(9, dtype='float32')
+        params = np.zeros(8, dtype='float32')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
-        params[8] = dist[1]
-        
+        # params[8] = dist[1]
+
         return params
 
     def set_params(self, params):
@@ -114,7 +114,7 @@ class Camera:
 
         dist = np.zeros(5, dtype='float32')
         dist[0] = params[7]
-        dist[1] = params[8]
+        # dist[1] = params[8]
         self.set_distortions(dist)
 
 
@@ -208,7 +208,7 @@ class CameraGroup:
         return errors
 
     # TODO: implement bundle adjustment with object points
-    def bundle_adjust(self, p2ds, loss='linear', verbose=True):
+    def bundle_adjust(self, p2ds, loss='linear', threshold=50, ftol=1e-4, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustsment to fine-tune the parameters of the cameras"""
@@ -218,10 +218,10 @@ class CameraGroup:
 
         jac_sparse = self._jac_sparsity_matrix(p2ds, n_cam_params)
 
-        f_scale = 10
+        f_scale = threshold
         opt = optimize.least_squares(error_fun, x0,
                                      jac_sparsity=jac_sparse, f_scale=f_scale,
-                                     x_scale='jac', loss=loss, ftol=1e-4,
+                                     x_scale='jac', loss=loss, ftol=ftol,
                                      method='trf', tr_solver='lsmr',
                                      verbose=2*verbose,
                                      max_nfev=1000)
@@ -234,7 +234,8 @@ class CameraGroup:
 
 
     def _make_error_fun(self, p2ds, n_cam_params):
-        cam_group = self.copy()
+        # cam_group = self.copy()
+        cam_group = self
         good = ~np.isnan(p2ds)
 
         def error_fun(params):
@@ -325,14 +326,14 @@ class CameraGroup:
     def set_translations(self, tvecs):
         for cam, tvec in zip(self.cameras, tvecs):
             cam.set_translation(tvec)
-            
+
     def get_rotations(self):
         rvecs = []
         for cam in self.cameras:
             rvec = cam.get_rotation()
             rvecs.append(rvec)
         return np.array(rvecs)
-        
+
     def get_translations(self):
         tvecs = []
         for cam in self.cameras:
