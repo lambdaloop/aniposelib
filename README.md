@@ -18,34 +18,33 @@ The calibration library should follow these requirements:
 
 Nice to haves
 - [ ] reject outlier points
-
+- [ ] add objective in optimization to match the object points of calibration board
 
 Functions to implement
 
 Camera
-.distort\_points
-.undistort\_points
-.project
-.undistort\_image
-.calibrate\_images
-.calibrate\_points
-.calibrate\_videos
-.extract\_points\_images
-.extract\_points\_videos
+- [X] distort\_points
+- [X] undistort\_points
+- [X] project
+- [X] undistort\_image
+- [ ] calibrate\_images
+- [ ] calibrate\_points
+- [ ] calibrate\_videos
 
 CameraGroup
-.distort\_points
-.undistort\_points
-.project
-.triangulate
-.reprojection\_error
-.calibrate\_images
-.calibrate\_points
-.calibrate\_videos
+- [X] distort\_points
+- [X] undistort\_points
+- [X] project
+- [X] triangulate
+- [X] reprojection\_error
+- [ ] calibrate\_images
+- [ ] calibrate\_points
+- [ ] calibrate\_videos
 
 CalibrationObject
-.draw
-.detect\_image
-.detect\_video
-.get\_object\_points
-.estimate\_pose
+- [X] draw
+- [X] detect\_image
+- [X] detect\_images
+- [X] detect\_video
+- [X] get\_object\_points
+- [X] estimate\_pose
