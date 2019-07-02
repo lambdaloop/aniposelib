@@ -131,6 +131,61 @@ def extract_points(merged, board, cam_names=None, min_cameras=1):
     return objp, imgp
 
 
+def extract_rtvecs(merged, cam_names=None, min_cameras=1,
+                   board=None, cameras=None):
+    """Takes a list of merged rows (output of merge_rows) and a board object.
+    Returns an array of rvecs and tvecs appended together, of size CxNx6,
+    where C is the number of cameras, N is the number of detections.
+    Optionally takes a list of cam_names, which determines what the keys are for each row. If cam_names are not given, then it is automatically determined from the rows, used in sorted order.
+    It also takes a parameter min_cameras, which specifies how many cameras must see a point in order to keep it.
+
+    board.estimate_pose_rows should have been run on the rows before merging.
+    If not, the board and cameras must be passed as arguments.
+    """
+
+    if cam_names is None:
+        s = set.union(*[set(r.keys()) for r in merged])
+        cam_names = sorted(s)
+
+    n_cams = len(cam_names)
+    n_detects = len(merged)
+
+    rtvecs = np.empty((n_cams, n_detects, 6), dtype='float32')
+    rtvecs[:] = np.nan
+
+    for rix, row in enumerate(merged):
+        for cix, cname in enumerate(cam_names):
+            if cname in row:
+                r = row[cname]
+                if 'rvec' not in r or 'tvec' not in r:
+                    if board is None:
+                        raise ValueError(
+                            'rvec or tvec not found in rows. '
+                            'board.estimate_pose_rows should have been run on '
+                            'the rows before merging.'
+                            'If not, the board and cameras must be passed as arguments.')
+                    else:
+                        rvec, tvec = board.estimate_pose_points(
+                            cameras[cix], r['corners'], r['ids'])
+                        r['rvec'] = rvec
+                        r['tvec'] = tvec
+
+                if r['rvec'] is None or r['tvec'] is None:
+                    continue
+
+                rvec = r['rvec'].ravel()
+                tvec = r['tvec'].ravel()
+
+                rtvec = np.hstack([rvec, tvec])
+                rtvecs[cix, rix] = rtvec
+
+    num_good = np.sum(~np.isnan(rtvecs), axis=0)[:, 0]
+    rtvecs = rtvecs[:, num_good >= min_cameras]
+
+    return rtvecs
+
+
+
 class CalibrationObject(ABC):
 
     @abstractmethod
