@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from tqdm import trange
 from collections import defaultdict
 
+
 def get_video_params_cap(cap):
     params = dict()
     params['width'] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -13,11 +14,13 @@ def get_video_params_cap(cap):
     params['fps'] = cap.get(cv2.CAP_PROP_FPS)
     return params
 
+
 def get_video_params(fname):
     cap = cv2.VideoCapture(fname)
     params = get_video_params_cap(cap)
     cap.release()
     return params
+
 
 def fix_rvec(rvec, tvec):
     # https://github.com/opencv/opencv/issues/8813
@@ -26,28 +29,29 @@ def fix_rvec(rvec, tvec):
 
     # Unrelated -- makes Y the up axis, Z forward
     R = R @ np.array([
-            [1, 0, 0],
-            [0, 0, 1],
-            [0,-1, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, -1, 0],
     ])
-    if 0 < R[1,1] < 1:
+    if 0 < R[1, 1] < 1:
         # If it gets here, the pose is flipped.
 
         # Flip the axes. E.g., Y axis becomes [-y0, -y1, y2].
         R *= np.array([
-                [ 1, -1,  1],
-                [ 1, -1,  1],
-                [-1,  1, -1],
+            [1, -1, 1],
+            [1, -1, 1],
+            [-1, 1, -1],
         ])
 
         # Fixup: rotate along the plane spanned by camera's forward (Z) axis and vector to marker's position
         forward = np.array([0, 0, 1])
         tnorm = T / np.linalg.norm(T)
         axis = np.cross(tnorm, forward)
-        angle = -2*np.arccos(tnorm @ forward)
+        angle = -2 * np.arccos(tnorm @ forward)
         R = cv2.Rodrigues(angle * axis)[0] @ R
 
     return cv2.Rodrigues(R)[0]
+
 
 def merge_rows(all_rows, cam_names=None):
     """Takes a list of rows returned from detect_images or detect_videos.
@@ -83,7 +87,12 @@ def merge_rows(all_rows, cam_names=None):
     return merged
 
 
-def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3, ignore_no_pose=False):
+def extract_points(merged,
+                   board,
+                   cam_names=None,
+                   min_cameras=1,
+                   min_points=3,
+                   ignore_no_pose=False):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,
     where C is the number of cameras, N is the number of points.
@@ -102,10 +111,12 @@ def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3, i
 
     objp_template = board.get_object_points().reshape(-1, 3)
 
-    objp = np.empty((n_cams, n_detects, n_points_per_detect, 3), dtype='float32')
+    objp = np.empty((n_cams, n_detects, n_points_per_detect, 3),
+                    dtype='float32')
     objp[:] = np.nan
 
-    imgp = np.empty((n_cams, n_detects, n_points_per_detect, 2), dtype='float32')
+    imgp = np.empty((n_cams, n_detects, n_points_per_detect, 2),
+                    dtype='float32')
     imgp[:] = np.nan
 
     for rix, row in enumerate(merged):
@@ -137,8 +148,11 @@ def extract_points(merged, board, cam_names=None, min_cameras=1, min_points=3, i
     return objp, imgp
 
 
-def extract_rtvecs(merged, cam_names=None, min_cameras=1,
-                   board=None, cameras=None):
+def extract_rtvecs(merged,
+                   cam_names=None,
+                   min_cameras=1,
+                   board=None,
+                   cameras=None):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of rvecs and tvecs appended together, of size CxNx6,
     where C is the number of cameras, N is the number of detections.
@@ -169,7 +183,8 @@ def extract_rtvecs(merged, cam_names=None, min_cameras=1,
                             'rvec or tvec not found in rows. '
                             'board.estimate_pose_rows should have been run on '
                             'the rows before merging.'
-                            'If not, the board and cameras must be passed as arguments.')
+                            'If not, the board and cameras must be passed as arguments.'
+                        )
                     else:
                         rvec, tvec = board.estimate_pose_points(
                             cameras[cix], r['corners'], r['ids'])
@@ -191,9 +206,7 @@ def extract_rtvecs(merged, cam_names=None, min_cameras=1,
     return rtvecs
 
 
-
 class CalibrationObject(ABC):
-
     @abstractmethod
     def draw(self, size):
         pass
@@ -256,13 +269,12 @@ class CalibrationObject(ABC):
 
         return rows
 
-
     def detect_video(self, vidname, prefix=None, skip=20, progress=False):
         cap = cv2.VideoCapture(vidname)
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         rows = []
 
-        go = int(skip/2)
+        go = int(skip / 2)
 
         if progress:
             it = trange(length, ncols=70)
@@ -282,15 +294,11 @@ class CalibrationObject(ABC):
                     key = framenum
                 else:
                     key = (prefix, framenum)
-                go = int(skip/2)
-                row = {
-                    'framenum': key,
-                    'corners': corners,
-                    'ids': ids
-                }
+                go = int(skip / 2)
+                row = {'framenum': key, 'corners': corners, 'ids': ids}
                 rows.append(row)
 
-            go = max(0, go-1)
+            go = max(0, go - 1)
 
         cap.release()
 
@@ -300,8 +308,8 @@ class CalibrationObject(ABC):
 
     def estimate_pose_rows(self, camera, rows):
         for row in rows:
-            rvec, tvec = self.estimate_pose_points(
-                camera, row['corners'], row['ids'])
+            rvec, tvec = self.estimate_pose_points(camera, row['corners'],
+                                                   row['ids'])
             row['rvec'] = rvec
             row['tvec'] = tvec
         return rows
@@ -343,10 +351,8 @@ class Checkerboard(CalibrationObject):
         cv2.CALIB_CB_ADAPTIVE_THRESH + \
         cv2.CALIB_CB_FILTER_QUADS
 
-
-    SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER,
-                       30, 0.1)
-
+    SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30,
+                       0.1)
 
     def __init__(self, squaresX, squaresY, square_length=1):
         self.squaresX = squaresX
@@ -362,7 +368,7 @@ class Checkerboard(CalibrationObject):
 
         self.ids = np.arange(total_size)
 
-        self.empty_detection = np.zeros((total_size, 1, 2))*np.nan
+        self.empty_detection = np.zeros((total_size, 1, 2)) * np.nan
 
     def get_size(self):
         size = (self.squaresX, self.squaresY)
@@ -400,11 +406,12 @@ class Checkerboard(CalibrationObject):
             gray = image
 
         size = self.get_size()
-        ret, corners = cv2.findChessboardCorners(gray, size, self.DETECT_PARAMS)
+        ret, corners = cv2.findChessboardCorners(gray, size,
+                                                 self.DETECT_PARAMS)
 
         if ret and subpix:
-            corners = cv2.cornerSubPix(
-                gray, corners, (3,3), (-1,-1), self.SUBPIX_CRITERIA)
+            corners = cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1),
+                                       self.SUBPIX_CRITERIA)
 
         if corners is None:
             ids = None
@@ -428,9 +435,12 @@ class Checkerboard(CalibrationObject):
         D = camera.get_distortions()
         obj_points = self.get_object_points()
 
-        retval, rvec, tvec, inliers = cv2.solvePnPRansac(
-            obj_points, corners, K, D,
-            confidence=0.9, reprojectionError=10)
+        retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
+                                                         corners,
+                                                         K,
+                                                         D,
+                                                         confidence=0.9,
+                                                         reprojectionError=10)
 
         return rvec, tvec
 
@@ -440,17 +450,14 @@ ARUCO_DICTS = {
     (5, 50): aruco.DICT_5X5_50,
     (6, 50): aruco.DICT_6X6_50,
     (7, 50): aruco.DICT_7X7_50,
-
     (4, 100): aruco.DICT_4X4_100,
     (5, 100): aruco.DICT_5X5_100,
     (6, 100): aruco.DICT_6X6_100,
     (7, 100): aruco.DICT_7X7_100,
-
     (4, 250): aruco.DICT_4X4_250,
     (5, 250): aruco.DICT_5X5_250,
     (6, 250): aruco.DICT_6X6_250,
     (7, 250): aruco.DICT_7X7_250,
-
     (4, 1000): aruco.DICT_4X4_1000,
     (5, 1000): aruco.DICT_5X5_1000,
     (6, 1000): aruco.DICT_6X6_1000,
@@ -459,9 +466,13 @@ ARUCO_DICTS = {
 
 
 class CharucoBoard(CalibrationObject):
-    def __init__(self, squaresX, squaresY,
-                 square_length, marker_length,
-                 marker_bits=4, dict_size=50,
+    def __init__(self,
+                 squaresX,
+                 squaresY,
+                 square_length,
+                 marker_length,
+                 marker_bits=4,
+                 dict_size=50,
                  aruco_dict=None):
         self.squaresX = squaresX
         self.squaresY = squaresY
@@ -471,21 +482,20 @@ class CharucoBoard(CalibrationObject):
         dkey = (marker_bits, dict_size)
         self.dictionary = aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
 
-        self.board = aruco.CharucoBoard_create(
-                squaresX, squaresY,
-                square_length, marker_length,
-                self.dictionary)
+        self.board = aruco.CharucoBoard_create(squaresX, squaresY,
+                                               square_length, marker_length,
+                                               self.dictionary)
 
-        total_size = (squaresX-1) * (squaresY-1)
+        total_size = (squaresX - 1) * (squaresY - 1)
 
         objp = np.zeros((total_size, 3), np.float32)
-        objp[:, :2] = np.mgrid[0:(squaresY-1), 0:(squaresX-1)].T.reshape(-1, 2)
+        objp[:, :2] = np.mgrid[0:(squaresY - 1), 0:(squaresX - 1)].T.reshape(
+            -1, 2)
         objp *= square_length
         self.objPoints = objp
 
-        self.empty_detection = np.zeros((total_size, 1, 2))*np.nan
+        self.empty_detection = np.zeros((total_size, 1, 2)) * np.nan
         self.total_size = total_size
-
 
     def get_size(self):
         size = (self.squaresX, self.squaresY)
@@ -541,7 +551,6 @@ class CharucoBoard(CalibrationObject):
                                         parameters=params)
 
         return detectedCorners, detectedIds
-
 
     def detect_image(self, image, camera=None):
         if len(image.shape) == 3:

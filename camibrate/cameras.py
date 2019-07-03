@@ -5,34 +5,38 @@ from copy import copy
 from scipy.sparse import lil_matrix
 from scipy import optimize
 
+
 def make_M(rvec, tvec):
-    out = np.zeros((4,4))
+    out = np.zeros((4, 4))
     rotmat, _ = cv2.Rodrigues(rvec)
-    out[:3,:3] = rotmat
+    out[:3, :3] = rotmat
     out[:3, 3] = tvec.flatten()
     out[3, 3] = 1
     return out
 
+
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
-    A = np.zeros((num_cams*2, 4))
+    A = np.zeros((num_cams * 2, 4))
     for i in range(num_cams):
         x, y = points[i]
         mat = camera_mats[i]
-        A[(i*2):(i*2+1)] = x*mat[2]-mat[0]
-        A[(i*2+1):(i*2+2)] = y*mat[2]-mat[1]
+        A[(i * 2):(i * 2 + 1)] = x * mat[2] - mat[0]
+        A[(i * 2 + 1):(i * 2 + 2)] = y * mat[2] - mat[1]
     u, s, vh = np.linalg.svd(A, full_matrices=True)
     p3d = vh[-1]
     p3d = p3d[:3] / p3d[3]
     return p3d
 
+
 class Camera:
     def __init__(self,
-                 matrix=np.eye(3), dist=np.zeros(5),
+                 matrix=np.eye(3),
+                 dist=np.zeros(5),
                  size=None,
-                 rvec=np.zeros(3), tvec=np.zeros(3),
-                 name=None
-    ):
+                 rvec=np.zeros(3),
+                 tvec=np.zeros(3),
+                 name=None):
         self.matrix = np.array(matrix)
         self.dist = np.array(dist)
         self.size = size
@@ -61,8 +65,7 @@ class Camera:
         if both:
             return (fx, fy)
         else:
-            return (fx + fy)/2.0
-
+            return (fx + fy) / 2.0
 
     def set_distortions(self, dist):
         self.dist = np.array(dist).ravel()
@@ -117,11 +120,10 @@ class Camera:
         # dist[1] = params[8]
         self.set_distortions(dist)
 
-
     def distort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
-        new_points = np.dstack([points, np.ones((points.shape[0],1,1))])
+        new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
                                    self.matrix, self.dist)
         return out.reshape(shape)
@@ -134,8 +136,8 @@ class Camera:
 
     def project(self, points):
         points = points.reshape(-1, 1, 3)
-        out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
-                                   self.matrix, self.dist)
+        out, _ = cv2.projectPoints(points, self.rvec, self.tvec, self.matrix,
+                                   self.dist)
         return out
 
     def reprojection_error(self, p3d, p2d):
@@ -208,7 +210,12 @@ class CameraGroup:
         return errors
 
     # TODO: implement bundle adjustment with object points
-    def bundle_adjust(self, p2ds, loss='linear', threshold=50, ftol=1e-4, verbose=True):
+    def bundle_adjust(self,
+                      p2ds,
+                      loss='linear',
+                      threshold=50,
+                      ftol=1e-2,
+                      verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustsment to fine-tune the parameters of the cameras"""
@@ -219,19 +226,23 @@ class CameraGroup:
         jac_sparse = self._jac_sparsity_matrix(p2ds, n_cam_params)
 
         f_scale = threshold
-        opt = optimize.least_squares(error_fun, x0,
-                                     jac_sparsity=jac_sparse, f_scale=f_scale,
-                                     x_scale='jac', loss=loss, ftol=ftol,
-                                     method='trf', tr_solver='lsmr',
-                                     verbose=2*verbose,
+        opt = optimize.least_squares(error_fun,
+                                     x0,
+                                     jac_sparsity=jac_sparse,
+                                     f_scale=f_scale,
+                                     x_scale='jac',
+                                     loss=loss,
+                                     ftol=ftol,
+                                     method='trf',
+                                     tr_solver='lsmr',
+                                     verbose=2 * verbose,
                                      max_nfev=1000)
         best_params = opt.x
 
         for i, cam in enumerate(self.cameras):
-            a = i*n_cam_params
-            b = (i+1)*n_cam_params
+            a = i * n_cam_params
+            b = (i + 1) * n_cam_params
             cam.set_params(best_params[a:b])
-
 
     def _make_error_fun(self, p2ds, n_cam_params):
         # cam_group = self.copy()
@@ -240,8 +251,8 @@ class CameraGroup:
 
         def error_fun(params):
             for i, cam in enumerate(cam_group.cameras):
-                a = i*n_cam_params
-                b = (i+1)*n_cam_params
+                a = i * n_cam_params
+                b = (i + 1) * n_cam_params
                 cam.set_params(params[a:b])
 
             n_cams = len(cam_group.cameras)
@@ -271,7 +282,7 @@ class CameraGroup:
 
         n_cams = p2ds.shape[0]
         n_points = p2ds.shape[1]
-        n_params = n_cams*n_cam_params + n_points*3
+        n_params = n_cams * n_cam_params + n_points * 3
 
         n_errors = np.sum(good)
 
@@ -283,10 +294,10 @@ class CameraGroup:
         ix = np.arange(n_errors)
 
         for i in range(n_cam_params):
-            A_sparse[ix, cam_indices_good*n_cam_params + i] = 1
+            A_sparse[ix, cam_indices_good * n_cam_params + i] = 1
 
         for i in range(3):
-            A_sparse[ix, n_cams*n_cam_params + point_indices_good*3 + i] = 1
+            A_sparse[ix, n_cams * n_cam_params + point_indices_good * 3 + i] = 1
 
         return A_sparse
 
@@ -296,7 +307,7 @@ class CameraGroup:
         initializes the parameters"""
 
         cam_params = np.hstack([cam.get_params() for cam in self.cameras])
-        n_cam_params = len(cam_params)//len(self.cameras)
+        n_cam_params = len(cam_params) // len(self.cameras)
 
         total_cam_params = len(cam_params)
 
@@ -340,3 +351,10 @@ class CameraGroup:
             tvec = cam.get_translation()
             tvecs.append(tvec)
         return np.array(tvecs)
+
+    def average_error(self, p2ds):
+        p3ds = self.triangulate(p2ds)
+        errors = self.reprojection_error(p3ds, p2ds)
+        errors_flat = np.linalg.norm(errors, axis=2).ravel()
+        err = np.mean(errors_flat[~np.isnan(errors_flat)])
+        return err
