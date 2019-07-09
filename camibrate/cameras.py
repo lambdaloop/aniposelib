@@ -156,7 +156,7 @@ class CameraGroup:
         cams = np.array(self.cameras)
         cams = list(cams[indices])
         return CameraGroup(cams)
-        
+
     def project(self, points):
         """Given an Nx3 array of points, this returns an CxNx2 array of 2D points,
         where C is the number of cameras"""
@@ -178,7 +178,7 @@ class CameraGroup:
         if len(points.shape) == 2:
             points = points.reshape(-1, 1, 2)
             one_point = True
-        
+
         if undistort:
             new_points = np.empty(points.shape)
             for cnum, cam in enumerate(self.cameras):
@@ -202,7 +202,7 @@ class CameraGroup:
 
         if one_point:
             out = out[0]
-                
+
         return out
 
     def triangulate_possible(self, points, undistort=True):
@@ -216,17 +216,18 @@ class CameraGroup:
         """
 
         n_cams, n_points, n_possible, _ = points.shape
-        
+
         cam_nums, point_nums, possible_nums = np.where(
             ~np.isnan(points[:, :, :, 0]))
 
         all_iters = defaultdict(dict)
 
-        for cam_num, point_num, possible_num in zip(cam_nums, point_nums, possible_nums):
+        for cam_num, point_num, possible_num in zip(cam_nums, point_nums,
+                                                    possible_nums):
             if cam_num not in all_iters[point_num]:
                 all_iters[point_num][cam_num] = [None]
-            all_iters[point_num][cam_num].append( (cam_num, possible_num) )
-        
+            all_iters[point_num][cam_num].append((cam_num, possible_num))
+
         out = np.zeros((n_points, 3), dtype='float')
         picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
         errors = np.zeros(n_points, dtype='float')
@@ -250,11 +251,12 @@ class CameraGroup:
                 err = cc.reprojection_error(p3d, pts, sum=True)
 
                 if err < best_error:
-                    point = {'error': err,
-                             'point': p3d[:3],
-                             'points': pts,
-                             'picked': picked,
-                             'joint_ix': point_ix
+                    point = {
+                        'error': err,
+                        'point': p3d[:3],
+                        'points': pts,
+                        'picked': picked,
+                        'joint_ix': point_ix
                     }
                     best_point = point
                     best_error = err
@@ -269,7 +271,6 @@ class CameraGroup:
 
         return out, picked_vals, errors
 
-    
     def reprojection_error(self, p3ds, p2ds, sum=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -280,7 +281,7 @@ class CameraGroup:
             p3ds = p3ds.reshape(1, 3)
             p2ds = p2ds.reshape(-1, 1, 2)
             one_point = True
-        
+
         n_cams, n_points, _ = p2ds.shape
         assert p3ds.shape == (n_points, 3), \
             "shapes of 2D and 3D points are not consistent: " \
@@ -293,7 +294,7 @@ class CameraGroup:
 
         if sum:
             errors = np.mean(np.linalg.norm(errors, axis=2), axis=0)
-            
+
         if one_point:
             if sum:
                 errors = float(errors[0])
@@ -451,5 +452,3 @@ class CameraGroup:
         errors_flat = np.linalg.norm(errors, axis=2).ravel()
         err = np.mean(errors_flat[~np.isnan(errors_flat)])
         return err
-
-    
