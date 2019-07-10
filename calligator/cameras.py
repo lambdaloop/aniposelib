@@ -310,13 +310,13 @@ class CameraGroup:
         return errors
 
     # TODO: implement bundle adjustment with object points
-    def bundle_adjust(self,
-                      p2ds,
+    def bundle_adjust(self, p2ds,
                       loss='linear',
                       threshold=50,
                       ftol=1e-2,
                       max_nfev=1000,
                       weights=None,
+                      start_params=None,
                       verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -324,6 +324,10 @@ class CameraGroup:
 
         x0, n_cam_params = self._initialize_params(p2ds)
         # error_fun = self._make_error_fun(p2ds, n_cam_params, weights=weights)
+
+        if start_params is not None:
+            x0 = start_params
+            n_cam_params = len(self.cameras[0].get_params())
 
         error_fun = self._error_fun
 
@@ -349,8 +353,12 @@ class CameraGroup:
             b = (i + 1) * n_cam_params
             cam.set_params(best_params[a:b])
 
-    def bundle_adjust_iter(self, p2ds, n_iters=6, start_mu=50, end_mu=3, verbose=True):
-        self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
+        return best_params
+
+    def bundle_adjust_iter(self, p2ds, n_iters=7, start_mu=100, end_mu=5,
+                           max_nfev=40, ftol=1e-2, verbose=True):
+
+        params = self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
 
         mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
 
@@ -362,21 +370,20 @@ class CameraGroup:
 
             mu = np.square(mus[i])
             weights = np.square(mu / (mu + errors**2))
-            check = weights > 0.001
-            self.bundle_adjust(p2ds[:, check],
-                               loss='linear', ftol=1e-2, max_nfev=50,
-                               weights=weights[check],
-                               verbose=verbose)
+            params = self.bundle_adjust(p2ds,
+                                        loss='linear', ftol=ftol, max_nfev=max_nfev,
+                                        weights=weights,
+                                        verbose=verbose)
 
 
-        p3ds = self.triangulate(p2ds)
-        errors = self.reprojection_error(p3ds, p2ds, mean=True)
-        good = errors < end_mu
+        # p3ds = self.triangulate(p2ds)
+        # errors = self.reprojection_error(p3ds, p2ds, mean=True)
+        # good = errors < end_mu
 
         if verbose:
-            print('error: ', np.mean(errors))
+            print('error: ', self.average_error(p2ds))
 
-        self.bundle_adjust(p2ds[:, good], loss='linear', ftol=5e-3, verbose=verbose)
+        # self.bundle_adjust(p2ds[:, good], loss='linear', ftol=5e-3, verbose=verbose)
 
     @jit(nopython=True, parallel=True, forceobj=True)
     def _error_fun(self, params, p2ds, n_cam_params, weights=None):
