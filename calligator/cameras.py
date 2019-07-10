@@ -1,10 +1,12 @@
 import cv2
-from cv2 import aruco
 import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix
 from scipy import optimize
 from numba import jit
+
+from .boards import merge_rows, extract_points, extract_rtvecs, get_video_params
+from .utils import get_initial_extrinsics, get_connections
 
 def make_M(rvec, tvec):
     out = np.zeros((4, 4))
@@ -365,6 +367,9 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
+        if verbose:
+            print('error: ', self.average_error(p2ds))
+
         params = self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
 
         mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
@@ -506,3 +511,52 @@ class CameraGroup:
         p3ds = self.triangulate(p2ds)
         errors = self.reprojection_error(p3ds, p2ds, mean=True)
         return np.mean(errors)
+
+    def calibrate_rows(self, all_rows, board, verbose=True):
+        """Assumes camera sizes are set properly"""
+        for rows, camera in zip(all_rows, self.cameras):
+            size = camera.get_size()
+
+            assert size is not None, \
+                "Camera with name {} has no specified frame size".format(camera.get_name())
+
+            objp, imgp = board.get_all_calibration_points(rows)
+            matrix = cv2.initCameraMatrix2D([objp], [imgp], size)
+            camera.set_camera_matrix(matrix)
+
+        for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
+            all_rows[i] = board.estimate_pose_rows(cam, row)
+
+        merged = merge_rows(all_rows)
+        objp, imgp = extract_points(merged, board, min_cameras=2, ignore_no_pose=True)
+
+        rtvecs = extract_rtvecs(merged)
+        rvecs, tvecs = get_initial_extrinsics(rtvecs)
+        self.set_rotations(rvecs)
+        self.set_translations(tvecs)
+
+        self.bundle_adjust_iter(imgp, start_mu=100, end_mu=5, verbose=verbose)
+
+        err = self.average_error(imgp)
+        return err
+
+    def calibrate_videos(self, videos, board, verbose=True):
+        """Takes as input a list of list of video filenames, one list of each camera.
+        Also takes a board which specifies what should be detected in the videos"""
+
+        all_rows = []
+
+        for cix, (cam, cam_videos) in enumerate(zip(self.cameras, videos)):
+            rows_cam = []
+            for vnum, vidname in enumerate(cam_videos):
+                if verbose: print(vidname)
+                rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
+                rows_cam.extend(rows)
+
+                params = get_video_params(vidname)
+                size = (params['width'], params['height'])
+                cam.set_size(size)
+
+            all_rows.append(rows_cam)
+
+        return self.calibrate_rows(all_rows, board, verbose=verbose)

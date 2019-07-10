@@ -59,7 +59,7 @@ def merge_rows(all_rows, cam_names=None):
     Optionally takes a list of cam_names, which determines what the keys are for each row.
     """
 
-    assert len(all_rows) == len(cam_names), \
+    assert cam_names is None or len(all_rows) == len(cam_names), \
         "number of rows does not match the number of camera names"
 
     if cam_names is None:
