@@ -357,6 +357,13 @@ class CameraGroup:
 
     def bundle_adjust_iter(self, p2ds, n_iters=7, start_mu=100, end_mu=5,
                            max_nfev=40, ftol=1e-2, verbose=True):
+        """Given an CxNx2 array of 2D points,
+        where N is the number of points and C is the number of cameras,
+        this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
+        That is, it performs bundle adjustment multiple times, adjusting the weights given to points
+        to reduce the influence of outliers.
+        This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
+        """
 
         params = self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
 
