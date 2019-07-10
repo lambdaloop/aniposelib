@@ -4,7 +4,7 @@ import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix
 from scipy import optimize
-
+from numba import jit
 
 def make_M(rvec, tvec):
     out = np.zeros((4, 4))
@@ -14,7 +14,7 @@ def make_M(rvec, tvec):
     out[3, 3] = 1
     return out
 
-
+@jit(nopython=True, parallel=True)
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
     A = np.zeros((num_cams * 2, 4))
@@ -231,6 +231,7 @@ class CameraGroup:
         out = np.zeros((n_points, 3), dtype='float')
         picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
         errors = np.zeros(n_points, dtype='float')
+        points_2d = np.full((n_cams, n_points, 2), np.nan, dtype='float')
 
         for point_ix in range(n_points):
             best_point = None
@@ -248,7 +249,7 @@ class CameraGroup:
                 cc = self.subset_cameras(cnums)
 
                 p3d = cc.triangulate(pts)
-                err = cc.reprojection_error(p3d, pts, sum=True)
+                err = cc.reprojection_error(p3d, pts, mean=True)
 
                 if err < best_error:
                     point = {
@@ -268,10 +269,12 @@ class CameraGroup:
                 xnums = [p[1] for p in picked]
                 picked_vals[cnums, point_ix, xnums] = True
                 errors[point_ix] = best_point['error']
+                points_2d[cnums, point_ix] = best_point['points']
 
-        return out, picked_vals, errors
+        return out, picked_vals, points_2d, errors
 
-    def reprojection_error(self, p3ds, p2ds, sum=False):
+    @jit(nopython=True, parallel=True, forceobj=True)
+    def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this returns an CxNx2 array of errors"""
@@ -292,11 +295,14 @@ class CameraGroup:
         for cnum, cam in enumerate(self.cameras):
             errors[cnum] = cam.reprojection_error(p3ds, p2ds[cnum])
 
-        if sum:
-            errors = np.mean(np.linalg.norm(errors, axis=2), axis=0)
+        if mean:
+            errors_norm = np.linalg.norm(errors, axis=2)
+            good = ~np.isnan(errors_norm)
+            errors_norm[~good] = 0
+            errors = np.sum(errors_norm, axis=0) / np.sum(good, axis=0)
 
         if one_point:
-            if sum:
+            if mean:
                 errors = float(errors[0])
             else:
                 errors = errors.reshape(-1, 2)
@@ -309,13 +315,17 @@ class CameraGroup:
                       loss='linear',
                       threshold=50,
                       ftol=1e-2,
+                      max_nfev=1000,
+                      weights=None,
                       verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustsment to fine-tune the parameters of the cameras"""
 
         x0, n_cam_params = self._initialize_params(p2ds)
-        error_fun = self._make_error_fun(p2ds, n_cam_params)
+        # error_fun = self._make_error_fun(p2ds, n_cam_params, weights=weights)
+
+        error_fun = self._error_fun
 
         jac_sparse = self._jac_sparsity_matrix(p2ds, n_cam_params)
 
@@ -330,7 +340,8 @@ class CameraGroup:
                                      method='trf',
                                      tr_solver='lsmr',
                                      verbose=2 * verbose,
-                                     max_nfev=1000)
+                                     max_nfev=max_nfev,
+                                     args=(p2ds, n_cam_params, weights))
         best_params = opt.x
 
         for i, cam in enumerate(self.cameras):
@@ -338,25 +349,56 @@ class CameraGroup:
             b = (i + 1) * n_cam_params
             cam.set_params(best_params[a:b])
 
-    def _make_error_fun(self, p2ds, n_cam_params):
-        # cam_group = self.copy()
-        cam_group = self
+    def bundle_adjust_iter(self, p2ds, n_iters=6, start_mu=50, end_mu=3, verbose=True):
+        self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
+
+        mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
+
+        for i in range(n_iters):
+            p3ds = self.triangulate(p2ds)
+            errors = self.reprojection_error(p3ds, p2ds, mean=True)
+            if verbose:
+                print('error: ', np.mean(errors))
+
+            mu = np.square(mus[i])
+            weights = np.square(mu / (mu + errors**2))
+            check = weights > 0.001
+            self.bundle_adjust(p2ds[:, check],
+                               loss='linear', ftol=1e-2, max_nfev=50,
+                               weights=weights[check],
+                               verbose=verbose)
+
+
+        p3ds = self.triangulate(p2ds)
+        errors = self.reprojection_error(p3ds, p2ds, mean=True)
+        good = errors < end_mu
+
+        if verbose:
+            print('error: ', np.mean(errors))
+
+        self.bundle_adjust(p2ds[:, good], loss='linear', ftol=5e-3, verbose=verbose)
+
+    @jit(nopython=True, parallel=True, forceobj=True)
+    def _error_fun(self, params, p2ds, n_cam_params, weights=None):
         good = ~np.isnan(p2ds)
+        n_cams = len(self.cameras)
 
-        def error_fun(params):
-            for i, cam in enumerate(cam_group.cameras):
-                a = i * n_cam_params
-                b = (i + 1) * n_cam_params
-                cam.set_params(params[a:b])
+        for i in range(n_cams):
+            cam = self.cameras[i]
+            a = i * n_cam_params
+            b = (i + 1) * n_cam_params
+            cam.set_params(params[a:b])
 
-            n_cams = len(cam_group.cameras)
-            sub = n_cam_params * n_cams
-            p3ds_test = params[sub:].reshape(-1, 3)
-            errors = cam_group.reprojection_error(p3ds_test, p2ds)
+        n_cams = len(self.cameras)
+        sub = n_cam_params * n_cams
+        p3ds_test = params[sub:].reshape(-1, 3)
+        errors = self.reprojection_error(p3ds_test, p2ds)
 
-            return errors[good]
+        if weights is not None:
+            errors = errors * weights.reshape(-1, 1)
 
-        return error_fun
+        return errors[good]
+
 
     def _jac_sparsity_matrix(self, p2ds, n_cam_params):
         """Given an CxNx2 array of 2D points,
@@ -448,7 +490,5 @@ class CameraGroup:
 
     def average_error(self, p2ds):
         p3ds = self.triangulate(p2ds)
-        errors = self.reprojection_error(p3ds, p2ds)
-        errors_flat = np.linalg.norm(errors, axis=2).ravel()
-        err = np.mean(errors_flat[~np.isnan(errors_flat)])
-        return err
+        errors = self.reprojection_error(p3ds, p2ds, mean=True)
+        return np.mean(errors)
