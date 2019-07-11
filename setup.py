@@ -4,14 +4,14 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="calligator",
+    name="camibrate",
     version="0.0.1",
     author="Pierre Karashchuk",
     author_email="krchtchk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/lambdaloop/calligator",
+    url="https://github.com/lambdaloop/camibrate",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
