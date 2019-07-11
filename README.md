@@ -1,4 +1,4 @@
-# Calligator
+# Camibrate
 
 An easy-to-use library for calibrating cameras in python
 
