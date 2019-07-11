@@ -4,9 +4,13 @@ from copy import copy
 from scipy.sparse import lil_matrix
 from scipy import optimize
 from numba import jit
+from collections import defaultdict
+import toml
+import itertools
 
-from .boards import merge_rows, extract_points, extract_rtvecs, get_video_params
-from .utils import get_initial_extrinsics, get_connections
+from .boards import merge_rows, extract_points, \
+    extract_rtvecs, get_video_params
+from .utils import get_initial_extrinsics
 
 def make_M(rvec, tvec):
     out = np.zeros((4, 4))
@@ -45,6 +49,29 @@ class Camera:
         self.rvec = np.array(rvec)
         self.tvec = np.array(tvec)
         self.name = name
+
+    def get_dict(self):
+        return {
+            'name': self.get_name(),
+            'size': self.get_size(),
+            'matrix': self.get_camera_matrix().tolist(),
+            'distortions': self.get_distortions().tolist(),
+            'rotation': self.get_rotation().tolist(),
+            'translation': self.get_translation().tolist(),
+        }
+
+    def load_dict(self, d):
+        self.set_camera_matrix(d['matrix'])
+        self.set_rotation(d['rotation'])
+        self.set_translation(d['translation'])
+        self.set_distortions(d['distortions'])
+        self.set_name(d['name'])
+        self.set_size(d['size'])
+
+    def from_dict(d):
+        cam = Camera()
+        cam.load_dict(d)
+        return cam
 
     def get_camera_matrix(self):
         return self.matrix
@@ -150,6 +177,7 @@ class Camera:
         return copy(self)
 
 
+
 class CameraGroup:
     def __init__(self, cameras):
         self.cameras = cameras
@@ -247,7 +275,7 @@ class CameraGroup:
                 cnums = [p[0] for p in picked]
                 xnums = [p[1] for p in picked]
 
-                pts = points_sim[cnums, point_ix, xnums]
+                pts = points[cnums, point_ix, xnums]
                 cc = self.subset_cameras(cnums)
 
                 p3d = cc.triangulate(pts)
@@ -471,8 +499,6 @@ class CameraGroup:
             "number of cameras in CameraGroup does not " \
             "match number of cameras in 2D points given"
 
-        n_point_params = n_points * 3
-
         p3ds = self.triangulate(p2ds)
 
         x0 = np.zeros(total_cam_params + p3ds.size)
@@ -560,3 +586,34 @@ class CameraGroup:
             all_rows.append(rows_cam)
 
         return self.calibrate_rows(all_rows, board, verbose=verbose)
+
+    def get_dicts(self):
+        out = []
+        for cam in self.cameras:
+            out.append(cam.get_dict())
+        return out
+
+    def from_dicts(arr):
+        cameras = []
+        for d in arr:
+            cam = Camera.from_dict(d)
+            cameras.append(cam)
+        cgroup = CameraGroup(cameras)
+        return cgroup
+
+    def load_dicts(self, arr):
+        for cam, d in zip(self.cameras, arr):
+            cam.load_dict(d)
+
+    def dump(self, fname):
+        dicts = self.get_dicts()
+        names = ['cam_{}'.format(i) for i in range(len(dicts))]
+        master_dict = dict(zip(names, dicts))
+        with open(fname, 'w') as f:
+            toml.dump(master_dict, f)
+
+    def load(fname):
+        dicts = toml.load(fname)
+        keys = sorted(dicts.keys())
+        items = [dicts[k] for k in keys]
+        return CameraGroup.from_dicts(items)
