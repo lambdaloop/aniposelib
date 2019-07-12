@@ -243,7 +243,7 @@ class CameraGroup:
         return out
 
     def triangulate_possible(self, points, undistort=True,
-                             min_cams=2, progress=False):
+                             min_cams=2, progress=False, threshold=1):
         """Given an CxNxPx2 array, this returns an Nx3 array of points
         by triangulating all possible points and picking the ones with
         best reprojection error
@@ -263,8 +263,12 @@ class CameraGroup:
         for cam_num, point_num, possible_num in zip(cam_nums, point_nums,
                                                     possible_nums):
             if cam_num not in all_iters[point_num]:
-                all_iters[point_num][cam_num] = [None]
+                all_iters[point_num][cam_num] = []
             all_iters[point_num][cam_num].append((cam_num, possible_num))
+
+        for point_num in all_iters.keys():
+            for cam_num in all_iters[point_num].keys():
+                all_iters[point_num][cam_num].append(None)
 
         out = np.full((n_points, 3), np.nan, dtype='float')
         picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
@@ -303,6 +307,8 @@ class CameraGroup:
                         'joint_ix': point_ix
                     }
                     best_error = err
+                    if best_error < threshold:
+                        break
 
             if best_point is not None:
                 out[point_ix] = best_point['point']
