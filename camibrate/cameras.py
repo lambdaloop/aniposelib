@@ -179,8 +179,9 @@ class Camera:
 
 
 class CameraGroup:
-    def __init__(self, cameras):
+    def __init__(self, cameras, metadata={}):
         self.cameras = cameras
+        self.metadata = metadata
 
     def subset_cameras(self, indices):
         cams = np.array(self.cameras)
@@ -235,7 +236,7 @@ class CameraGroup:
 
         return out
 
-    def triangulate_possible(self, points, undistort=True):
+    def triangulate_possible(self, points, undistort=True, min_cams=2):
         """Given an CxNxPx2 array, this returns an Nx3 array of points
         by triangulating all possible points and picking the ones with
         best reprojection error
@@ -269,7 +270,7 @@ class CameraGroup:
 
             for picked in itertools.product(*all_iters[point_ix].values()):
                 picked = [p for p in picked if p is not None]
-                if len(picked) < 2:
+                if len(picked) < min_cams:
                     continue
 
                 cnums = [p[0] for p in picked]
@@ -278,18 +279,17 @@ class CameraGroup:
                 pts = points[cnums, point_ix, xnums]
                 cc = self.subset_cameras(cnums)
 
-                p3d = cc.triangulate(pts)
+                p3d = cc.triangulate(pts, undistort=undistort)
                 err = cc.reprojection_error(p3d, pts, mean=True)
 
                 if err < best_error:
-                    point = {
+                    best_point = {
                         'error': err,
                         'point': p3d[:3],
                         'points': pts,
                         'picked': picked,
                         'joint_ix': point_ix
                     }
-                    best_point = point
                     best_error = err
 
             if best_point is not None:
@@ -303,11 +303,24 @@ class CameraGroup:
 
         return out, picked_vals, points_2d, errors
 
+    def triangulate_ransac(self, points, undistort=True, min_cams=2):
+        """Given an CxNx2 array, this returns an Nx3 array of points,
+        where N is the number of points and C is the number of cameras"""
+
+        n_cams, n_points, _ = points.shape
+
+        points_ransac = points.reshape(n_cams, n_points, 1, 2)
+
+        return self.triangulate_possible(points_ransac,
+                                         undistort=undistort, min_cams=min_cams)
+
+
     @jit(nopython=True, parallel=True, forceobj=True)
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
-        this returns an CxNx2 array of errors"""
+        this returns an CxNx2 array of errors.
+        Optionally mean=True, this averages the errors and returns array of length N of errors"""
 
         one_point = False
         if len(p3ds.shape) == 1 and len(p2ds.shape) == 2:
@@ -383,10 +396,11 @@ class CameraGroup:
             b = (i + 1) * n_cam_params
             cam.set_params(best_params[a:b])
 
-        return best_params
+        error = self.average_error(p2ds)
+        return error
 
-    def bundle_adjust_iter(self, p2ds, n_iters=7, start_mu=100, end_mu=5,
-                           max_nfev=40, ftol=1e-2, verbose=True):
+    def bundle_adjust_iter(self, p2ds, n_iters=7, start_mu=None, end_mu=5,
+                           max_nfev=50, ftol=1e-2, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -394,36 +408,49 @@ class CameraGroup:
         to reduce the influence of outliers.
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
+        error = self.average_error(p2ds)
 
         if verbose:
-            print('error: ', self.average_error(p2ds))
+            print('error: ', error)
 
-        params = self.bundle_adjust(p2ds, loss='huber', threshold=start_mu, ftol=1e-2, max_nfev=100)
+        if start_mu is None:
+            p3ds = self.triangulate(p2ds)
+            errors = self.reprojection_error(p3ds, p2ds, mean=True)
+            q1, q3 = np.percentile(errors, [25, 75])
+            iqr = q3 - q1
+            start_mu = q3 + 7*iqr
+
+        # error = self.bundle_adjust(p2ds, threshold=start_mu, loss='huber', ftol=1e-2, max_nfev=100)
+        # if verbose:
+        #     print('error: ', error)
 
         mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
 
         for i in range(n_iters):
             p3ds = self.triangulate(p2ds)
             errors = self.reprojection_error(p3ds, p2ds, mean=True)
+            mu = mus[i]
+            good = errors < mu
+            self.bundle_adjust(p2ds[:, good],
+                               loss='linear', ftol=ftol,
+                               max_nfev=max_nfev,
+                               verbose=verbose)
+            error = self.average_error(p2ds)
+
             if verbose:
-                print('error: ', np.mean(errors))
+                print('error: {:.2f}, mu: {:.1f}'.format(error, mu))
 
-            mu = np.square(mus[i])
-            weights = np.square(mu / (mu + errors**2))
-            params = self.bundle_adjust(p2ds,
-                                        loss='linear', ftol=ftol, max_nfev=max_nfev,
-                                        weights=weights,
-                                        verbose=verbose)
+        p3ds = self.triangulate(p2ds)
+        errors = self.reprojection_error(p3ds, p2ds, mean=True)
+        good = errors < end_mu
+        self.bundle_adjust(p2ds[:, good], loss='linear', ftol=ftol/10.0, verbose=verbose)
 
-
-        # p3ds = self.triangulate(p2ds)
-        # errors = self.reprojection_error(p3ds, p2ds, mean=True)
-        # good = errors < end_mu
+        error = self.average_error(p2ds)
 
         if verbose:
-            print('error: ', self.average_error(p2ds))
+            print('error: ', error)
 
-        # self.bundle_adjust(p2ds[:, good], loss='linear', ftol=5e-3, verbose=verbose)
+        return error
 
     @jit(nopython=True, parallel=True, forceobj=True)
     def _error_fun(self, params, p2ds, n_cam_params, weights=None):
@@ -561,10 +588,9 @@ class CameraGroup:
         self.set_rotations(rvecs)
         self.set_translations(tvecs)
 
-        self.bundle_adjust_iter(imgp, start_mu=100, end_mu=5, verbose=verbose)
+        error = self.bundle_adjust_iter(imgp, verbose=verbose)
 
-        err = self.average_error(imgp)
-        return err
+        return error
 
     def calibrate_videos(self, videos, board, verbose=True):
         """Takes as input a list of list of video filenames, one list of each camera.
@@ -582,10 +608,10 @@ class CameraGroup:
                 params = get_video_params(vidname)
                 size = (params['width'], params['height'])
                 cam.set_size(size)
-
             all_rows.append(rows_cam)
 
-        return self.calibrate_rows(all_rows, board, verbose=verbose)
+        error = self.calibrate_rows(all_rows, board, verbose=verbose)
+        return error, all_rows
 
     def get_dicts(self):
         out = []
@@ -598,8 +624,14 @@ class CameraGroup:
         for d in arr:
             cam = Camera.from_dict(d)
             cameras.append(cam)
-        cgroup = CameraGroup(cameras)
-        return cgroup
+        return CameraGroup(cameras)
+
+    def from_names(names):
+        cameras = []
+        for name in names:
+            cam = Camera(name=name)
+            cameras.append(cam)
+        return CameraGroup(cameras)
 
     def load_dicts(self, arr):
         for cam, d in zip(self.cameras, arr):
@@ -609,11 +641,15 @@ class CameraGroup:
         dicts = self.get_dicts()
         names = ['cam_{}'.format(i) for i in range(len(dicts))]
         master_dict = dict(zip(names, dicts))
+        master_dict['metadata'] = self.metadata
         with open(fname, 'w') as f:
             toml.dump(master_dict, f)
 
     def load(fname):
-        dicts = toml.load(fname)
-        keys = sorted(dicts.keys())
-        items = [dicts[k] for k in keys]
-        return CameraGroup.from_dicts(items)
+        master_dict = toml.load(fname)
+        keys = sorted(master_dict.keys())
+        items = [master_dict[k] for k in keys if k != 'metadata']
+        cgroup = CameraGroup.from_dicts(items)
+        if 'metadata' in master_dict:
+            cgroup.metadata = master_dict['metadata']
+        return cgroup

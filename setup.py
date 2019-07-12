@@ -21,8 +21,8 @@ setuptools.setup(
         "Topic :: Scientific/Engineering :: Image Recognition"
     ],
     install_requires=[
-        'opencv-python',
-        'opencv-contrib-python'
+        'opencv-contrib-python',
+        'numba'
     ],
     extras_require={
         'full':  ["checkerboard"]

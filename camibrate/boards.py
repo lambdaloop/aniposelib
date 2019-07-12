@@ -424,7 +424,7 @@ class Checkerboard(CalibrationObject):
         return self.objPoints
 
     def estimate_pose_points(self, camera, points, ids=None):
-        ngood = np.sum(np.isnan(corners)) // 2
+        ngood = np.sum(np.isnan(points)) // 2
         if points is None or ngood < 3:
             return None, None
 
@@ -436,7 +436,7 @@ class Checkerboard(CalibrationObject):
         obj_points = self.get_object_points()
 
         retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
-                                                         corners,
+                                                         points,
                                                          K,
                                                          D,
                                                          confidence=0.9,
