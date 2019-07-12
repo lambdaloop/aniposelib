@@ -91,7 +91,7 @@ def extract_points(merged,
                    board,
                    cam_names=None,
                    min_cameras=1,
-                   min_points=2,
+                   min_points=4,
                    ignore_no_pose=False):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,

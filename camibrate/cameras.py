@@ -275,7 +275,7 @@ class CameraGroup:
             iterator = trange(n_points, ncols=70)
         else:
             iterator = range(n_points)
-        
+
         for point_ix in iterator:
             best_point = None
             best_error = 200
