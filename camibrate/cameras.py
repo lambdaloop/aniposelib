@@ -7,6 +7,7 @@ from numba import jit
 from collections import defaultdict
 import toml
 import itertools
+from tqdm import trange
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
@@ -201,7 +202,7 @@ class CameraGroup:
 
         return out
 
-    def triangulate(self, points, undistort=True):
+    def triangulate(self, points, undistort=True, progress=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
@@ -225,7 +226,12 @@ class CameraGroup:
 
         cam_mats = np.array([cam.get_extrinsics_mat() for cam in self.cameras])
 
-        for ip in range(n_points):
+        if progress:
+            iterator = trange(n_points, ncols=70)
+        else:
+            iterator = range(n_points)
+
+        for ip in iterator:
             subp = points[:, ip, :]
             good = ~np.isnan(subp[:, 0])
             if np.sum(good) >= 2:
@@ -236,7 +242,8 @@ class CameraGroup:
 
         return out
 
-    def triangulate_possible(self, points, undistort=True, min_cams=2):
+    def triangulate_possible(self, points, undistort=True,
+                             min_cams=2, progress=False):
         """Given an CxNxPx2 array, this returns an Nx3 array of points
         by triangulating all possible points and picking the ones with
         best reprojection error
@@ -259,12 +266,17 @@ class CameraGroup:
                 all_iters[point_num][cam_num] = [None]
             all_iters[point_num][cam_num].append((cam_num, possible_num))
 
-        out = np.zeros((n_points, 3), dtype='float')
+        out = np.full((n_points, 3), np.nan, dtype='float')
         picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
         errors = np.zeros(n_points, dtype='float')
         points_2d = np.full((n_cams, n_points, 2), np.nan, dtype='float')
 
-        for point_ix in range(n_points):
+        if progress:
+            iterator = trange(n_points, ncols=70)
+        else:
+            iterator = range(n_points)
+        
+        for point_ix in iterator:
             best_point = None
             best_error = 200
 
@@ -303,7 +315,7 @@ class CameraGroup:
 
         return out, picked_vals, points_2d, errors
 
-    def triangulate_ransac(self, points, undistort=True, min_cams=2):
+    def triangulate_ransac(self, points, undistort=True, min_cams=2, progress=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
@@ -312,10 +324,11 @@ class CameraGroup:
         points_ransac = points.reshape(n_cams, n_points, 1, 2)
 
         return self.triangulate_possible(points_ransac,
-                                         undistort=undistort, min_cams=min_cams)
+                                         undistort=undistort,
+                                         min_cams=min_cams,
+                                         progress=progress)
 
 
-    @jit(nopython=True, parallel=True, forceobj=True)
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -399,8 +412,8 @@ class CameraGroup:
         error = self.average_error(p2ds)
         return error
 
-    def bundle_adjust_iter(self, p2ds, n_iters=7, start_mu=None, end_mu=5,
-                           max_nfev=50, ftol=1e-2, verbose=True):
+    def bundle_adjust_iter(self, p2ds, n_iters=5, start_mu=300, end_mu=3,
+                           max_nfev=100, ftol=1e-2, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -418,7 +431,7 @@ class CameraGroup:
             errors = self.reprojection_error(p3ds, p2ds, mean=True)
             q1, q3 = np.percentile(errors, [25, 75])
             iqr = q3 - q1
-            start_mu = q3 + 7*iqr
+            start_mu = q3 + 10*iqr
 
         # error = self.bundle_adjust(p2ds, threshold=start_mu, loss='huber', ftol=1e-2, max_nfev=100)
         # if verbose:
