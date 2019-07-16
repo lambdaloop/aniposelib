@@ -36,6 +36,53 @@ def triangulate_simple(points, camera_mats):
     return p3d
 
 
+def get_error_dict(errors_full, min_points=3):
+    n_cams = errors_full.shape[0]
+    errors_norm = np.linalg.norm(errors_full, axis=2)
+
+    good = ~np.isnan(errors_full[:, :, 0])
+
+    error_dict = dict()
+
+    for i in range(n_cams):
+        for j in range(i+1, n_cams):
+            subset = good[i] & good[j]
+            err_subset = errors_norm[:, subset][[i, j]]
+            if np.sum(subset) > min_points:
+                percents = np.percentile(err_subset, [10, 50])
+                error_dict[(i, j)] = (err_subset.shape[1], percents)
+    return error_dict
+
+def check_errors(cgroup, imgp):
+    p3ds = cgroup.triangulate(imgp)
+    errors_full = cgroup.reprojection_error(p3ds, imgp, mean=False)
+    return get_error_dict(errors_full)
+
+def resample_points(imgp, n_samp=200):
+    n_cams = imgp.shape[0]
+    good = ~np.isnan(imgp[:, :, 0])
+    ixs = np.arange(imgp.shape[1])
+
+    num_cams = np.sum(~np.isnan(imgp[:, :, 0]), axis=0)
+
+    include = set()
+
+    for i in range(n_cams):
+        for j in range(i+1, n_cams):
+            subset = good[i] & good[j]
+            n_good = np.sum(subset)
+            if n_good > 0:
+                ## pick points, prioritizing points seen by more cameras
+                arr = np.copy(num_cams[subset]).astype('float')
+                arr += np.random.random(size=arr.shape)
+                picked_ix = np.argsort(-arr)[:n_samp]
+                picked = ixs[subset][picked_ix]
+                include.update(picked)
+
+    newp = imgp[:, sorted(include)]
+    return newp
+
+
 class Camera:
     def __init__(self,
                  matrix=np.eye(3),
@@ -361,7 +408,9 @@ class CameraGroup:
             errors_norm = np.linalg.norm(errors, axis=2)
             good = ~np.isnan(errors_norm)
             errors_norm[~good] = 0
-            errors = np.sum(errors_norm, axis=0) / np.sum(good, axis=0)
+            denom = np.sum(good, axis=0)
+            denom[denom == 0] = 1
+            errors = np.sum(errors_norm, axis=0) / denom
 
         if one_point:
             if mean:
@@ -418,8 +467,8 @@ class CameraGroup:
         error = self.average_error(p2ds)
         return error
 
-    def bundle_adjust_iter(self, p2ds, n_iters=5, start_mu=300, end_mu=3,
-                           max_nfev=100, ftol=1e-2, verbose=True):
+    def bundle_adjust_iter(self, p2ds, n_iters=3, start_mu=100, end_mu=5,
+                           max_nfev=200, ftol=1e-3, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -427,44 +476,47 @@ class CameraGroup:
         to reduce the influence of outliers.
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
-        error = self.average_error(p2ds)
+
+
+        error = self.average_error(p2ds, median=True)
 
         if verbose:
             print('error: ', error)
-
-        if start_mu is None:
-            p3ds = self.triangulate(p2ds)
-            errors = self.reprojection_error(p3ds, p2ds, mean=True)
-            q1, q3 = np.percentile(errors, [25, 75])
-            iqr = q3 - q1
-            start_mu = q3 + 10*iqr
-
-        # error = self.bundle_adjust(p2ds, threshold=start_mu, loss='huber', ftol=1e-2, max_nfev=100)
-        # if verbose:
-        #     print('error: ', error)
 
         mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
 
         for i in range(n_iters):
             p3ds = self.triangulate(p2ds)
-            errors = self.reprojection_error(p3ds, p2ds, mean=True)
-            mu = mus[i]
-            good = errors < mu
-            self.bundle_adjust(p2ds[:, good],
+            errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
+            errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
+
+            error_dict = get_error_dict(errors_full)
+            max_error = 0
+            min_error = 0
+            for k, v in error_dict.items():
+                num, percents = v
+                max_error = max(percents[-1], max_error)
+                min_error = max(percents[0], min_error)
+            mu = max(min(max_error, mus[i]), min_error)
+
+            good = errors_norm < mu
+            p2ds_samp = resample_points(p2ds[:, good], n_samp=50)
+
+            self.bundle_adjust(p2ds_samp,
                                loss='linear', ftol=ftol,
                                max_nfev=max_nfev,
                                verbose=verbose)
-            error = self.average_error(p2ds)
 
             if verbose:
-                print('error: {:.2f}, mu: {:.1f}'.format(error, mu))
+                error = self.average_error(p2ds, median=True)
+                print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
 
         p3ds = self.triangulate(p2ds)
         errors = self.reprojection_error(p3ds, p2ds, mean=True)
         good = errors < end_mu
         self.bundle_adjust(p2ds[:, good], loss='linear', ftol=ftol/10.0, verbose=verbose)
 
-        error = self.average_error(p2ds)
+        error = self.average_error(p2ds, median=True)
 
         if verbose:
             print('error: ', error)
@@ -579,10 +631,13 @@ class CameraGroup:
             tvecs.append(tvec)
         return np.array(tvecs)
 
-    def average_error(self, p2ds):
+    def average_error(self, p2ds, median=False):
         p3ds = self.triangulate(p2ds)
         errors = self.reprojection_error(p3ds, p2ds, mean=True)
-        return np.mean(errors)
+        if median:
+            return np.median(errors)
+        else:
+            return np.mean(errors)
 
     def calibrate_rows(self, all_rows, board, verbose=True):
         """Assumes camera sizes are set properly"""

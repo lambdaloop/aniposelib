@@ -519,7 +519,7 @@ class CharucoBoard(CalibrationObject):
             out[i] = cxs
         return out
 
-    def detect_markers(self, image, camera=None):
+    def detect_markers(self, image, camera=None, refine=True):
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
@@ -530,7 +530,7 @@ class CharucoBoard(CalibrationObject):
         params.adaptiveThreshWinSizeMin = 100
         params.adaptiveThreshWinSizeMax = 700
         params.adaptiveThreshWinSizeStep = 50
-        params.adaptiveThreshConstant = 5
+        params.adaptiveThreshConstant = 0
 
         corners, ids, rejectedImgPoints = aruco.detectMarkers(
             gray, self.dictionary, parameters=params)
@@ -544,11 +544,14 @@ class CharucoBoard(CalibrationObject):
             K = camera.get_camera_matrix()
             D = camera.get_distortions()
 
-        detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
-            aruco.refineDetectedMarkers(gray, self.board, corners, ids,
-                                        rejectedImgPoints,
-                                        K, D,
-                                        parameters=params)
+        if refine:
+            detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
+                aruco.refineDetectedMarkers(gray, self.board, corners, ids,
+                                            rejectedImgPoints,
+                                            K, D,
+                                            parameters=params)
+        else:
+            detectedCorners, detectedIds = corners, ids
 
         return detectedCorners, detectedIds
 
@@ -558,7 +561,7 @@ class CharucoBoard(CalibrationObject):
         else:
             gray = image
 
-        corners, ids = self.detect_markers(image, camera)
+        corners, ids = self.detect_markers(image, camera, refine=camera is not None)
         if len(corners) > 0:
             ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
                 corners, ids, gray, self.board)
