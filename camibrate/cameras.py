@@ -50,7 +50,7 @@ def get_error_dict(errors_full, min_points=10):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
             if np.sum(subset) > min_points:
-                percents = np.percentile(err_subset, [25, 50])
+                percents = np.percentile(err_subset, [10, 50])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
@@ -291,7 +291,7 @@ class CameraGroup:
         return out
 
     def triangulate_possible(self, points, undistort=True,
-                             min_cams=2, progress=False, threshold=1):
+                             min_cams=2, progress=False, threshold=0.5):
         """Given an CxNxPx2 array, this returns an Nx3 array of points
         by triangulating all possible points and picking the ones with
         best reprojection error
@@ -332,9 +332,11 @@ class CameraGroup:
             best_point = None
             best_error = 200
 
+            n_cams_max = len(all_iters[point_ix])
+
             for picked in itertools.product(*all_iters[point_ix].values()):
                 picked = [p for p in picked if p is not None]
-                if len(picked) < min_cams:
+                if len(picked) < min_cams and len(picked) != n_cams_max:
                     continue
 
                 cnums = [p[0] for p in picked]
@@ -468,7 +470,7 @@ class CameraGroup:
         error = self.average_error(p2ds)
         return error
 
-    def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=30, end_mu=1,
+    def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -677,7 +679,7 @@ class CameraGroup:
             all_rows[i] = board.estimate_pose_rows(cam, row)
 
         merged = merge_rows(all_rows)
-        objp, imgp = extract_points(merged, board, min_cameras=2, ignore_no_pose=True)
+        objp, imgp = extract_points(merged, board, min_cameras=2, ignore_no_pose=False)
 
         rtvecs = extract_rtvecs(merged)
         rvecs, tvecs = get_initial_extrinsics(rtvecs)
