@@ -8,6 +8,7 @@ from collections import defaultdict
 import toml
 import itertools
 from tqdm import trange
+from pprint import pprint
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
@@ -36,7 +37,7 @@ def triangulate_simple(points, camera_mats):
     return p3d
 
 
-def get_error_dict(errors_full, min_points=3):
+def get_error_dict(errors_full, min_points=10):
     n_cams = errors_full.shape[0]
     errors_norm = np.linalg.norm(errors_full, axis=2)
 
@@ -49,7 +50,7 @@ def get_error_dict(errors_full, min_points=3):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
             if np.sum(subset) > min_points:
-                percents = np.percentile(err_subset, [10, 50])
+                percents = np.percentile(err_subset, [25, 50])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
@@ -58,7 +59,7 @@ def check_errors(cgroup, imgp):
     errors_full = cgroup.reprojection_error(p3ds, imgp, mean=False)
     return get_error_dict(errors_full)
 
-def resample_points(imgp, n_samp=200):
+def resample_points(imgp, n_samp=25):
     n_cams = imgp.shape[0]
     good = ~np.isnan(imgp[:, :, 0])
     ixs = np.arange(imgp.shape[1])
@@ -467,8 +468,8 @@ class CameraGroup:
         error = self.average_error(p2ds)
         return error
 
-    def bundle_adjust_iter(self, p2ds, n_iters=3, start_mu=100, end_mu=5,
-                           max_nfev=200, ftol=1e-3, verbose=True):
+    def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=30, end_mu=1,
+                           max_nfev=200, ftol=1e-4, verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -500,7 +501,9 @@ class CameraGroup:
             mu = max(min(max_error, mus[i]), min_error)
 
             good = errors_norm < mu
-            p2ds_samp = resample_points(p2ds[:, good], n_samp=50)
+            p2ds_samp = resample_points(p2ds[:, good], n_samp=30)
+
+            pprint(error_dict)
 
             self.bundle_adjust(p2ds_samp,
                                loss='linear', ftol=ftol,
@@ -512,11 +515,30 @@ class CameraGroup:
                 print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
 
         p3ds = self.triangulate(p2ds)
-        errors = self.reprojection_error(p3ds, p2ds, mean=True)
-        good = errors < end_mu
-        self.bundle_adjust(p2ds[:, good], loss='linear', ftol=ftol/10.0, verbose=verbose)
+        errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
+        errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
+        error_dict = get_error_dict(errors_full)
+        pprint(error_dict)
+
+        max_error = 0
+        min_error = 0
+        for k, v in error_dict.items():
+            num, percents = v
+            max_error = max(percents[-1], max_error)
+            min_error = max(percents[0], min_error)
+        mu = max(max(max_error, end_mu), min_error)
+
+        good = errors_norm < mu
+        self.bundle_adjust(p2ds[:, good], loss='linear',
+                           ftol=ftol, max_nfev=max_nfev,
+                           verbose=verbose)
 
         error = self.average_error(p2ds, median=True)
+
+        p3ds = self.triangulate(p2ds)
+        errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
+        error_dict = get_error_dict(errors_full)
+        pprint(error_dict)
 
         if verbose:
             print('error: ', error)
