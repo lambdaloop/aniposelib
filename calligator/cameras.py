@@ -3,6 +3,7 @@ import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix
 from scipy import optimize
+from scipy import signal
 from numba import jit
 from collections import defaultdict
 import toml
@@ -82,6 +83,21 @@ def resample_points(imgp, n_samp=25):
 
     newp = imgp[:, sorted(include)]
     return newp
+
+def medfilt_data(values, size=15):
+    padsize = size+5
+    vpad = np.pad(values, (padsize, padsize), mode='reflect')
+    vpadf = signal.medfilt(vpad, kernel_size=size)
+    return vpadf[padsize:-padsize]
+
+def nan_helper(y):
+    return np.isnan(y), lambda z: z.nonzero()[0]
+
+def interpolate_data(vals):
+    nans, ix = nan_helper(vals)
+    out = np.copy(vals)
+    out[nans] = np.interp(ix(nans), ix(~nans), vals[~nans])
+    return out
 
 
 class Camera:
@@ -412,7 +428,7 @@ class CameraGroup:
             good = ~np.isnan(errors_norm)
             errors_norm[~good] = 0
             denom = np.sum(good, axis=0)
-            denom[denom == 0] = 1
+            denom[denom == 0] = np.nan
             errors = np.sum(errors_norm, axis=0) / denom
 
         if one_point:
@@ -423,52 +439,6 @@ class CameraGroup:
 
         return errors
 
-    # TODO: implement bundle adjustment with object points
-    def bundle_adjust(self, p2ds,
-                      loss='linear',
-                      threshold=50,
-                      ftol=1e-2,
-                      max_nfev=1000,
-                      weights=None,
-                      start_params=None,
-                      verbose=True):
-        """Given an CxNx2 array of 2D points,
-        where N is the number of points and C is the number of cameras,
-        this performs bundle adjustsment to fine-tune the parameters of the cameras"""
-
-        x0, n_cam_params = self._initialize_params(p2ds)
-        # error_fun = self._make_error_fun(p2ds, n_cam_params, weights=weights)
-
-        if start_params is not None:
-            x0 = start_params
-            n_cam_params = len(self.cameras[0].get_params())
-
-        error_fun = self._error_fun
-
-        jac_sparse = self._jac_sparsity_matrix(p2ds, n_cam_params)
-
-        f_scale = threshold
-        opt = optimize.least_squares(error_fun,
-                                     x0,
-                                     jac_sparsity=jac_sparse,
-                                     f_scale=f_scale,
-                                     x_scale='jac',
-                                     loss=loss,
-                                     ftol=ftol,
-                                     method='trf',
-                                     tr_solver='lsmr',
-                                     verbose=2 * verbose,
-                                     max_nfev=max_nfev,
-                                     args=(p2ds, n_cam_params, weights))
-        best_params = opt.x
-
-        for i, cam in enumerate(self.cameras):
-            a = i * n_cam_params
-            b = (i + 1) * n_cam_params
-            cam.set_params(best_params[a:b])
-
-        error = self.average_error(p2ds)
-        return error
 
     def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4, verbose=True):
@@ -547,8 +517,56 @@ class CameraGroup:
 
         return error
 
+
+    # TODO: implement bundle adjustment with object points
+    def bundle_adjust(self, p2ds,
+                      loss='linear',
+                      threshold=50,
+                      ftol=1e-2,
+                      max_nfev=1000,
+                      weights=None,
+                      start_params=None,
+                      verbose=True):
+        """Given an CxNx2 array of 2D points,
+        where N is the number of points and C is the number of cameras,
+        this performs bundle adjustsment to fine-tune the parameters of the cameras"""
+
+        x0, n_cam_params = self._initialize_params_bundle(p2ds)
+
+        if start_params is not None:
+            x0 = start_params
+            n_cam_params = len(self.cameras[0].get_params())
+
+        error_fun = self._error_fun_bundle
+
+        jac_sparse = self._jac_sparsity_bundle(p2ds, n_cam_params)
+
+        f_scale = threshold
+        opt = optimize.least_squares(error_fun,
+                                     x0,
+                                     jac_sparsity=jac_sparse,
+                                     f_scale=f_scale,
+                                     x_scale='jac',
+                                     loss=loss,
+                                     ftol=ftol,
+                                     method='trf',
+                                     tr_solver='lsmr',
+                                     verbose=2 * verbose,
+                                     max_nfev=max_nfev,
+                                     args=(p2ds, n_cam_params, weights))
+        best_params = opt.x
+
+        for i, cam in enumerate(self.cameras):
+            a = i * n_cam_params
+            b = (i + 1) * n_cam_params
+            cam.set_params(best_params[a:b])
+
+        error = self.average_error(p2ds)
+        return error
+
     @jit(nopython=True, parallel=True, forceobj=True)
-    def _error_fun(self, params, p2ds, n_cam_params, weights=None):
+    def _error_fun_bundle(self, params, p2ds, n_cam_params, weights=None):
+        """Error function for bundle adjustment"""
         good = ~np.isnan(p2ds)
         n_cams = len(self.cameras)
 
@@ -569,7 +587,7 @@ class CameraGroup:
         return errors[good]
 
 
-    def _jac_sparsity_matrix(self, p2ds, n_cam_params):
+    def _jac_sparsity_bundle(self, p2ds, n_cam_params):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         compute the sparsity structure of the jacobian for bundle adjustment"""
@@ -606,10 +624,10 @@ class CameraGroup:
 
         return A_sparse
 
-    def _initialize_params(self, p2ds):
+    def _initialize_params_bundle(self, p2ds):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
-        initializes the parameters"""
+        initializes the parameters for bundle adjustment"""
 
         cam_params = np.hstack([cam.get_params() for cam in self.cameras])
         n_cam_params = len(cam_params) // len(self.cameras)
@@ -628,6 +646,178 @@ class CameraGroup:
         x0[total_cam_params:] = p3ds.ravel()
 
         return x0, n_cam_params
+
+    def triangulate_optim(self, points, constraints=[],
+                          scale_smooth=3, scale_length=3,
+                          scores=None, init_progress=False,
+                          init_ransac=False, verbose=False):
+        """
+        Take in an array of 2D points of shape CxNxJx2, and an array of constraints of shape Kx2, where
+        C: number of camera
+        N: number of frames
+        J: number of joints
+        K: number of constraints
+
+        This function creates an optimized array of 3D points of shape NxJx3.
+
+        Example constraints:
+        constraints = [[0, 1], [1, 2], [2, 3]]
+        (meaning that lengths of joints 0->1, 1->2, 2->3 are all constant)
+
+        """
+
+        n_cams, n_frames, n_joints, _ = points.shape
+        constraints = np.array(constraints)
+
+        points_shaped = points.reshape(n_cams, n_frames*n_joints, 2)
+        if init_ransac:
+            p3ds, picked, p2ds, errors = self.triangulate_ransac(points_shaped, progress=init_progress)
+        else:
+            p3ds = self.triangulate(points_shaped, progress=init_progress)
+        p3ds = p3ds.reshape((n_frames, n_joints, 3))
+        p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
+
+        p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
+
+        default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
+        scale_smooth_full = scale_smooth * default_smooth
+
+        jac1 = self._jac_sparsity_triangulation(points, [])
+        jac2 = self._jac_sparsity_triangulation(points, constraints)
+
+        x1 = self._initialize_params_triangulation(p3ds_intp, [])
+
+        opt1 = optimize.least_squares(self._error_fun_triangulation,
+                                      x0=x1, jac_sparsity=jac1,
+                                      loss='linear',
+                                      ftol=1e-3,
+                                      verbose=2*verbose,
+                                      args=(points,
+                                            np.array([]),
+                                            scores,
+                                            scale_smooth_full,
+                                            0))
+
+        p3ds_new1 = opt1.x[:p3ds.size].reshape(p3ds.shape)
+        x2 = self._initialize_params_triangulation(p3ds_new1, constraints)
+
+        opt2 = optimize.least_squares(self._error_fun_triangulation,
+                                      x0=x2, jac_sparsity=jac2,
+                                      loss='linear',
+                                      ftol=1e-3,
+                                      verbose=2*verbose,
+                                      args=(points,
+                                            constraints,
+                                            scores,
+                                            scale_smooth_full,
+                                            scale_length))
+
+        p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
+
+        return p3ds_new2
+
+
+    @jit(nopython=True, forceobj=True)
+    def _error_fun_triangulation(self, params, p2ds, constraints=[],
+                                 scores=None,
+                                 scale_smooth=10000, scale_length=1):
+        n_cams, n_frames, n_joints, _ = p2ds.shape
+
+        n_3d = n_frames*n_joints*3
+        n_constraints = len(constraints)
+
+        # load params
+        p3ds = params[:n_3d].reshape((n_frames, n_joints, 3))
+        joint_lengths = np.array(params[n_3d:])
+
+        # reprojection errors
+        p3ds_flat = p3ds.reshape(-1, 3)
+        p2ds_flat = p2ds.reshape((n_cams, -1, 2))
+        errors = self.reprojection_error(p3ds_flat, p2ds_flat)
+        if scores is not None:
+            scores_flat = scores.reshape((n_cams, -1))
+            errors = errors * scores_flat[:, :, None]
+        errors_reproj = errors[~np.isnan(p2ds_flat)]
+
+        # temporal constraint
+        errors_smooth = np.diff(p3ds, axis=0).ravel() * scale_smooth
+
+        # joint length constraint
+        errors_lengths = np.empty((n_constraints, n_frames), dtype='float')
+        for cix, (a, b) in enumerate(constraints):
+            lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
+            expected = joint_lengths[cix]
+            errors_lengths[cix] = 100*(lengths - expected)/expected
+        errors_lengths = errors_lengths.ravel() * scale_length
+
+        return np.hstack([errors_reproj, errors_smooth, errors_lengths])
+
+    def _initialize_params_triangulation(self, p3ds, constraints=[]):
+        n_constraints = len(constraints)
+        joint_lengths = np.empty(n_constraints, dtype='float')
+        for cix, (a, b) in enumerate(constraints):
+            lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
+            joint_lengths[cix] = np.median(lengths)
+        return np.hstack([p3ds.ravel(), joint_lengths])
+
+
+    def _jac_sparsity_triangulation(self, p2ds, constraints=[]):
+        n_cams, n_frames, n_joints, _ = p2ds.shape
+        n_constraints = len(constraints)
+
+        p2ds_flat = p2ds.reshape((n_cams, -1, 2))
+
+        point_indices = np.zeros(p2ds_flat.shape, dtype='int32')
+        for i in range(p2ds_flat.shape[1]):
+            point_indices[:, i] = i
+
+        point_indices_3d = np.arange(n_frames*n_joints)\
+                             .reshape((n_frames, n_joints))
+
+        good = ~np.isnan(p2ds_flat)
+        n_errors_reproj = np.sum(good)
+        n_errors_smooth = (n_frames-1) * n_joints * 3
+        n_errors_lengths = n_constraints * n_frames
+        n_errors = n_errors_reproj + n_errors_smooth + n_errors_lengths
+
+        n_3d = n_frames*n_joints*3
+        n_params = n_3d + n_constraints
+
+        point_indices_good = point_indices[good]
+
+        A_sparse = lil_matrix((n_errors, n_params), dtype='int16')
+
+        # constraints for reprojection errors
+        ix_reproj = np.arange(n_errors_reproj)
+        for k in range(3):
+            A_sparse[ix_reproj, point_indices_good * 3 + k] = 1
+
+        # sparse constraints for smoothness in time
+        frames = np.arange(n_frames-1)
+        for j in range(n_joints):
+            pa = point_indices_3d[frames, j]
+            pb = point_indices_3d[frames+1, j]
+            for k in range(3):
+                A_sparse[n_errors_reproj + pa*3 + k, pa*3 + k] = 1
+                A_sparse[n_errors_reproj + pa*3 + k, pb*3 + k] = 1
+
+        # joint lengths should change with joint lengths errors
+        start = n_errors_reproj + n_errors_smooth
+        frames = np.arange(n_frames)
+        for cix, (a, b) in enumerate(constraints):
+            A_sparse[start + cix*n_frames + frames, n_3d+cix] = 1
+
+        # points should change accordingly to match joint lengths too
+        frames = np.arange(n_frames)
+        for cix, (a, b) in enumerate(constraints):
+            pa = point_indices_3d[frames, a]
+            pb = point_indices_3d[frames, b]
+            for k in range(3):
+                A_sparse[start + cix*n_frames + frames, pa*3 + k] = 1
+                A_sparse[start + cix*n_frames + frames, pb*3 + k] = 1
+
+        return A_sparse
+
 
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
