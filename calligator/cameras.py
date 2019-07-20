@@ -427,8 +427,8 @@ class CameraGroup:
             errors_norm = np.linalg.norm(errors, axis=2)
             good = ~np.isnan(errors_norm)
             errors_norm[~good] = 0
-            denom = np.sum(good, axis=0)
-            denom[denom == 0] = np.nan
+            denom = np.sum(good, axis=0).astype('float')
+            denom[denom < 0.5] = np.nan
             errors = np.sum(errors_norm, axis=0) / denom
 
         if one_point:
@@ -648,7 +648,7 @@ class CameraGroup:
         return x0, n_cam_params
 
     def triangulate_optim(self, points, constraints=[],
-                          scale_smooth=3, scale_length=3,
+                          scale_smooth=2, scale_length=3,
                           scores=None, init_progress=False,
                           init_ransac=False, verbose=False):
         """
