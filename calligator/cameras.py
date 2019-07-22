@@ -96,7 +96,10 @@ def nan_helper(y):
 def interpolate_data(vals):
     nans, ix = nan_helper(vals)
     out = np.copy(vals)
-    out[nans] = np.interp(ix(nans), ix(~nans), vals[~nans])
+    try:
+        out[nans] = np.interp(ix(nans), ix(~nans), vals[~nans])
+    except ValueError:
+        out[:] = 0
     return out
 
 
@@ -648,7 +651,8 @@ class CameraGroup:
         return x0, n_cam_params
 
     def triangulate_optim(self, points, constraints=[],
-                          scale_smooth=2, scale_length=3,
+                          scale_smooth=4, scale_length=2,
+                          reproj_error_threshold=15,
                           scores=None, init_progress=False,
                           init_ransac=False, verbose=False):
         """
@@ -696,7 +700,8 @@ class CameraGroup:
                                             np.array([]),
                                             scores,
                                             scale_smooth_full,
-                                            0))
+                                            0,
+                                            reproj_error_threshold))
 
         p3ds_new1 = opt1.x[:p3ds.size].reshape(p3ds.shape)
         x2 = self._initialize_params_triangulation(p3ds_new1, constraints)
@@ -710,7 +715,8 @@ class CameraGroup:
                                             constraints,
                                             scores,
                                             scale_smooth_full,
-                                            scale_length))
+                                            scale_length,
+                                            reproj_error_threshold))
 
         p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
 
@@ -720,7 +726,8 @@ class CameraGroup:
     @jit(nopython=True, forceobj=True)
     def _error_fun_triangulation(self, params, p2ds, constraints=[],
                                  scores=None,
-                                 scale_smooth=10000, scale_length=1):
+                                 scale_smooth=10000, scale_length=1,
+                                 reproj_error_threshold=100):
         n_cams, n_frames, n_joints, _ = p2ds.shape
 
         n_3d = n_frames*n_joints*3
@@ -738,6 +745,10 @@ class CameraGroup:
             scores_flat = scores.reshape((n_cams, -1))
             errors = errors * scores_flat[:, :, None]
         errors_reproj = errors[~np.isnan(p2ds_flat)]
+
+        rp = reproj_error_threshold
+        bad = errors_reproj > rp
+        errors_reproj[bad] = rp*(2*np.sqrt(errors_reproj[bad]/rp) - 1)
 
         # temporal constraint
         errors_smooth = np.diff(p3ds, axis=0).ravel() * scale_smooth
