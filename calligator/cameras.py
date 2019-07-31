@@ -719,7 +719,7 @@ class CameraGroup:
 
         t2 = time.time()
 
-        if init_progress:
+        if verbose:
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
         return p3ds_new2
