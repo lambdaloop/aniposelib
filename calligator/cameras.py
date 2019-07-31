@@ -10,6 +10,7 @@ import toml
 import itertools
 from tqdm import trange
 from pprint import pprint
+import time
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
@@ -404,6 +405,7 @@ class CameraGroup:
                                          progress=progress)
 
 
+    @jit(nopython=True, parallel=True, forceobj=True)
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -690,34 +692,16 @@ class CameraGroup:
         default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
         scale_smooth_full = scale_smooth * default_smooth
 
-        jac1 = self._jac_sparsity_triangulation(
-            points, [], [], n_deriv_smooth)
-        jac2 = self._jac_sparsity_triangulation(
+        t1 = time.time()
+
+        x0 = self._initialize_params_triangulation(
+            p3ds_intp, constraints, constraints_weak)
+
+        jac = self._jac_sparsity_triangulation(
             points, constraints, constraints_weak, n_deriv_smooth)
 
-        x1 = self._initialize_params_triangulation(p3ds_intp)
-
-        opt1 = optimize.least_squares(self._error_fun_triangulation,
-                                      x0=x1, jac_sparsity=jac1,
-                                      loss='linear',
-                                      ftol=1e-3,
-                                      verbose=2*verbose,
-                                      args=(points,
-                                            np.array([]),
-                                            np.array([]),
-                                            scores,
-                                            scale_smooth_full,
-                                            0,
-                                            0,
-                                            reproj_error_threshold,
-                                            n_deriv_smooth))
-
-        p3ds_new1 = opt1.x[:p3ds.size].reshape(p3ds.shape)
-        x2 = self._initialize_params_triangulation(
-            p3ds_new1, constraints, constraints_weak)
-
         opt2 = optimize.least_squares(self._error_fun_triangulation,
-                                      x0=x2, jac_sparsity=jac2,
+                                      x0=x0, jac_sparsity=jac,
                                       loss='linear',
                                       ftol=1e-3,
                                       verbose=2*verbose,
@@ -733,10 +717,15 @@ class CameraGroup:
 
         p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
 
+        t2 = time.time()
+
+        if init_progress:
+            print('optimization took {:.2f} seconds'.format(t2 - t1))
+
         return p3ds_new2
 
 
-    @jit(nopython=True, forceobj=True)
+    @jit(nopython=True, forceobj=True, parallel=True)
     def _error_fun_triangulation(self, params, p2ds,
                                  constraints=[],
                                  constraints_weak=[],
