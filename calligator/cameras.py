@@ -104,6 +104,7 @@ def interpolate_data(vals):
     return out
 
 
+
 class Camera:
     def __init__(self,
                  matrix=np.eye(3),
@@ -791,9 +792,22 @@ class CameraGroup:
             lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
             joint_lengths[cix] = np.median(lengths)
 
+
         for cix, (a, b) in enumerate(constraints_weak):
             lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
             joint_lengths_weak[cix] = np.median(lengths)
+
+        all_lengths = np.hstack([joint_lengths, joint_lengths_weak])
+        med = np.median(all_lengths)
+        if med == 0:
+            med = 1e-3
+
+        mad = np.median(np.abs(all_lengths - med))
+
+        joint_lengths[joint_lengths == 0] = med
+        joint_lengths_weak[joint_lengths_weak == 0] = med
+        joint_lengths[joint_lengths > med+mad*5] = med
+        joint_lengths_weak[joint_lengths_weak > med+mad*5] = med
 
         return np.hstack([p3ds.ravel(), joint_lengths, joint_lengths_weak])
 
@@ -914,7 +928,7 @@ class CameraGroup:
         else:
             return np.mean(errors)
 
-    def calibrate_rows(self, all_rows, board, verbose=True):
+    def calibrate_rows(self, all_rows, board, init_extrinsics=True, verbose=True):
         """Assumes camera sizes are set properly"""
         for rows, camera in zip(all_rows, self.cameras):
             size = camera.get_size()
@@ -932,16 +946,17 @@ class CameraGroup:
         merged = merge_rows(all_rows)
         objp, imgp = extract_points(merged, board, min_cameras=2, ignore_no_pose=False)
 
-        rtvecs = extract_rtvecs(merged)
-        rvecs, tvecs = get_initial_extrinsics(rtvecs)
-        self.set_rotations(rvecs)
-        self.set_translations(tvecs)
+        if init_extrinsics:
+            rtvecs = extract_rtvecs(merged)
+            rvecs, tvecs = get_initial_extrinsics(rtvecs)
+            self.set_rotations(rvecs)
+            self.set_translations(tvecs)
 
         error = self.bundle_adjust_iter(imgp, verbose=verbose)
 
         return error
 
-    def calibrate_videos(self, videos, board, verbose=True):
+    def calibrate_videos(self, videos, board, init_extrinsics=True, verbose=True):
         """Takes as input a list of list of video filenames, one list of each camera.
         Also takes a board which specifies what should be detected in the videos"""
 
@@ -959,7 +974,7 @@ class CameraGroup:
                 cam.set_size(size)
             all_rows.append(rows_cam)
 
-        error = self.calibrate_rows(all_rows, board, verbose=verbose)
+        error = self.calibrate_rows(all_rows, board, init_extrinsics=init_extrinsics, verbose=verbose)
         return error, all_rows
 
     def get_dicts(self):
