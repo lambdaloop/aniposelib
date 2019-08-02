@@ -246,6 +246,40 @@ class Camera:
     def copy(self):
         return copy(self)
 
+class FisheyeCamera(Camera):
+    def __init__(self,
+                 matrix=np.eye(3),
+                 dist=np.zeros(4),
+                 size=None,
+                 rvec=np.zeros(3),
+                 tvec=np.zeros(3),
+                 name=None):
+        self.matrix = np.array(matrix)
+        self.dist = np.array(dist)
+        self.size = size
+        self.rvec = np.array(rvec)
+        self.tvec = np.array(tvec)
+        self.name = name
+
+    def distort_points(self, points):
+        shape = points.shape
+        points = points.reshape(-1, 1, 2)
+        new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
+        out, _ = cv2.fisheye.projectPoints(new_points, np.zeros(3), np.zeros(3),
+                                          self.matrix, self.dist)
+        return out.reshape(shape)
+
+    def undistort_points(self, points):
+        shape = points.shape
+        points = points.reshape(-1, 1, 2)
+        out = cv2.fisheye.undistortPoints(points, self.matrix, self.dist)
+        return out.reshape(shape)
+
+    def project(self, points):
+        points = points.reshape(-1, 1, 3)
+        out, _ = cv2.fisheye.projectPoints(points, self.rvec, self.tvec, self.matrix,
+                                           self.dist)
+        return out
 
 
 class CameraGroup:
