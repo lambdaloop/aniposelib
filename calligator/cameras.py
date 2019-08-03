@@ -52,7 +52,7 @@ def get_error_dict(errors_full, min_points=10):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
             if np.sum(subset) > min_points:
-                percents = np.percentile(err_subset, [10, 50])
+                percents = np.percentile(err_subset, [20, 50])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
@@ -199,7 +199,7 @@ class Camera:
         return self.size
 
     def get_params(self):
-        params = np.zeros(8, dtype='float32')
+        params = np.zeros(8, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
@@ -214,7 +214,7 @@ class Camera:
         self.set_translation(params[3:6])
         self.set_focal_length(params[6])
 
-        dist = np.zeros(5, dtype='float32')
+        dist = np.zeros(5, dtype='float64')
         dist[0] = params[7]
         # dist[1] = params[8]
         self.set_distortions(dist)
@@ -224,8 +224,8 @@ class Camera:
         points = points.reshape(-1, 1, 2)
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
-                                   self.matrix.astype('float32'),
-                                   self.dist.astype('float32'))
+                                   self.matrix.astype('float64'),
+                                   self.dist.astype('float64'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
@@ -237,8 +237,8 @@ class Camera:
     def project(self, points):
         points = points.reshape(-1, 1, 3)
         out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
-                                   self.matrix.astype('float32'),
-                                   self.dist.astype('float32'))
+                                   self.matrix.astype('float64'),
+                                   self.dist.astype('float64'))
         return out
 
     def reprojection_error(self, p3d, p2d):
@@ -274,24 +274,24 @@ class FisheyeCamera(Camera):
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.fisheye.projectPoints(new_points,
                                            np.zeros(3), np.zeros(3),
-                                           self.matrix.astype('float32'),
-                                           self.dist.astype('float32'))
+                                           self.matrix.astype('float64'),
+                                           self.dist.astype('float64'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
         out = cv2.fisheye.undistortPoints(points,
-                                          self.matrix.astype('float32'),
-                                          self.dist.astype('float32'))
+                                          self.matrix.astype('float64'),
+                                          self.dist.astype('float64'))
         return out.reshape(shape)
 
     def project(self, points):
         points = points.reshape(-1, 1, 3)
         out, _ = cv2.fisheye.projectPoints(points,
                                            self.rvec, self.tvec,
-                                           self.matrix.astype('float32'),
-                                           self.dist.astype('float32'))
+                                           self.matrix.astype('float64'),
+                                           self.dist.astype('float64'))
         return out
 
     def set_params(self, params):
@@ -299,7 +299,7 @@ class FisheyeCamera(Camera):
         self.set_translation(params[3:6])
         self.set_focal_length(params[6])
 
-        dist = np.zeros(4, dtype='float32')
+        dist = np.zeros(4, dtype='float64')
         dist[0] = params[7]
         # dist[1] = params[8]
         self.set_distortions(dist)
@@ -514,7 +514,7 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
-        p2ds = resample_points(p2ds, n_samp=n_samp_full)
+        # p2ds = resample_points(p2ds, n_samp=n_samp_full)
 
         error = self.average_error(p2ds, median=True)
 
@@ -538,7 +538,7 @@ class CameraGroup:
             mu = max(min(max_error, mus[i]), min_error)
 
             good = errors_norm < mu
-            p2ds_samp = resample_points(p2ds[:, good], n_samp=30)
+            p2ds_samp = resample_points(p2ds[:, good], n_samp=n_samp_iter)
 
             pprint(error_dict)
 
