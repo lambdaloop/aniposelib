@@ -5,7 +5,7 @@ from scipy.sparse import lil_matrix
 from scipy import optimize
 from scipy import signal
 from numba import jit
-from collections import defaultdict
+from collections import defaultdict, Counter
 import toml
 import itertools
 from tqdm import trange
@@ -14,15 +14,7 @@ import time
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
-from .utils import get_initial_extrinsics
-
-def make_M(rvec, tvec):
-    out = np.zeros((4, 4))
-    rotmat, _ = cv2.Rodrigues(rvec)
-    out[:3, :3] = rotmat
-    out[:3, 3] = tvec.flatten()
-    out[3, 3] = 1
-    return out
+from .utils import get_initial_extrinsics, make_M, get_rtvec
 
 @jit(nopython=True, parallel=True)
 def triangulate_simple(points, camera_mats):
@@ -61,7 +53,47 @@ def check_errors(cgroup, imgp):
     errors_full = cgroup.reprojection_error(p3ds, imgp, mean=False)
     return get_error_dict(errors_full)
 
-def resample_points(imgp, n_samp=25):
+def subset_extra(extra, ixs):
+    if extra is None:
+        return None
+    
+    new_extra = {
+        'objp': extra['objp'][ixs],
+        'ids': extra['ids'][ixs],
+        'rvecs': extra['rvecs'][:, ixs],
+        'tvecs': extra['tvecs'][:, ixs]
+    }
+    return new_extra
+
+def resample_points_extra(imgp, extra, n_samp=25):
+    ids = extra['ids']
+    good = ~np.isnan(imgp[:, :, 0])
+    id_list = good * ids
+    cam_counts = np.zeros(imgp.shape[0])
+    ixs = np.arange(imgp.shape[1])
+    counts = Counter(id_list.ravel())
+
+    counts[0] = 0
+    
+    for board_id, count in counts.most_common():
+        counts[board_id] += np.random.random()*5
+    
+    include = set()
+    for board_id, count in counts.most_common():
+        include.update(ixs[ids == board_id])
+        cam_counts += np.sum(good[:, ids==board_id], axis=1)
+        if np.all(cam_counts >= n_samp):
+            break
+
+    final_ixs = sorted(include)
+    newp = imgp[:, final_ixs]
+    extra = subset_extra(extra, final_ixs)
+    return newp, extra
+
+def resample_points(imgp, extra=None, n_samp=25):
+    if extra is not None:
+        return resample_points_extra(imgp, extra, n_samp)
+    
     n_cams = imgp.shape[0]
     good = ~np.isnan(imgp[:, :, 0])
     ixs = np.arange(imgp.shape[1])
@@ -82,8 +114,9 @@ def resample_points(imgp, n_samp=25):
                 picked = ixs[subset][picked_ix]
                 include.update(picked)
 
-    newp = imgp[:, sorted(include)]
-    return newp
+    final_ixs = sorted(include)
+    newp = imgp[:, final_ixs]
+    return newp, None
 
 def medfilt_data(values, size=15):
     padsize = size+5
@@ -103,7 +136,31 @@ def interpolate_data(vals):
         out[:] = 0
     return out
 
+def remap_ids(ids):
+    unique_ids = np.unique(ids)
+    ids_out = np.copy(ids)
+    for i, num in enumerate(unique_ids):
+        ids_out[ids == num] = i
+    return ids_out
 
+def transform_points(points, rvecs, tvecs):
+    """Rotate points by given rotation vectors and translate.
+    Rodrigues' rotation formula is used.
+    """
+    theta = np.linalg.norm(rvecs, axis=1)[:, np.newaxis]
+    with np.errstate(invalid='ignore'):
+        v = rvecs / theta
+        v = np.nan_to_num(v)
+    dot = np.sum(points * v, axis=1)[:, np.newaxis]
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    rotated = cos_theta * points + \
+        sin_theta * np.cross(v, points) + \
+        dot * (1 - cos_theta) * v
+
+    return rotated + tvecs
+    
 
 class Camera:
     def __init__(self,
@@ -206,7 +263,6 @@ class Camera:
         dist = self.get_distortions()
         params[7] = dist[0]
         # params[8] = dist[1]
-
         return params
 
     def set_params(self, params):
@@ -302,8 +358,22 @@ class FisheyeCamera(Camera):
         dist = np.zeros(4, dtype='float32')
         dist[0] = params[7]
         # dist[1] = params[8]
+        # dist[2] = params[9]
+        # dist[3] = params[10]
         self.set_distortions(dist)
 
+    def get_params(self):
+        params = np.zeros(8, dtype='float32')
+        params[0:3] = self.get_rotation()
+        params[3:6] = self.get_translation()
+        params[6] = self.get_focal_length()
+        dist = self.get_distortions()
+        params[7] = dist[0]
+        # params[8] = dist[1]
+        # params[9] = dist[2]
+        # params[10] = dist[3]
+        return params
+        
 class CameraGroup:
     def __init__(self, cameras, metadata={}):
         self.cameras = cameras
@@ -490,7 +560,7 @@ class CameraGroup:
             good = ~np.isnan(errors_norm)
             errors_norm[~good] = 0
             denom = np.sum(good, axis=0).astype('float')
-            denom[denom < 0.5] = np.nan
+            denom[denom < 1.5] = np.nan
             errors = np.sum(errors_norm, axis=0) / denom
 
         if one_point:
@@ -502,9 +572,10 @@ class CameraGroup:
         return errors
 
 
-    def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=15, end_mu=1,
+    def bundle_adjust_iter(self, p2ds, extra=None,
+                           n_iters=15, start_mu=30, end_mu=3,
                            max_nfev=200, ftol=1e-4,
-                           n_samp_full=2000, n_samp_iter=30, 
+                           p_samp_iter=0.005, 
                            verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -514,16 +585,30 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
-        p2ds = resample_points(p2ds, n_samp=n_samp_full)
-
+        extra = None
+        
+        p2ds_full = p2ds
+        extra_full = extra
+        
+        
+        n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
+        n_samp_iter = max(n_samp_iter, 30)
+        
+        p2ds, extra = resample_points(p2ds_full, extra_full,
+                                      n_samp=n_samp_iter*5)
         error = self.average_error(p2ds, median=True)
 
         if verbose:
             print('error: ', error)
 
         mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
-
+        
+        if verbose:
+            print('n_samples: {}'.format(n_samp_iter))
+        
         for i in range(n_iters):
+            p2ds, extra = resample_points(p2ds_full, extra_full,
+                                          n_samp=n_samp_iter*5)
             p3ds = self.triangulate(p2ds)
             errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
             errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
@@ -538,11 +623,14 @@ class CameraGroup:
             mu = max(min(max_error, mus[i]), min_error)
 
             good = errors_norm < mu
-            p2ds_samp = resample_points(p2ds[:, good], n_samp=30)
+            extra_good = subset_extra(extra, good)
+            p2ds_samp = p2ds[:, good]
+            p2ds_samp, extra_samp = resample_points(
+                p2ds[:, good], extra_good, n_samp=n_samp_iter)
 
             pprint(error_dict)
 
-            self.bundle_adjust(p2ds_samp,
+            self.bundle_adjust(p2ds_samp, extra_good,
                                loss='linear', ftol=ftol,
                                max_nfev=max_nfev,
                                verbose=verbose)
@@ -551,6 +639,8 @@ class CameraGroup:
                 error = self.average_error(p2ds, median=True)
                 print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
 
+        p2ds, extra = resample_points(p2ds_full, extra_full,
+                                      n_samp=n_samp_iter*2)
         p3ds = self.triangulate(p2ds)
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
         errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
@@ -566,7 +656,9 @@ class CameraGroup:
         mu = max(max(max_error, end_mu), min_error)
 
         good = errors_norm < mu
-        self.bundle_adjust(p2ds[:, good], loss='linear',
+        extra_good = subset_extra(extra, good)
+        self.bundle_adjust(p2ds[:, good], extra_good,
+                           loss='linear',
                            ftol=ftol, max_nfev=max_nfev,
                            verbose=verbose)
 
@@ -584,7 +676,7 @@ class CameraGroup:
 
 
     # TODO: implement bundle adjustment with object points
-    def bundle_adjust(self, p2ds,
+    def bundle_adjust(self, p2ds, extra=None,
                       loss='linear',
                       threshold=50,
                       ftol=1e-2,
@@ -596,7 +688,10 @@ class CameraGroup:
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustsment to fine-tune the parameters of the cameras"""
 
-        x0, n_cam_params = self._initialize_params_bundle(p2ds)
+        if extra is not None:
+            extra['ids_map'] = remap_ids(extra['ids'])
+        
+        x0, n_cam_params = self._initialize_params_bundle(p2ds, extra)
 
         if start_params is not None:
             x0 = start_params
@@ -604,7 +699,7 @@ class CameraGroup:
 
         error_fun = self._error_fun_bundle
 
-        jac_sparse = self._jac_sparsity_bundle(p2ds, n_cam_params)
+        jac_sparse = self._jac_sparsity_bundle(p2ds, n_cam_params, extra)
 
         f_scale = threshold
         opt = optimize.least_squares(error_fun,
@@ -618,7 +713,7 @@ class CameraGroup:
                                      tr_solver='lsmr',
                                      verbose=2 * verbose,
                                      max_nfev=max_nfev,
-                                     args=(p2ds, n_cam_params, weights))
+                                     args=(p2ds, n_cam_params, extra))
         best_params = opt.x
 
         for i, cam in enumerate(self.cameras):
@@ -630,7 +725,7 @@ class CameraGroup:
         return error
 
     @jit(nopython=True, parallel=True, forceobj=True)
-    def _error_fun_bundle(self, params, p2ds, n_cam_params, weights=None):
+    def _error_fun_bundle(self, params, p2ds, n_cam_params, extra):
         """Error function for bundle adjustment"""
         good = ~np.isnan(p2ds)
         n_cams = len(self.cameras)
@@ -643,20 +738,31 @@ class CameraGroup:
 
         n_cams = len(self.cameras)
         sub = n_cam_params * n_cams
-        p3ds_test = params[sub:].reshape(-1, 3)
+        n3d = p2ds.shape[1] * 3
+        p3ds_test = params[sub:sub+n3d].reshape(-1, 3)
         errors = self.reprojection_error(p3ds_test, p2ds)
+        errors_reproj = errors[good]
+        
+        if extra is not None:
+            ids = extra['ids_map']
+            objp = extra['objp']
+            n_boards = int(np.max(ids)) + 1
+            a = sub+n3d
+            rvecs = params[a:a+n_boards*3].reshape(-1, 3)
+            tvecs = params[a+n_boards*3:a+n_boards*6].reshape(-1, 3)
+            expected = transform_points(objp, rvecs[ids], tvecs[ids])
+            errors_obj = (p3ds_test - expected).ravel() * 100
+        else:
+            errors_obj = np.array([])
+                
+        return np.hstack([errors_reproj, errors_obj])
 
-        if weights is not None:
-            errors = errors * weights.reshape(-1, 1)
 
-        return errors[good]
-
-
-    def _jac_sparsity_bundle(self, p2ds, n_cam_params):
+    def _jac_sparsity_bundle(self, p2ds, n_cam_params, extra):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         compute the sparsity structure of the jacobian for bundle adjustment"""
-
+        
         point_indices = np.zeros(p2ds.shape, dtype='int32')
         cam_indices = np.zeros(p2ds.shape, dtype='int32')
 
@@ -668,28 +774,68 @@ class CameraGroup:
 
         good = ~np.isnan(p2ds)
 
+        if extra is not None:
+            ids = extra['ids_map']
+            n_boards = int(np.max(ids)) + 1
+            total_board_params = n_boards * (3 + 3) # rvecs + tvecs
+        else:
+            n_boards = 0
+            total_board_params = 0
+            
         n_cams = p2ds.shape[0]
         n_points = p2ds.shape[1]
-        n_params = n_cams * n_cam_params + n_points * 3
+        total_params_reproj = n_cams * n_cam_params + n_points * 3
+        n_params = total_params_reproj + total_board_params
 
-        n_errors = np.sum(good)
+        n_good_values = np.sum(good)
+        if extra is not None:
+            n_errors = n_good_values + n_points * 3
+        else:
+            n_errors = n_good_values
 
         A_sparse = lil_matrix((n_errors, n_params), dtype='int16')
 
         cam_indices_good = cam_indices[good]
         point_indices_good = point_indices[good]
 
-        ix = np.arange(n_errors)
+        # -- reprojection error -- 
+        ix = np.arange(n_good_values)
 
+        ## update camera params based on point error
         for i in range(n_cam_params):
             A_sparse[ix, cam_indices_good * n_cam_params + i] = 1
 
+        ## update point position based on point error
         for i in range(3):
             A_sparse[ix, n_cams * n_cam_params + point_indices_good * 3 + i] = 1
 
+        # -- match for the object points-- 
+        if extra is not None:
+            point_ix = np.arange(n_points)
+
+            ## update all the camera parameters
+            A_sparse[n_good_values:n_good_values+n_points*3,
+                     0:n_cams*n_cam_params] = 1
+            
+            ## update board rotation and translation based on error from expected
+
+            for i in range(3):
+                for j in range(3):
+                    A_sparse[n_good_values + point_ix*3 + i,
+                             total_params_reproj + ids*3 + j] = 1
+                    A_sparse[n_good_values + point_ix*3 + i,
+                             total_params_reproj + n_boards*3 + ids*3 + j] = 1
+            
+            
+            ## update point position based on error from expected
+            for i in range(3):
+                A_sparse[n_good_values + point_ix*3 + i,
+                         n_cams*n_cam_params + point_ix*3 + i] = 1
+
+            
         return A_sparse
 
-    def _initialize_params_bundle(self, p2ds):
+    def _initialize_params_bundle(self, p2ds, extra):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         initializes the parameters for bundle adjustment"""
@@ -706,10 +852,42 @@ class CameraGroup:
 
         p3ds = self.triangulate(p2ds)
 
-        x0 = np.zeros(total_cam_params + p3ds.size)
-        x0[:total_cam_params] = cam_params
-        x0[total_cam_params:] = p3ds.ravel()
+        if extra is not None:
+            ids = extra['ids_map']
+            rvecs_all = extra['rvecs']
+            tvecs_all = extra['tvecs']
+            
+            n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
+            total_board_params = n_boards * (3 + 3) # rvecs + tvecs
+            
+            rvecs = np.zeros((n_boards, 3), dtype='float32')
+            tvecs = np.zeros((n_boards, 3), dtype='float32')
 
+            for board_num in range(n_boards):
+                point_id = np.where(ids == board_num)[0][0]
+                cam_ids_possible = np.where(~np.isnan(p2ds[:, point_id, 0]))[0]
+                cam_id = np.random.choice(cam_ids_possible)
+                M_cam = self.cameras[cam_id].get_extrinsics_mat()
+                M_board_cam = make_M(rvecs_all[cam_id, point_id],
+                                     tvecs_all[cam_id, point_id])
+                M_board = np.matmul(np.linalg.inv(M_cam), M_board_cam)
+                rvec, tvec = get_rtvec(M_board)
+                rvecs[board_num] = rvec
+                tvecs[board_num] = tvec
+            
+        else:
+            total_board_params = 0
+            
+        x0 = np.zeros(total_cam_params + p3ds.size + total_board_params)
+        x0[:total_cam_params] = cam_params
+        x0[total_cam_params:total_cam_params+p3ds.size] = p3ds.ravel()
+
+        if extra is not None:
+            start_board = total_cam_params+p3ds.size
+            x0[start_board:start_board + n_boards*3] = rvecs.ravel()
+            x0[start_board + n_boards*3:start_board + n_boards*6] = \
+                tvecs.ravel()
+        
         return x0, n_cam_params
 
     def triangulate_optim(self, points,
@@ -987,7 +1165,8 @@ class CameraGroup:
         else:
             return np.mean(errors)
 
-    def calibrate_rows(self, all_rows, board, init_extrinsics=True, verbose=True):
+    def calibrate_rows(self, all_rows, board,
+                       init_extrinsics=True, verbose=True):
         """Assumes camera sizes are set properly"""
         for rows, camera in zip(all_rows, self.cameras):
             size = camera.get_size()
@@ -1003,7 +1182,7 @@ class CameraGroup:
             all_rows[i] = board.estimate_pose_rows(cam, row)
 
         merged = merge_rows(all_rows)
-        objp, imgp = extract_points(merged, board, min_cameras=2, ignore_no_pose=False)
+        imgp, extra = extract_points(merged, board, min_cameras=2)
 
         if init_extrinsics:
             rtvecs = extract_rtvecs(merged)
@@ -1011,7 +1190,7 @@ class CameraGroup:
             self.set_rotations(rvecs)
             self.set_translations(tvecs)
 
-        error = self.bundle_adjust_iter(imgp, verbose=verbose)
+        error = self.bundle_adjust_iter(imgp, extra, verbose=verbose)
 
         return error
 

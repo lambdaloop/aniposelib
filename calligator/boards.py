@@ -91,8 +91,7 @@ def extract_points(merged,
                    board,
                    cam_names=None,
                    min_cameras=1,
-                   min_points=4,
-                   ignore_no_pose=False):
+                   min_points=4):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,
     where C is the number of cameras, N is the number of points.
@@ -111,41 +110,64 @@ def extract_points(merged,
 
     objp_template = board.get_object_points().reshape(-1, 3)
 
-    objp = np.empty((n_cams, n_detects, n_points_per_detect, 3),
-                    dtype='float32')
-    objp[:] = np.nan
 
-    imgp = np.empty((n_cams, n_detects, n_points_per_detect, 2),
+    imgp = np.full((n_cams, n_detects, n_points_per_detect, 2),
+                   np.nan, dtype='float32')
+
+    rvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
+                    np.nan, dtype='float32')
+    
+    tvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
+                    np.nan, dtype='float32')
+
+    objp = np.empty((n_detects, n_points_per_detect, 3),
                     dtype='float32')
-    imgp[:] = np.nan
+    
+    board_ids = np.empty((n_detects, n_points_per_detect),
+                         dtype='int32')
 
     for rix, row in enumerate(merged):
+        objp[rix] = np.copy(objp_template)
+        board_ids[rix] = rix
+        
         for cix, cname in enumerate(cam_names):
             if cname in row:
                 filled = row[cname]['filled'].reshape(-1, 2)
                 bad = np.any(np.isnan(filled), axis=1)
                 num_good = np.sum(~bad)
                 if num_good < min_points or \
-                   ignore_no_pose and \
                    (row[cname].get('rvec', None) is None or \
                     row[cname].get('tvec', None) is None):
                     continue
 
-                objp_here = np.copy(objp_template)
                 imgp[cix, rix] = filled
-                objp_here[bad] = np.nan
-                objp[cix, rix] = objp_here
-
-    objp = np.reshape(objp, (n_cams, -1, 3))
+                
+                rvecs[cix, rix, ~bad] = row[cname]['rvec'].ravel()
+                tvecs[cix, rix, ~bad] = row[cname]['tvec'].ravel()
+                
     imgp = np.reshape(imgp, (n_cams, -1, 2))
+    rvecs = np.reshape(rvecs, (n_cams, -1, 3))
+    tvecs = np.reshape(tvecs, (n_cams, -1, 3))
+    objp = np.reshape(objp, (-1, 3))
+    board_ids = np.reshape(board_ids, (-1))
 
     num_good = np.sum(~np.isnan(imgp), axis=0)[:, 0]
     good = num_good >= min_cameras
 
-    objp = objp[:, good]
     imgp = imgp[:, good]
+    rvecs = rvecs[:, good]
+    tvecs = tvecs[:, good]
+    objp = objp[good]
+    board_ids = board_ids[good]
 
-    return objp, imgp
+    extra = {
+        'objp': objp,
+        'ids': board_ids,
+        'rvecs': rvecs,
+        'tvecs': tvecs
+    }
+    
+    return imgp, extra
 
 
 def extract_rtvecs(merged,
