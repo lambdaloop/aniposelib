@@ -261,6 +261,11 @@ class FisheyeCamera(Camera):
         self.tvec = np.array(tvec)
         self.name = name
 
+    def get_dict(self):
+        d = super().get_dict()
+        d['fisheye'] = True
+        return d
+
     def distort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
@@ -1020,14 +1025,20 @@ class CameraGroup:
     def from_dicts(arr):
         cameras = []
         for d in arr:
-            cam = Camera.from_dict(d)
+            if 'fisheye' in d and d['fisheye']:
+                cam = FisheyeCamera.from_dict(d)
+            else:
+                cam = Camera.from_dict(d)
             cameras.append(cam)
         return CameraGroup(cameras)
 
-    def from_names(names):
+    def from_names(names, fisheye=False):
         cameras = []
         for name in names:
-            cam = Camera(name=name)
+            if fisheye:
+                cam = FisheyeCamera(name=name)
+            else:
+                cam = Camera(name=name)
             cameras.append(cam)
         return CameraGroup(cameras)
 
