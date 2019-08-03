@@ -573,7 +573,7 @@ class CameraGroup:
 
 
     def bundle_adjust_iter(self, p2ds, extra=None,
-                           n_iters=15, start_mu=30, end_mu=3,
+                           n_iters=15, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4,
                            p_samp_iter=0.005, 
                            verbose=True):
@@ -587,15 +587,16 @@ class CameraGroup:
 
         extra = None
         
-        p2ds_full = p2ds
-        extra_full = extra
-        
+        # p2ds_full = p2ds
+        # extra_full = extra
         
         n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
         n_samp_iter = max(n_samp_iter, 30)
+
+        n_samp_full = max(n_samp_iter*5, 1000)
         
-        p2ds, extra = resample_points(p2ds_full, extra_full,
-                                      n_samp=n_samp_iter*5)
+        # p2ds, extra = resample_points(p2ds_full, extra_full,
+        #                               n_samp=n_samp_full)
         error = self.average_error(p2ds, median=True)
 
         if verbose:
@@ -607,8 +608,8 @@ class CameraGroup:
             print('n_samples: {}'.format(n_samp_iter))
         
         for i in range(n_iters):
-            p2ds, extra = resample_points(p2ds_full, extra_full,
-                                          n_samp=n_samp_iter*5)
+            # p2ds, extra = resample_points(p2ds_full, extra_full,
+            #                               n_samp=n_samp_full)
             p3ds = self.triangulate(p2ds)
             errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
             errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
@@ -624,7 +625,6 @@ class CameraGroup:
 
             good = errors_norm < mu
             extra_good = subset_extra(extra, good)
-            p2ds_samp = p2ds[:, good]
             p2ds_samp, extra_samp = resample_points(
                 p2ds[:, good], extra_good, n_samp=n_samp_iter)
 
@@ -640,7 +640,7 @@ class CameraGroup:
                 print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
-                                      n_samp=n_samp_iter*2)
+                                      n_samp=n_samp_full*2)
         p3ds = self.triangulate(p2ds)
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
         errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
