@@ -224,7 +224,8 @@ class Camera:
         points = points.reshape(-1, 1, 2)
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
-                                   self.matrix, self.dist)
+                                   self.matrix.astype('float32'),
+                                   self.dist.astype('float32'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
@@ -235,8 +236,9 @@ class Camera:
 
     def project(self, points):
         points = points.reshape(-1, 1, 3)
-        out, _ = cv2.projectPoints(points, self.rvec, self.tvec, self.matrix,
-                                   self.dist)
+        out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
+                                   self.matrix.astype('float32'),
+                                   self.dist.astype('float32'))
         return out
 
     def reprojection_error(self, p3d, p2d):
@@ -270,22 +272,37 @@ class FisheyeCamera(Camera):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
-        out, _ = cv2.fisheye.projectPoints(new_points, np.zeros(3), np.zeros(3),
-                                          self.matrix, self.dist)
+        out, _ = cv2.fisheye.projectPoints(new_points,
+                                           np.zeros(3), np.zeros(3),
+                                           self.matrix.astype('float32'),
+                                           self.dist.astype('float32'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
-        out = cv2.fisheye.undistortPoints(points, self.matrix, self.dist)
+        out = cv2.fisheye.undistortPoints(points,
+                                          self.matrix.astype('float32'),
+                                          self.dist.astype('float32'))
         return out.reshape(shape)
 
     def project(self, points):
         points = points.reshape(-1, 1, 3)
-        out, _ = cv2.fisheye.projectPoints(points, self.rvec, self.tvec, self.matrix,
-                                           self.dist)
+        out, _ = cv2.fisheye.projectPoints(points,
+                                           self.rvec, self.tvec,
+                                           self.matrix.astype('float32'),
+                                           self.dist.astype('float32'))
         return out
 
+    def set_params(self, params):
+        self.set_rotation(params[0:3])
+        self.set_translation(params[3:6])
+        self.set_focal_length(params[6])
+
+        dist = np.zeros(4, dtype='float32')
+        dist[0] = params[7]
+        # dist[1] = params[8]
+        self.set_distortions(dist)
 
 class CameraGroup:
     def __init__(self, cameras, metadata={}):
@@ -486,7 +503,9 @@ class CameraGroup:
 
 
     def bundle_adjust_iter(self, p2ds, n_iters=15, start_mu=15, end_mu=1,
-                           max_nfev=200, ftol=1e-4, verbose=True):
+                           max_nfev=200, ftol=1e-4,
+                           n_samp_full=2000, n_samp_iter=30, 
+                           verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -495,6 +514,7 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
+        p2ds = resample_points(p2ds, n_samp=n_samp_full)
 
         error = self.average_error(p2ds, median=True)
 
@@ -995,10 +1015,7 @@ class CameraGroup:
 
         return error
 
-    def calibrate_videos(self, videos, board, init_extrinsics=True, verbose=True):
-        """Takes as input a list of list of video filenames, one list of each camera.
-        Also takes a board which specifies what should be detected in the videos"""
-
+    def get_rows_videos(self, videos, board, verbose=True):
         all_rows = []
 
         for cix, (cam, cam_videos) in enumerate(zip(self.cameras, videos)):
@@ -1007,13 +1024,28 @@ class CameraGroup:
                 if verbose: print(vidname)
                 rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
                 rows_cam.extend(rows)
+            all_rows.append(rows_cam)
 
+        return all_rows
+
+    def set_camera_sizes_videos(self, videos):
+        for cix, (cam, cam_videos) in enumerate(zip(self.cameras, videos)):
+            rows_cam = []
+            for vnum, vidname in enumerate(cam_videos):
                 params = get_video_params(vidname)
                 size = (params['width'], params['height'])
                 cam.set_size(size)
-            all_rows.append(rows_cam)
 
-        error = self.calibrate_rows(all_rows, board, init_extrinsics=init_extrinsics, verbose=verbose)
+    def calibrate_videos(self, videos, board, init_extrinsics=True, verbose=True):
+        """Takes as input a list of list of video filenames, one list of each camera.
+        Also takes a board which specifies what should be detected in the videos"""
+
+        all_rows = self.get_rows_videos(videos, board, verbose=verbose)
+        self.set_camera_sizes_videos(videos)
+        
+        error = self.calibrate_rows(all_rows, board,
+                                    init_extrinsics=init_extrinsics,
+                                    verbose=verbose)
         return error, all_rows
 
     def get_dicts(self):
