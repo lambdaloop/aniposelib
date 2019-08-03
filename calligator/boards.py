@@ -112,16 +112,16 @@ def extract_points(merged,
 
 
     imgp = np.full((n_cams, n_detects, n_points_per_detect, 2),
-                   np.nan, dtype='float32')
+                   np.nan, dtype='float64')
 
     rvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
-                    np.nan, dtype='float32')
+                    np.nan, dtype='float64')
     
     tvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
-                    np.nan, dtype='float32')
+                    np.nan, dtype='float64')
 
     objp = np.empty((n_detects, n_points_per_detect, 3),
-                    dtype='float32')
+                    dtype='float64')
     
     board_ids = np.empty((n_detects, n_points_per_detect),
                          dtype='int32')
@@ -192,7 +192,7 @@ def extract_rtvecs(merged,
     n_cams = len(cam_names)
     n_detects = len(merged)
 
-    rtvecs = np.empty((n_cams, n_detects, 6), dtype='float32')
+    rtvecs = np.empty((n_cams, n_detects, 6), dtype='float64')
     rtvecs[:] = np.nan
 
     for rix, row in enumerate(merged):
@@ -361,8 +361,8 @@ class CalibrationObject(ABC):
         all_obj = np.vstack(all_obj)
         all_img = np.vstack(all_img)
 
-        all_obj = np.array(all_obj, dtype='float32')
-        all_img = np.array(all_img, dtype='float32')
+        all_obj = np.array(all_obj, dtype='float64')
+        all_img = np.array(all_img, dtype='float64')
 
         return all_obj, all_img
 
@@ -383,7 +383,7 @@ class Checkerboard(CalibrationObject):
 
         total_size = squaresX * squaresY
 
-        objp = np.zeros((total_size, 3), np.float32)
+        objp = np.zeros((total_size, 3), np.float64)
         objp[:, :2] = np.mgrid[0:squaresY, 0:squaresX].T.reshape(-1, 2)
         objp *= square_length
         self.objPoints = objp
@@ -510,7 +510,7 @@ class CharucoBoard(CalibrationObject):
 
         total_size = (squaresX - 1) * (squaresY - 1)
 
-        objp = np.zeros((total_size, 3), np.float32)
+        objp = np.zeros((total_size, 3), np.float64)
         objp[:, :2] = np.mgrid[0:(squaresY - 1), 0:(squaresX - 1)].T.reshape(
             -1, 2)
         objp *= square_length
@@ -588,9 +588,9 @@ class CharucoBoard(CalibrationObject):
             ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
                 corners, ids, gray, self.board)
             if detectedIds is None:
-                detectedCorners = detectedIds = np.float32([])
+                detectedCorners = detectedIds = np.float64([])
         else:
-            detectedCorners = detectedIds = np.float32([])
+            detectedCorners = detectedIds = np.float64([])
 
         return detectedCorners, detectedIds
 

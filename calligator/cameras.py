@@ -256,7 +256,7 @@ class Camera:
         return self.size
 
     def get_params(self):
-        params = np.zeros(8, dtype='float32')
+        params = np.zeros(8, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
@@ -270,7 +270,7 @@ class Camera:
         self.set_translation(params[3:6])
         self.set_focal_length(params[6])
 
-        dist = np.zeros(5, dtype='float32')
+        dist = np.zeros(5, dtype='float64')
         dist[0] = params[7]
         # dist[1] = params[8]
         self.set_distortions(dist)
@@ -280,8 +280,8 @@ class Camera:
         points = points.reshape(-1, 1, 2)
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
-                                   self.matrix.astype('float32'),
-                                   self.dist.astype('float32'))
+                                   self.matrix.astype('float64'),
+                                   self.dist.astype('float64'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
@@ -293,8 +293,8 @@ class Camera:
     def project(self, points):
         points = points.reshape(-1, 1, 3)
         out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
-                                   self.matrix.astype('float32'),
-                                   self.dist.astype('float32'))
+                                   self.matrix.astype('float64'),
+                                   self.dist.astype('float64'))
         return out
 
     def reprojection_error(self, p3d, p2d):
@@ -330,24 +330,24 @@ class FisheyeCamera(Camera):
         new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
         out, _ = cv2.fisheye.projectPoints(new_points,
                                            np.zeros(3), np.zeros(3),
-                                           self.matrix.astype('float32'),
-                                           self.dist.astype('float32'))
+                                           self.matrix.astype('float64'),
+                                           self.dist.astype('float64'))
         return out.reshape(shape)
 
     def undistort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
         out = cv2.fisheye.undistortPoints(points,
-                                          self.matrix.astype('float32'),
-                                          self.dist.astype('float32'))
+                                          self.matrix.astype('float64'),
+                                          self.dist.astype('float64'))
         return out.reshape(shape)
 
     def project(self, points):
         points = points.reshape(-1, 1, 3)
         out, _ = cv2.fisheye.projectPoints(points,
                                            self.rvec, self.tvec,
-                                           self.matrix.astype('float32'),
-                                           self.dist.astype('float32'))
+                                           self.matrix.astype('float64'),
+                                           self.dist.astype('float64'))
         return out
 
     def set_params(self, params):
@@ -355,7 +355,7 @@ class FisheyeCamera(Camera):
         self.set_translation(params[3:6])
         self.set_focal_length(params[6])
 
-        dist = np.zeros(4, dtype='float32')
+        dist = np.zeros(4, dtype='float64')
         dist[0] = params[7]
         # dist[1] = params[8]
         # dist[2] = params[9]
@@ -363,7 +363,7 @@ class FisheyeCamera(Camera):
         self.set_distortions(dist)
 
     def get_params(self):
-        params = np.zeros(8, dtype='float32')
+        params = np.zeros(8, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
@@ -587,16 +587,16 @@ class CameraGroup:
 
         extra = None
         
-        # p2ds_full = p2ds
-        # extra_full = extra
+        p2ds_full = p2ds
+        extra_full = extra
         
         n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
         n_samp_iter = max(n_samp_iter, 30)
 
-        n_samp_full = max(n_samp_iter*5, 1000)
+        n_samp_full = max(n_samp_iter*5, 2000)
         
-        # p2ds, extra = resample_points(p2ds_full, extra_full,
-        #                               n_samp=n_samp_full)
+        p2ds, extra = resample_points(p2ds_full, extra_full,
+                                      n_samp=n_samp_full)
         error = self.average_error(p2ds, median=True)
 
         if verbose:
@@ -608,8 +608,8 @@ class CameraGroup:
             print('n_samples: {}'.format(n_samp_iter))
         
         for i in range(n_iters):
-            # p2ds, extra = resample_points(p2ds_full, extra_full,
-            #                               n_samp=n_samp_full)
+            p2ds, extra = resample_points(p2ds_full, extra_full,
+                                          n_samp=n_samp_full)
             p3ds = self.triangulate(p2ds)
             errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
             errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
@@ -746,12 +746,13 @@ class CameraGroup:
         if extra is not None:
             ids = extra['ids_map']
             objp = extra['objp']
+            min_scale = np.min(objp[objp > 0])
             n_boards = int(np.max(ids)) + 1
             a = sub+n3d
             rvecs = params[a:a+n_boards*3].reshape(-1, 3)
             tvecs = params[a+n_boards*3:a+n_boards*6].reshape(-1, 3)
             expected = transform_points(objp, rvecs[ids], tvecs[ids])
-            errors_obj = (p3ds_test - expected).ravel() * 100
+            errors_obj = (p3ds_test - expected).ravel() / min_scale
         else:
             errors_obj = np.array([])
                 
@@ -860,8 +861,8 @@ class CameraGroup:
             n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
             total_board_params = n_boards * (3 + 3) # rvecs + tvecs
             
-            rvecs = np.zeros((n_boards, 3), dtype='float32')
-            tvecs = np.zeros((n_boards, 3), dtype='float32')
+            rvecs = np.zeros((n_boards, 3), dtype='float64')
+            tvecs = np.zeros((n_boards, 3), dtype='float64')
 
             for board_num in range(n_boards):
                 point_id = np.where(ids == board_num)[0][0]
@@ -1175,7 +1176,8 @@ class CameraGroup:
                 "Camera with name {} has no specified frame size".format(camera.get_name())
 
             objp, imgp = board.get_all_calibration_points(rows)
-            matrix = cv2.initCameraMatrix2D([objp], [imgp], size)
+            matrix = cv2.initCameraMatrix2D([objp.astype('float32')],
+                                            [imgp.astype('float32')], size)
             camera.set_camera_matrix(matrix)
 
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
