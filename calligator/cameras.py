@@ -52,7 +52,7 @@ def get_error_dict(errors_full, min_points=10):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
             if np.sum(subset) > min_points:
-                percents = np.percentile(err_subset, [20, 50])
+                percents = np.percentile(err_subset, [10, 50])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
