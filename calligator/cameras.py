@@ -44,7 +44,7 @@ def get_error_dict(errors_full, min_points=10):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
             if np.sum(subset) > min_points:
-                percents = np.percentile(err_subset, [10, 50])
+                percents = np.percentile(err_subset, [25, 75])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
@@ -112,7 +112,7 @@ def resample_points(imgp, extra=None, n_samp=25):
             n_good = np.sum(subset)
             if n_good > 0:
                 ## pick points, prioritizing points seen by more cameras
-                arr = np.copy(num_cams[subset]).astype('float')
+                arr = np.copy(num_cams[subset]).astype('float64')
                 arr += np.random.random(size=arr.shape)
                 picked_ix = np.argsort(-arr)[:n_samp]
                 picked = ixs[subset][picked_ix]
@@ -470,10 +470,10 @@ class CameraGroup:
             for cam_num in all_iters[point_num].keys():
                 all_iters[point_num][cam_num].append(None)
 
-        out = np.full((n_points, 3), np.nan, dtype='float')
+        out = np.full((n_points, 3), np.nan, dtype='float64')
         picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
-        errors = np.zeros(n_points, dtype='float')
-        points_2d = np.full((n_cams, n_points, 2), np.nan, dtype='float')
+        errors = np.zeros(n_points, dtype='float64')
+        points_2d = np.full((n_cams, n_points, 2), np.nan, dtype='float64')
 
         if progress:
             iterator = trange(n_points, ncols=70)
@@ -564,7 +564,7 @@ class CameraGroup:
             errors_norm = np.linalg.norm(errors, axis=2)
             good = ~np.isnan(errors_norm)
             errors_norm[~good] = 0
-            denom = np.sum(good, axis=0).astype('float')
+            denom = np.sum(good, axis=0).astype('float64')
             denom[denom < 1.5] = np.nan
             errors = np.sum(errors_norm, axis=0) / denom
 
@@ -662,7 +662,7 @@ class CameraGroup:
         extra_good = subset_extra(extra, good)
         self.bundle_adjust(p2ds[:, good], extra_good,
                            loss='linear',
-                           ftol=ftol, max_nfev=max_nfev,
+                           ftol=ftol, max_nfev=1000,
                            verbose=verbose)
 
         error = self.average_error(p2ds, median=True)
@@ -816,11 +816,10 @@ class CameraGroup:
             point_ix = np.arange(n_points)
 
             ## update all the camera parameters
-            A_sparse[n_good_values:n_good_values+n_points*3,
-                     0:n_cams*n_cam_params] = 1
+            # A_sparse[n_good_values:n_good_values+n_points*3,
+            #          0:n_cams*n_cam_params] = 1
 
             ## update board rotation and translation based on error from expected
-
             for i in range(3):
                 for j in range(3):
                     A_sparse[n_good_values + point_ix*3 + i,
@@ -1004,14 +1003,14 @@ class CameraGroup:
         errors_smooth = np.diff(p3ds, n=n_deriv_smooth, axis=0).ravel() * scale_smooth
 
         # joint length constraint
-        errors_lengths = np.empty((n_constraints, n_frames), dtype='float')
+        errors_lengths = np.empty((n_constraints, n_frames), dtype='float64')
         for cix, (a, b) in enumerate(constraints):
             lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
             expected = joint_lengths[cix]
             errors_lengths[cix] = 100*(lengths - expected)/expected
         errors_lengths = errors_lengths.ravel() * scale_length
 
-        errors_lengths_weak = np.empty((n_constraints_weak, n_frames), dtype='float')
+        errors_lengths_weak = np.empty((n_constraints_weak, n_frames), dtype='float64')
         for cix, (a, b) in enumerate(constraints_weak):
             lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
             expected = joint_lengths_weak[cix]
@@ -1024,8 +1023,8 @@ class CameraGroup:
     def _initialize_params_triangulation(self, p3ds,
                                          constraints=[],
                                          constraints_weak=[]):
-        joint_lengths = np.empty(len(constraints), dtype='float')
-        joint_lengths_weak = np.empty(len(constraints_weak), dtype='float')
+        joint_lengths = np.empty(len(constraints), dtype='float64')
+        joint_lengths_weak = np.empty(len(constraints_weak), dtype='float64')
 
         for cix, (a, b) in enumerate(constraints):
             lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
