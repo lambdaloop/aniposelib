@@ -627,20 +627,20 @@ class CameraGroup:
             p2ds_samp, extra_samp = resample_points(
                 p2ds[:, good], extra_good, n_samp=n_samp_iter)
 
-            pprint(error_dict)
+            error = np.median(errors_norm)
+
+            if error < error_threshold:
+                break
+
+            if verbose:
+                pprint(error_dict)
+                print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
 
             self.bundle_adjust(p2ds_samp, extra_samp,
                                loss='linear', ftol=ftol,
                                max_nfev=max_nfev,
                                verbose=verbose)
 
-            error = self.average_error(p2ds, median=True)
-
-            if verbose:
-                print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
-
-            if error < error_threshold:
-                break
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full*2)
