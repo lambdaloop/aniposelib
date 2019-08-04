@@ -677,12 +677,10 @@ class CameraGroup:
 
         return error
 
-
-    # TODO: implement bundle adjustment with object points
     def bundle_adjust(self, p2ds, extra=None,
                       loss='linear',
                       threshold=50,
-                      ftol=1e-2,
+                      ftol=1e-4,
                       max_nfev=1000,
                       weights=None,
                       start_params=None,
