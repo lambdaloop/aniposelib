@@ -643,7 +643,7 @@ class CameraGroup:
 
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
-                                      n_samp=n_samp_full*2)
+                                      n_samp=n_samp_full)
         p3ds = self.triangulate(p2ds)
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
         errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
