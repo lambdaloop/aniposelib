@@ -591,15 +591,8 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
-        # extra = None
-
         p2ds_full = p2ds
         extra_full = extra
-
-        # n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
-        # n_samp_iter = max(n_samp_iter, 30)
-
-        # n_samp_full = max(n_samp_iter*5, 2000)
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
