@@ -22,7 +22,8 @@ setuptools.setup(
     ],
     install_requires=[
         'opencv-contrib-python',
-        'numba'
+        'numba',
+        'numpy', 'scipy', 'toml'
     ],
     extras_require={
         'full':  ["checkerboard"]
