@@ -91,8 +91,8 @@ def resample_points_extra(imgp, extra, n_samp=25):
     return newp, extra
 
 def resample_points(imgp, extra=None, n_samp=25):
-    if extra is not None:
-        return resample_points_extra(imgp, extra, n_samp)
+    # if extra is not None:
+    #     return resample_points_extra(imgp, extra, n_samp)
     
     n_cams = imgp.shape[0]
     good = ~np.isnan(imgp[:, :, 0])
@@ -116,7 +116,8 @@ def resample_points(imgp, extra=None, n_samp=25):
 
     final_ixs = sorted(include)
     newp = imgp[:, final_ixs]
-    return newp, None
+    extra = subset_extra(extra, final_ixs)
+    return newp, extra
 
 def medfilt_data(values, size=15):
     padsize = size+5
@@ -585,7 +586,7 @@ class CameraGroup:
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
 
-        extra = None
+        # extra = None
         
         p2ds_full = p2ds
         extra_full = extra
@@ -630,7 +631,7 @@ class CameraGroup:
 
             pprint(error_dict)
 
-            self.bundle_adjust(p2ds_samp, extra_good,
+            self.bundle_adjust(p2ds_samp, extra_samp,
                                loss='linear', ftol=ftol,
                                max_nfev=max_nfev,
                                verbose=verbose)
