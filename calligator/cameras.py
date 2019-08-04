@@ -66,25 +66,29 @@ def subset_extra(extra, ixs):
     return new_extra
 
 def resample_points_extra(imgp, extra, n_samp=25):
-    ids = extra['ids']
+    n_cams, n_points, _ = imgp.shape
+    ids = remap_ids(extra['ids'])
+    n_ids = np.max(ids)+1
     good = ~np.isnan(imgp[:, :, 0])
-    id_list = good * ids
-    cam_counts = np.zeros(imgp.shape[0])
-    ixs = np.arange(imgp.shape[1])
-    counts = Counter(id_list.ravel())
-
-    counts[0] = 0
+    ixs = np.arange(n_points)
     
-    for board_id, count in counts.most_common():
-        counts[board_id] += np.random.random()*5
+    cam_counts = np.zeros((n_ids, n_cams), dtype='int32')
+    for idnum in range(n_ids):
+        cam_counts[idnum] = np.sum(good[:, ids == idnum], axis=1)
+    cam_counts_random = cam_counts + np.random.random(size=cam_counts.shape)
+    best_boards = np.argsort(-cam_counts_random, axis=0)
+
+    cam_totals = np.zeros(n_cams, dtype='int32')
     
     include = set()
-    for board_id, count in counts.most_common():
-        include.update(ixs[ids == board_id])
-        cam_counts += np.sum(good[:, ids==board_id], axis=1)
-        if np.all(cam_counts >= n_samp):
-            break
-
+    for cam_num in range(n_cams):
+        for board_id in best_boards[:, cam_num]:
+            include.update(ixs[ids == board_id])
+            cam_totals += cam_counts[board_id]
+            if cam_totals[cam_num] >= n_samp or \
+               cam_counts_random[board_id, cam_num] < 1:
+                break
+    
     final_ixs = sorted(include)
     newp = imgp[:, final_ixs]
     extra = subset_extra(extra, final_ixs)
@@ -574,9 +578,10 @@ class CameraGroup:
 
 
     def bundle_adjust_iter(self, p2ds, extra=None,
-                           n_iters=15, start_mu=15, end_mu=1,
+                           n_iters=10, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4,
-                           p_samp_iter=0.005, 
+                           n_samp_iter=50, n_samp_full=1000,
+                           error_threshold=0.3,
                            verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -591,10 +596,10 @@ class CameraGroup:
         p2ds_full = p2ds
         extra_full = extra
         
-        n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
-        n_samp_iter = max(n_samp_iter, 30)
+        # n_samp_iter = int(p_samp_iter * p2ds.shape[1] / p2ds.shape[0])
+        # n_samp_iter = max(n_samp_iter, 30)
 
-        n_samp_full = max(n_samp_iter*5, 2000)
+        # n_samp_full = max(n_samp_iter*5, 2000)
         
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
@@ -636,9 +641,13 @@ class CameraGroup:
                                max_nfev=max_nfev,
                                verbose=verbose)
 
+            error = self.average_error(p2ds, median=True)
+            
             if verbose:
-                error = self.average_error(p2ds, median=True)
                 print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
+
+            if error < error_threshold:
+                break
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full*2)
