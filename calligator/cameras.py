@@ -406,6 +406,12 @@ class CameraGroup:
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
+
         one_point = False
         if len(points.shape) == 2:
             points = points.reshape(-1, 1, 2)
@@ -452,6 +458,12 @@ class CameraGroup:
         N: number of points
         P: number of possible options per point
         """
+
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
 
         n_cams, n_points, n_possible, _ = points.shape
 
@@ -527,6 +539,12 @@ class CameraGroup:
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
+
         n_cams, n_points, _ = points.shape
 
         points_ransac = points.reshape(n_cams, n_points, 1, 2)
@@ -590,6 +608,12 @@ class CameraGroup:
         to reduce the influence of outliers.
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
         """
+
+        assert p2ds.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), p2ds.shape
+            )
 
         p2ds_full = p2ds
         extra_full = extra
@@ -688,6 +712,12 @@ class CameraGroup:
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustsment to fine-tune the parameters of the cameras"""
+
+        assert p2ds.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), p2ds.shape
+            )
 
         if extra is not None:
             extra['ids_map'] = remap_ids(extra['ids'])
@@ -913,6 +943,12 @@ class CameraGroup:
         (meaning that lengths of joints 0->1, 1->2, 2->3 are all constant)
 
         """
+
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
 
         n_cams, n_frames, n_joints, _ = points.shape
         constraints = np.array(constraints)
