@@ -598,7 +598,7 @@ class CameraGroup:
     def bundle_adjust_iter(self, p2ds, extra=None,
                            n_iters=10, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4,
-                           n_samp_iter=50, n_samp_full=1000,
+                           n_samp_iter=100, n_samp_full=1000,
                            error_threshold=0.3,
                            verbose=True):
         """Given an CxNx2 array of 2D points,
