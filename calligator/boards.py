@@ -116,20 +116,20 @@ def extract_points(merged,
 
     rvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
                     np.nan, dtype='float64')
-    
+
     tvecs = np.full((n_cams, n_detects, n_points_per_detect, 3),
                     np.nan, dtype='float64')
 
     objp = np.empty((n_detects, n_points_per_detect, 3),
                     dtype='float64')
-    
+
     board_ids = np.empty((n_detects, n_points_per_detect),
                          dtype='int32')
 
     for rix, row in enumerate(merged):
         objp[rix] = np.copy(objp_template)
         board_ids[rix] = rix
-        
+
         for cix, cname in enumerate(cam_names):
             if cname in row:
                 filled = row[cname]['filled'].reshape(-1, 2)
@@ -141,10 +141,10 @@ def extract_points(merged,
                     continue
 
                 imgp[cix, rix] = filled
-                
+
                 rvecs[cix, rix, ~bad] = row[cname]['rvec'].ravel()
                 tvecs[cix, rix, ~bad] = row[cname]['tvec'].ravel()
-                
+
     imgp = np.reshape(imgp, (n_cams, -1, 2))
     rvecs = np.reshape(rvecs, (n_cams, -1, 3))
     tvecs = np.reshape(tvecs, (n_cams, -1, 3))
@@ -166,7 +166,7 @@ def extract_points(merged,
         'rvecs': rvecs,
         'tvecs': tvecs
     }
-    
+
     return imgp, extra
 
 
@@ -369,12 +369,13 @@ class CalibrationObject(ABC):
 
 class Checkerboard(CalibrationObject):
     DETECT_PARAMS = \
-        cv2.CALIB_CB_FAST_CHECK + \
+        cv2.CALIB_CB_NORMALIZE_IMAGE + \
         cv2.CALIB_CB_ADAPTIVE_THRESH + \
-        cv2.CALIB_CB_FILTER_QUADS
+        cv2.CALIB_CB_FAST_CHECK
 
-    SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30,
-                       0.1)
+    SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS +
+                       cv2.TERM_CRITERIA_MAX_ITER,
+                       30, 0.01)
 
     def __init__(self, squaresX, squaresY, square_length=1):
         self.squaresX = squaresX

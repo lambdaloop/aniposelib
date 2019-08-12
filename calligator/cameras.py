@@ -260,6 +260,16 @@ class Camera:
         """get size as (width, height)"""
         return self.size
 
+    def resize_camera(self, scale):
+        """resize the camera by scale factor, updating intrinsics to match"""
+        size = self.get_size()
+        new_size = size[0] * scale, size[1] * scale
+        matrix = self.get_camera_matrix()
+        new_matrix = matrix * scale
+        new_matrix[2, 2] = 1
+        self.set_size(size)
+        self.set_camera_matrix(new_matrix)
+
     def get_params(self):
         params = np.zeros(8, dtype='float64')
         params[0:3] = self.get_rotation()
@@ -385,9 +395,21 @@ class CameraGroup:
         self.metadata = metadata
 
     def subset_cameras(self, indices):
-        cams = np.array(self.cameras)
-        cams = list(cams[indices])
-        return CameraGroup(cams)
+        cams = [self.cameras[ix].copy() for ix in indices]
+        return CameraGroup(cams, self.metadata)
+
+    def subset_cameras_names(self, names):
+        cur_names = self.get_names()
+        cur_names_dict = zip(cur_names, range(len(cur_names)))
+        indices = []
+        for name in names:
+            if name not in cur_names_dict:
+                raise ValueError(
+                    "name {} not part of camera names: {}".format(
+                        name, cur_names
+                    ))
+            indices.append(cur_names_dict[name])
+        return self.subset_cameras(indices)
 
     def project(self, points):
         """Given an Nx3 array of points, this returns an CxNx2 array of 2D points,
@@ -940,7 +962,7 @@ class CameraGroup:
 
         Example constraints:
         constraints = [[0, 1], [1, 2], [2, 3]]
-        (meaning that lengths of joints 0->1, 1->2, 2->3 are all constant)
+        (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
 
         """
 
@@ -1170,7 +1192,8 @@ class CameraGroup:
 
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
-        return CameraGroup(cameras)
+        metadata = copy(self.metadata)
+        return CameraGroup(cameras, metadata)
 
     def set_rotations(self, rvecs):
         for cam, rvec in zip(self.cameras, rvecs):
@@ -1193,6 +1216,16 @@ class CameraGroup:
             tvec = cam.get_translation()
             tvecs.append(tvec)
         return np.array(tvecs)
+
+    def get_names(self):
+        return [cam.get_name() for cam in self.cameras]
+
+    def set_names(self, names):
+        for cam, name in zip(self.cameras, names):
+            cam.set_name(name)
+
+
+
 
     def average_error(self, p2ds, median=False):
         p3ds = self.triangulate(p2ds)
@@ -1311,3 +1344,7 @@ class CameraGroup:
         if 'metadata' in master_dict:
             cgroup.metadata = master_dict['metadata']
         return cgroup
+
+    def resize_cameras(self, scale):
+        for cam in self.cameras:
+            cam.resize_camera(scale)
