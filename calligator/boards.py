@@ -285,8 +285,6 @@ class CalibrationObject(ABC):
                 }
                 rows.append(row)
 
-        cap.release()
-
         rows = self.fill_points_rows(rows)
 
         return rows
@@ -330,7 +328,8 @@ class CalibrationObject(ABC):
 
     def estimate_pose_rows(self, camera, rows):
         for row in rows:
-            rvec, tvec = self.estimate_pose_points(camera, row['corners'],
+            rvec, tvec = self.estimate_pose_points(camera,
+                                                   row['corners'],
                                                    row['ids'])
             row['rvec'] = rvec
             row['tvec'] = tvec
@@ -447,7 +446,7 @@ class Checkerboard(CalibrationObject):
         return self.objPoints
 
     def estimate_pose_points(self, camera, points, ids=None):
-        ngood = np.sum(np.isnan(points)) // 2
+        ngood = np.sum(~np.isnan(points)) // 2
         if points is None or ngood < 3:
             return None, None
 
@@ -463,7 +462,7 @@ class Checkerboard(CalibrationObject):
                                                          K,
                                                          D,
                                                          confidence=0.9,
-                                                         reprojectionError=10)
+                                                         reprojectionError=30)
 
         return rvec, tvec
 
