@@ -14,7 +14,8 @@ import time
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
-from .utils import get_initial_extrinsics, make_M, get_rtvec
+from .utils import get_initial_extrinsics, make_M, get_rtvec, \
+    get_connections
 
 @jit(nopython=True, parallel=True)
 def triangulate_simple(points, camera_mats):
@@ -1257,6 +1258,8 @@ class CameraGroup:
 
         if init_extrinsics:
             rtvecs = extract_rtvecs(merged)
+            if verbose:
+                pprint(get_connections(rtvecs, self.get_names()))
             rvecs, tvecs = get_initial_extrinsics(rtvecs)
             self.set_rotations(rvecs)
             self.set_translations(tvecs)
@@ -1273,6 +1276,7 @@ class CameraGroup:
             for vnum, vidname in enumerate(cam_videos):
                 if verbose: print(vidname)
                 rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
+                if verbose: print("{} boards detected".format(len(rows)))
                 rows_cam.extend(rows)
             all_rows.append(rows_cam)
 
@@ -1286,7 +1290,8 @@ class CameraGroup:
                 size = (params['width'], params['height'])
                 cam.set_size(size)
 
-    def calibrate_videos(self, videos, board, init_extrinsics=True, verbose=True):
+    def calibrate_videos(self, videos, board,
+                         init_extrinsics=True, verbose=True):
         """Takes as input a list of list of video filenames, one list of each camera.
         Also takes a board which specifies what should be detected in the videos"""
 
