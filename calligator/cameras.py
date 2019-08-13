@@ -176,17 +176,18 @@ class Camera:
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
                  name=None):
-        self.matrix = np.array(matrix)
-        self.dist = np.array(dist)
-        self.size = size
-        self.rvec = np.array(rvec)
-        self.tvec = np.array(tvec)
-        self.name = name
+
+        self.set_camera_matrix(matrix)
+        self.set_distortions(dist)
+        self.set_size(size)
+        self.set_rotation(rvec)
+        self.set_translation(tvec)
+        self.set_name(name)
 
     def get_dict(self):
         return {
             'name': self.get_name(),
-            'size': self.get_size(),
+            'size': list(self.get_size()),
             'matrix': self.get_camera_matrix().tolist(),
             'distortions': self.get_distortions().tolist(),
             'rotation': self.get_rotation().tolist(),
@@ -251,7 +252,7 @@ class Camera:
         return self.name
 
     def set_name(self, name):
-        self.name = name
+        self.name = str(name)
 
     def set_size(self, size):
         """set size as (width, height)"""
@@ -401,7 +402,7 @@ class CameraGroup:
 
     def subset_cameras_names(self, names):
         cur_names = self.get_names()
-        cur_names_dict = zip(cur_names, range(len(cur_names)))
+        cur_names_dict = dict(zip(cur_names, range(len(cur_names))))
         indices = []
         for name in names:
             if name not in cur_names_dict:
@@ -1237,6 +1238,7 @@ class CameraGroup:
             return np.mean(errors)
 
     def calibrate_rows(self, all_rows, board,
+                       init_intrinsics=True,
                        init_extrinsics=True, verbose=True):
         """Assumes camera sizes are set properly"""
         for rows, camera in zip(all_rows, self.cameras):
@@ -1245,10 +1247,11 @@ class CameraGroup:
             assert size is not None, \
                 "Camera with name {} has no specified frame size".format(camera.get_name())
 
-            objp, imgp = board.get_all_calibration_points(rows)
-            matrix = cv2.initCameraMatrix2D([objp.astype('float32')],
-                                            [imgp.astype('float32')], size)
-            camera.set_camera_matrix(matrix)
+            if init_intrinsics:
+                objp, imgp = board.get_all_calibration_points(rows)
+                matrix = cv2.initCameraMatrix2D([objp.astype('float32')],
+                                                [imgp.astype('float32')], size)
+                camera.set_camera_matrix(matrix)
 
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)
@@ -1291,14 +1294,17 @@ class CameraGroup:
                 cam.set_size(size)
 
     def calibrate_videos(self, videos, board,
+                         init_intrinsics=True,
                          init_extrinsics=True, verbose=True):
         """Takes as input a list of list of video filenames, one list of each camera.
         Also takes a board which specifies what should be detected in the videos"""
 
         all_rows = self.get_rows_videos(videos, board, verbose=verbose)
-        self.set_camera_sizes_videos(videos)
+        if init_extrinsics:
+            self.set_camera_sizes_videos(videos)
 
         error = self.calibrate_rows(all_rows, board,
+                                    init_intrinsics=init_intrinsics,
                                     init_extrinsics=init_extrinsics,
                                     verbose=verbose)
         return error, all_rows
