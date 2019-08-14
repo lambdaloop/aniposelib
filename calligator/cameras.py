@@ -981,6 +981,7 @@ class CameraGroup:
         points_shaped = points.reshape(n_cams, n_frames*n_joints, 2)
         if init_ransac:
             p3ds, picked, p2ds, errors = self.triangulate_ransac(points_shaped, progress=init_progress)
+            points = p2ds.reshape(points.shape)
         else:
             p3ds = self.triangulate(points_shaped, progress=init_progress)
         p3ds = p3ds.reshape((n_frames, n_joints, 3))
@@ -994,7 +995,7 @@ class CameraGroup:
         t1 = time.time()
 
         x0 = self._initialize_params_triangulation(
-            p3ds_intp, constraints, constraints_weak)
+            p3ds_med, constraints, constraints_weak)
 
         jac = self._jac_sparsity_triangulation(
             points, constraints, constraints_weak, n_deriv_smooth)
