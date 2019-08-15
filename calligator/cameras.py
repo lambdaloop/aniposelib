@@ -696,7 +696,8 @@ class CameraGroup:
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
         errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
         error_dict = get_error_dict(errors_full)
-        pprint(error_dict)
+        if verbose:
+            pprint(error_dict)
 
         max_error = 0
         min_error = 0
@@ -718,7 +719,8 @@ class CameraGroup:
         p3ds = self.triangulate(p2ds)
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
         error_dict = get_error_dict(errors_full)
-        pprint(error_dict)
+        if verbose:
+            pprint(error_dict)
 
         if verbose:
             print('error: ', error)
