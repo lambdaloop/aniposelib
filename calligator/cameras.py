@@ -214,7 +214,7 @@ class Camera:
         return self.dist
 
     def set_camera_matrix(self, matrix):
-        self.matrix = np.array(matrix)
+        self.matrix = np.array(matrix, dtype='float64')
 
     def set_focal_length(self, fx, fy=None):
         if fy is None:
@@ -231,16 +231,16 @@ class Camera:
             return (fx + fy) / 2.0
 
     def set_distortions(self, dist):
-        self.dist = np.array(dist).ravel()
+        self.dist = np.array(dist, dtype='float64').ravel()
 
     def set_rotation(self, rvec):
-        self.rvec = np.array(rvec).ravel()
+        self.rvec = np.array(rvec, dtype='float64').ravel()
 
     def get_rotation(self):
         return self.rvec
 
     def set_translation(self, tvec):
-        self.tvec = np.array(tvec).ravel()
+        self.tvec = np.array(tvec, dtype='float64').ravel()
 
     def get_translation(self):
         return self.tvec
@@ -304,7 +304,9 @@ class Camera:
     def undistort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
-        out = cv2.undistortPoints(points, self.matrix, self.dist)
+        out = cv2.undistortPoints(points,
+                                  self.matrix.astype('float64'),
+                                  self.dist.astype('float64'))
         return out.reshape(shape)
 
     def project(self, points):
@@ -329,12 +331,17 @@ class FisheyeCamera(Camera):
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
                  name=None):
-        self.matrix = np.array(matrix)
-        self.dist = np.array(dist)
-        self.size = size
-        self.rvec = np.array(rvec)
-        self.tvec = np.array(tvec)
-        self.name = name
+        self.set_camera_matrix(matrix)
+        self.set_distortions(dist)
+        self.set_size(size)
+        self.set_rotation(rvec)
+        self.set_translation(tvec)
+        self.set_name(name)
+
+    def from_dict(d):
+        cam = FisheyeCamera()
+        cam.load_dict(d)
+        return cam
 
     def get_dict(self):
         d = super().get_dict()
