@@ -995,7 +995,7 @@ class CameraGroup:
         t1 = time.time()
 
         x0 = self._initialize_params_triangulation(
-            p3ds_med, constraints, constraints_weak)
+            p3ds_intp, constraints, constraints_weak)
 
         jac = self._jac_sparsity_triangulation(
             points, constraints, constraints_weak, n_deriv_smooth)
