@@ -44,7 +44,9 @@ def get_error_dict(errors_full, min_points=10):
         for j in range(i+1, n_cams):
             subset = good[i] & good[j]
             err_subset = errors_norm[:, subset][[i, j]]
+            err_subset_mean = np.mean(err_subset, axis=0)
             if np.sum(subset) > min_points:
+                # percents = np.percentile(err_subset_mean, [15, 75])
                 percents = np.percentile(err_subset, [25, 75])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
@@ -73,13 +75,13 @@ def resample_points_extra(imgp, extra, n_samp=25):
     good = ~np.isnan(imgp[:, :, 0])
     ixs = np.arange(n_points)
 
-    cam_counts = np.zeros((n_ids, n_cams), dtype='int32')
+    cam_counts = np.zeros((n_ids, n_cams), dtype='int64')
     for idnum in range(n_ids):
         cam_counts[idnum] = np.sum(good[:, ids == idnum], axis=1)
     cam_counts_random = cam_counts + np.random.random(size=cam_counts.shape)
     best_boards = np.argsort(-cam_counts_random, axis=0)
 
-    cam_totals = np.zeros(n_cams, dtype='int32')
+    cam_totals = np.zeros(n_cams, dtype='int64')
 
     include = set()
     for cam_num in range(n_cams):
@@ -96,8 +98,8 @@ def resample_points_extra(imgp, extra, n_samp=25):
     return newp, extra
 
 def resample_points(imgp, extra=None, n_samp=25):
-    # if extra is not None:
-    #     return resample_points_extra(imgp, extra, n_samp)
+    if extra is not None:
+        return resample_points_extra(imgp, extra, n_samp)
 
     n_cams = imgp.shape[0]
     good = ~np.isnan(imgp[:, :, 0])
@@ -175,7 +177,8 @@ class Camera:
                  size=None,
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
-                 name=None):
+                 name=None,
+                 extra_dist=False):
 
         self.set_camera_matrix(matrix)
         self.set_distortions(dist)
@@ -183,6 +186,7 @@ class Camera:
         self.set_rotation(rvec)
         self.set_translation(tvec)
         self.set_name(name)
+        self.extra_dist = extra_dist
 
     def get_dict(self):
         return {
@@ -273,13 +277,14 @@ class Camera:
         self.set_camera_matrix(new_matrix)
 
     def get_params(self):
-        params = np.zeros(8, dtype='float64')
+        params = np.zeros(8 + self.extra_dist, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
-        # params[8] = dist[1]
+        if self.extra_dist:
+            params[8] = dist[1]
         return params
 
     def set_params(self, params):
@@ -289,7 +294,8 @@ class Camera:
 
         dist = np.zeros(5, dtype='float64')
         dist[0] = params[7]
-        # dist[1] = params[8]
+        if self.extra_dist:
+            dist[1] = params[8]
         self.set_distortions(dist)
 
     def distort_points(self, points):
@@ -330,13 +336,15 @@ class FisheyeCamera(Camera):
                  size=None,
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
-                 name=None):
+                 name=None,
+                 extra_dist=False):
         self.set_camera_matrix(matrix)
         self.set_distortions(dist)
         self.set_size(size)
         self.set_rotation(rvec)
         self.set_translation(tvec)
         self.set_name(name)
+        self.extra_dist = extra_dist
 
     def from_dict(d):
         cam = FisheyeCamera()
@@ -361,7 +369,7 @@ class FisheyeCamera(Camera):
     def undistort_points(self, points):
         shape = points.shape
         points = points.reshape(-1, 1, 2)
-        out = cv2.fisheye.undistortPoints(points,
+        out = cv2.fisheye.undistortPoints(points.astype('float64'),
                                           self.matrix.astype('float64'),
                                           self.dist.astype('float64'))
         return out.reshape(shape)
@@ -381,19 +389,21 @@ class FisheyeCamera(Camera):
 
         dist = np.zeros(4, dtype='float64')
         dist[0] = params[7]
-        # dist[1] = params[8]
+        if self.extra_dist:
+            dist[1] = params[8]
         # dist[2] = params[9]
         # dist[3] = params[10]
         self.set_distortions(dist)
 
     def get_params(self):
-        params = np.zeros(8, dtype='float64')
+        params = np.zeros(8+self.extra_dist, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
-        # params[8] = dist[1]
+        if self.extra_dist:
+            params[8] = dist[1]
         # params[9] = dist[2]
         # params[10] = dist[3]
         return params
@@ -631,7 +641,7 @@ class CameraGroup:
                            max_nfev=200, ftol=1e-4,
                            n_samp_iter=100, n_samp_full=1000,
                            error_threshold=0.3,
-                           verbose=True):
+                           verbose=False):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
@@ -1248,8 +1258,8 @@ class CameraGroup:
             return np.mean(errors)
 
     def calibrate_rows(self, all_rows, board,
-                       init_intrinsics=True,
-                       init_extrinsics=True, verbose=True):
+                       init_intrinsics=True, init_extrinsics=True, verbose=True,
+                       **kwargs):
         """Assumes camera sizes are set properly"""
         for rows, camera in zip(all_rows, self.cameras):
             size = camera.get_size()
@@ -1277,7 +1287,7 @@ class CameraGroup:
             self.set_rotations(rvecs)
             self.set_translations(tvecs)
 
-        error = self.bundle_adjust_iter(imgp, extra, verbose=verbose)
+        error = self.bundle_adjust_iter(imgp, extra, verbose=verbose, **kwargs)
 
         return error
 
@@ -1304,8 +1314,8 @@ class CameraGroup:
                 cam.set_size(size)
 
     def calibrate_videos(self, videos, board,
-                         init_intrinsics=True,
-                         init_extrinsics=True, verbose=True):
+                         init_intrinsics=True, init_extrinsics=True, verbose=True,
+                         **kwargs):
         """Takes as input a list of list of video filenames, one list of each camera.
         Also takes a board which specifies what should be detected in the videos"""
 
@@ -1316,7 +1326,7 @@ class CameraGroup:
         error = self.calibrate_rows(all_rows, board,
                                     init_intrinsics=init_intrinsics,
                                     init_extrinsics=init_extrinsics,
-                                    verbose=verbose)
+                                    verbose=verbose, **kwargs)
         return error, all_rows
 
     def get_dicts(self):
