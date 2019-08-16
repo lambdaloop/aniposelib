@@ -384,7 +384,7 @@ class Checkerboard(CalibrationObject):
         total_size = squaresX * squaresY
 
         objp = np.zeros((total_size, 3), np.float64)
-        objp[:, :2] = np.mgrid[0:squaresY, 0:squaresX].T.reshape(-1, 2)
+        objp[:, :2] = np.mgrid[0:squaresX, 0:squaresY].T.reshape(-1, 2)
         objp *= square_length
         self.objPoints = objp
 
@@ -511,7 +511,7 @@ class CharucoBoard(CalibrationObject):
         total_size = (squaresX - 1) * (squaresY - 1)
 
         objp = np.zeros((total_size, 3), np.float64)
-        objp[:, :2] = np.mgrid[0:(squaresY - 1), 0:(squaresX - 1)].T.reshape(
+        objp[:, :2] = np.mgrid[0:(squaresX - 1), 0:(squaresY - 1)].T.reshape(
             -1, 2)
         objp *= square_length
         self.objPoints = objp
