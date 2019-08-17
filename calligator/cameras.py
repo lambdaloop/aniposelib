@@ -46,8 +46,8 @@ def get_error_dict(errors_full, min_points=10):
             err_subset = errors_norm[:, subset][[i, j]]
             err_subset_mean = np.mean(err_subset, axis=0)
             if np.sum(subset) > min_points:
-                # percents = np.percentile(err_subset_mean, [15, 75])
-                percents = np.percentile(err_subset, [25, 75])
+                percents = np.percentile(err_subset_mean, [15, 75])
+                # percents = np.percentile(err_subset, [25, 75])
                 error_dict[(i, j)] = (err_subset.shape[1], percents)
     return error_dict
 
@@ -969,7 +969,7 @@ class CameraGroup:
                           constraints_weak=[],
                           scale_smooth=4,
                           scale_length=2, scale_length_weak=0.5,
-                          reproj_error_threshold=15,
+                          reproj_error_threshold=15, reproj_loss='soft_l1',
                           n_deriv_smooth=1, scores=None, init_progress=False,
                           init_ransac=False, verbose=False):
         """
@@ -1032,6 +1032,7 @@ class CameraGroup:
                                             scale_length,
                                             scale_length_weak,
                                             reproj_error_threshold,
+                                            reproj_loss,
                                             n_deriv_smooth))
 
         p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
@@ -1053,6 +1054,7 @@ class CameraGroup:
                                  scale_length=1,
                                  scale_length_weak=0.2,
                                  reproj_error_threshold=100,
+                                 reproj_loss='soft_l1',
                                  n_deriv_smooth=1):
         n_cams, n_frames, n_joints, _ = p2ds.shape
 
@@ -1076,8 +1078,13 @@ class CameraGroup:
 
         rp = reproj_error_threshold
         errors_reproj = np.abs(errors_reproj)
-        bad = errors_reproj > rp
-        errors_reproj[bad] = rp*(2*np.sqrt(errors_reproj[bad]/rp) - 1)
+        if reproj_loss == 'huber':
+            bad = errors_reproj > rp
+            errors_reproj[bad] = rp*(2*np.sqrt(errors_reproj[bad]/rp) - 1)
+        elif reproj_loss == 'linear':
+            pass
+        elif reproj_loss == 'soft_l1':
+            errors_reproj = rp*2*(np.sqrt(1+errors_reproj/rp)-1)
 
         # temporal constraint
         errors_smooth = np.diff(p3ds, n=n_deriv_smooth, axis=0).ravel() * scale_smooth
