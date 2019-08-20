@@ -98,8 +98,8 @@ def resample_points_extra(imgp, extra, n_samp=25):
     return newp, extra
 
 def resample_points(imgp, extra=None, n_samp=25):
-    if extra is not None:
-        return resample_points_extra(imgp, extra, n_samp)
+    # if extra is not None:
+    #     return resample_points_extra(imgp, extra, n_samp)
 
     n_cams = imgp.shape[0]
     good = ~np.isnan(imgp[:, :, 0])
@@ -423,7 +423,7 @@ class CameraGroup:
         indices = []
         for name in names:
             if name not in cur_names_dict:
-                raise ValueError(
+                raise IndexError(
                     "name {} not part of camera names: {}".format(
                         name, cur_names
                     ))
@@ -437,7 +437,7 @@ class CameraGroup:
         n_points = points.shape[0]
         n_cams = len(self.cameras)
 
-        out = np.zeros((n_cams, n_points, 2))
+        out = np.empty((n_cams, n_points, 2), dtype='float64')
         for cnum, cam in enumerate(self.cameras):
             out[cnum] = cam.project(points).reshape(n_points, 2)
 
@@ -1252,9 +1252,6 @@ class CameraGroup:
     def set_names(self, names):
         for cam, name in zip(self.cameras, names):
             cam.set_name(name)
-
-
-
 
     def average_error(self, p2ds, median=False):
         p3ds = self.triangulate(p2ds)
