@@ -327,7 +327,14 @@ class Camera:
         return p2d - proj
 
     def copy(self):
-        return copy(self)
+        return \
+            Camera(matrix=self.get_camera_matrix().copy(),
+                   dist=self.get_distortions().copy(),
+                   size=self.get_size(),
+                   rvec=self.get_rotation().copy(),
+                   tvec=self.get_translation().copy(),
+                   name=self.get_name(),
+                   extra_dist=self.extra_dist)
 
 class FisheyeCamera(Camera):
     def __init__(self,
@@ -407,6 +414,16 @@ class FisheyeCamera(Camera):
         # params[9] = dist[2]
         # params[10] = dist[3]
         return params
+
+    def copy(self):
+        return FisheyeCamera(
+            matrix=self.get_camera_matrix().copy(),
+            dist=self.get_distortions().copy(),
+            size=self.get_size(),
+            rvec=self.get_rotation().copy(),
+            tvec=self.get_translation().copy(),
+            name=self.get_name(),
+            extra_dist=self.extra_dist)
 
 class CameraGroup:
     def __init__(self, cameras, metadata={}):
