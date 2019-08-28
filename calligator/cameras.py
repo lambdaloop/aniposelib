@@ -981,16 +981,17 @@ class CameraGroup:
 
         return x0, n_cam_params
 
-    def triangulate_optim(self, points,
-                          constraints=[],
-                          constraints_weak=[],
-                          scale_smooth=4,
-                          scale_length=2, scale_length_weak=0.5,
-                          reproj_error_threshold=15, reproj_loss='soft_l1',
-                          n_deriv_smooth=1, scores=None, init_progress=False,
-                          init_ransac=False, verbose=False):
+    def optim_points(self, points, p3ds,
+                     constraints=[],
+                     constraints_weak=[],
+                     scale_smooth=4,
+                     scale_length=2, scale_length_weak=0.5,
+                     reproj_error_threshold=15, reproj_loss='soft_l1',
+                     n_deriv_smooth=1, scores=None, verbose=False):
         """
-        Take in an array of 2D points of shape CxNxJx2, and an array of constraints of shape Kx2, where
+        Take in an array of 2D points of shape CxNxJx2,
+        an array of 3D points of shape NxJx3,
+        and an array of constraints of shape Kx2, where
         C: number of camera
         N: number of frames
         J: number of joints
@@ -1003,7 +1004,6 @@ class CameraGroup:
         (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
 
         """
-
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
@@ -1014,13 +1014,6 @@ class CameraGroup:
         constraints = np.array(constraints)
         constraints_weak = np.array(constraints_weak)
 
-        points_shaped = points.reshape(n_cams, n_frames*n_joints, 2)
-        if init_ransac:
-            p3ds, picked, p2ds, errors = self.triangulate_ransac(points_shaped, progress=init_progress)
-            points = p2ds.reshape(points.shape)
-        else:
-            p3ds = self.triangulate(points_shaped, progress=init_progress)
-        p3ds = p3ds.reshape((n_frames, n_joints, 3))
         p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
 
         p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
@@ -1060,6 +1053,45 @@ class CameraGroup:
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
         return p3ds_new2
+
+
+    def triangulate_optim(self, points, init_ransac=False, init_progress=False,
+                          **kwargs):
+        """
+        Take in an array of 2D points of shape CxNxJx2, and an array of constraints of shape Kx2, where
+        C: number of camera
+        N: number of frames
+        J: number of joints
+        K: number of constraints
+
+        This function creates an optimized array of 3D points of shape NxJx3.
+
+        Example constraints:
+        constraints = [[0, 1], [1, 2], [2, 3]]
+        (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
+
+        """
+
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
+
+        n_cams, n_frames, n_joints, _ = points.shape
+        # constraints = np.array(constraints)
+        # constraints_weak = np.array(constraints_weak)
+
+        points_shaped = points.reshape(n_cams, n_frames*n_joints, 2)
+        if init_ransac:
+            p3ds, picked, p2ds, errors = self.triangulate_ransac(points_shaped, progress=init_progress)
+            points = p2ds.reshape(points.shape)
+        else:
+            p3ds = self.triangulate(points_shaped, progress=init_progress)
+        p3ds = p3ds.reshape((n_frames, n_joints, 3))
+
+        return self.optim_points(points, p3ds, **kwargs)
+
 
 
     @jit(nopython=True, forceobj=True, parallel=True)
