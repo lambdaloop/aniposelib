@@ -1107,12 +1107,15 @@ class CameraGroup:
             constraints_weak=constraints_weak,
             n_deriv_smooth=n_deriv_smooth)
 
+        beta = 0.5
+        
         opt2 = optimize.least_squares(self._error_fun_triangulation_possible,
                                       x0=x0, jac_sparsity=jac,
                                       loss='linear',
                                       ftol=1e-3,
                                       verbose=2*verbose,
                                       args=(points,
+                                            beta,
                                             constraints,
                                             constraints_weak,
                                             scores,
@@ -1134,7 +1137,6 @@ class CameraGroup:
         alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
         alphas[~bad] = params[n_params_norm:]
 
-        beta = 5
         alphas_exp = np.exp(beta * alphas)
         alphas_exp[bad] = 0
         alphas_sum = np.sum(alphas_exp, axis=3)
@@ -1252,6 +1254,7 @@ class CameraGroup:
                           errors_lengths, errors_lengths_weak])
 
     def _error_fun_triangulation_possible(self, params, p2ds,
+                                          beta=2,
                                           constraints=[],
                                           constraints_weak=[],
                                           *args):
@@ -1277,7 +1280,6 @@ class CameraGroup:
         params_rest = np.array(params[:n_params_norm])
 
         # get normalized alphas
-        beta = 5
         alphas_exp = np.exp(beta * alphas)
         alphas_exp[bad] = 0
         alphas_sum = np.sum(alphas_exp, axis=3)
@@ -1327,7 +1329,7 @@ class CameraGroup:
 
     def _initialize_params_triangulation_possible(self, p3ds, p2ds, **kwargs):
         # initialize params using above function
-        # initialize alphas to 10 for first one and 0 for other possible
+        # initialize alphas to 1 for first one and 0 for other possible
 
         n_cams, n_frames, n_joints, n_possible, _ = p2ds.shape
         good = ~np.isnan(p2ds[:, :, :, :, 0])
