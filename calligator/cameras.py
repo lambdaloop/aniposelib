@@ -1055,6 +1055,101 @@ class CameraGroup:
         return p3ds_new2
 
 
+    def optim_points_possible(self, points, p3ds,
+                              constraints=[],
+                              constraints_weak=[],
+                              scale_smooth=4,
+                              scale_length=2, scale_length_weak=0.5,
+                              reproj_error_threshold=15, reproj_loss='soft_l1',
+                              n_deriv_smooth=1, scores=None, verbose=False):
+        """
+        Take in an array of 2D points of shape CxNxJxPx2,
+        an array of 3D points of shape NxJx3,
+        and an array of constraints of shape Kx2, where
+        C: number of camera
+        N: number of frames
+        J: number of joints
+        P: number of possible options per point
+        K: number of constraints
+
+        This function creates an optimized array of 3D points of shape NxJx3.
+
+        Example constraints:
+        constraints = [[0, 1], [1, 2], [2, 3]]
+        (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
+
+        """
+        assert points.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(
+                len(self.cameras), points.shape
+            )
+
+        n_cams, n_frames, n_joints, n_possible, _ = points.shape
+        constraints = np.array(constraints)
+        constraints_weak = np.array(constraints_weak)
+
+        p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
+
+        p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
+
+        default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
+        scale_smooth_full = scale_smooth * default_smooth
+
+        t1 = time.time()
+
+        x0 = self._initialize_params_triangulation_possible(
+            p3ds_intp, points, constraints=constraints, constraints_weak=constraints_weak)
+
+        jac = self._jac_sparsity_triangulation_possible(
+            points,
+            constraints=constraints,
+            constraints_weak=constraints_weak,
+            n_deriv_smooth=n_deriv_smooth)
+
+        opt2 = optimize.least_squares(self._error_fun_triangulation_possible,
+                                      x0=x0, jac_sparsity=jac,
+                                      loss='linear',
+                                      ftol=1e-3,
+                                      verbose=2*verbose,
+                                      args=(points,
+                                            constraints,
+                                            constraints_weak,
+                                            scores,
+                                            scale_smooth_full,
+                                            scale_length,
+                                            scale_length_weak,
+                                            reproj_error_threshold,
+                                            reproj_loss,
+                                            n_deriv_smooth))
+        params = opt2.x
+        
+        p3ds_new2 = params[:p3ds.size].reshape(p3ds.shape)
+
+        bad = np.isnan(points[:, :, :, :, 0])
+        all_bad = np.all(bad, axis=3)
+
+        n_params_norm = p3ds.size + len(constraints) + len(constraints_weak)
+        
+        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
+        alphas[~bad] = params[n_params_norm:]
+
+        beta = 5
+        alphas_exp = np.exp(beta * alphas)
+        alphas_exp[bad] = 0
+        alphas_sum = np.sum(alphas_exp, axis=3)
+        alphas_sum[all_bad] = 1
+        alphas_norm = alphas_exp / alphas_sum[:, :, :, None]
+        alphas_norm[bad] = np.nan
+        
+        t2 = time.time()
+
+        if verbose:
+            print('optimization took {:.2f} seconds'.format(t2 - t1))
+
+        return p3ds_new2, alphas_norm
+
+
     def triangulate_optim(self, points, init_ransac=False, init_progress=False,
                           **kwargs):
         """
@@ -1156,6 +1251,51 @@ class CameraGroup:
         return np.hstack([errors_reproj, errors_smooth,
                           errors_lengths, errors_lengths_weak])
 
+    def _error_fun_triangulation_possible(self, params, p2ds,
+                                          constraints=[],
+                                          constraints_weak=[],
+                                          *args):
+        # extract alphas from end of params
+        # soft argmax for picking the appropriate points from p2ds
+        # pass the points to error_fun_triangulate_possible for residuals
+        # add errors to keep the alphas in check
+        # return all the errors
+
+        n_cams, n_frames, n_joints, n_possible, _ = p2ds.shape
+
+        n_3d = n_frames*n_joints*3
+        n_constraints = len(constraints)
+        n_constraints_weak = len(constraints_weak)
+        n_params_norm = n_3d+n_constraints+n_constraints_weak
+
+        # load params
+        bad = np.isnan(p2ds[:, :, :, :, 0])
+        all_bad = np.all(bad, axis=3)
+
+        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
+        alphas[~bad] = params[n_params_norm:]
+        params_rest = np.array(params[:n_params_norm])
+
+        # get normalized alphas
+        beta = 5
+        alphas_exp = np.exp(beta * alphas)
+        alphas_exp[bad] = 0
+        alphas_sum = np.sum(alphas_exp, axis=3)
+        alphas_sum[all_bad] = 1
+        alphas_norm = alphas_exp / alphas_sum[:, :, :, None]
+
+        # extract the 2D points using soft argmax
+        p2ds_test = np.copy(p2ds)
+        p2ds_test[bad] = 0
+        p2ds_adj = np.sum(alphas_norm[:, :, :, :, None] * p2ds_test, axis=3)
+        p2ds_adj[all_bad] = np.nan
+
+        errors = self._error_fun_triangulation(params_rest, p2ds_adj,
+                                               constraints, constraints_weak, *args)
+
+        return errors
+
+
     def _initialize_params_triangulation(self, p3ds,
                                          constraints=[],
                                          constraints_weak=[]):
@@ -1185,6 +1325,20 @@ class CameraGroup:
 
         return np.hstack([p3ds.ravel(), joint_lengths, joint_lengths_weak])
 
+    def _initialize_params_triangulation_possible(self, p3ds, p2ds, **kwargs):
+        # initialize params using above function
+        # initialize alphas to 10 for first one and 0 for other possible
+
+        n_cams, n_frames, n_joints, n_possible, _ = p2ds.shape
+        good = ~np.isnan(p2ds[:, :, :, :, 0])
+
+        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
+        alphas[:, :, :, 0] = 1
+
+        params = self._initialize_params_triangulation(p3ds, **kwargs)
+        params_full = np.hstack([params, alphas[good]])
+
+        return params_full
 
     def _jac_sparsity_triangulation(self, p2ds,
                                     constraints=[],
@@ -1254,7 +1408,7 @@ class CameraGroup:
         start = n_errors_reproj + n_errors_smooth + n_errors_lengths
         frames = np.arange(n_frames)
         for cix, (a, b) in enumerate(constraints_weak):
-            A_sparse[start + cix*n_frames + frames, n_3d+cix] = 1
+            A_sparse[start + cix*n_frames + frames, n_3d + n_constraints + cix] = 1
 
         # points should change accordingly to match joint lengths too
         frames = np.arange(n_frames)
@@ -1267,6 +1421,45 @@ class CameraGroup:
 
         return A_sparse
 
+    def _jac_sparsity_triangulation_possible(self, p2ds_full, **kwargs):
+        # initialize sparse jacobian using above function
+        # extend to include alphas from parameters
+
+        n_cams, n_frames, n_joints, n_possible, _ = p2ds_full.shape
+        good_full = ~np.isnan(p2ds_full[:, :, :, :, 0])
+
+        n_alphas = np.sum(good_full)
+        
+        p2ds = p2ds_full[:, :, :, 0]
+        A_sparse = self._jac_sparsity_triangulation(p2ds, **kwargs)
+
+        n_errors, n_params = A_sparse.shape
+
+        B_sparse = lil_matrix((n_errors, n_params + n_alphas), dtype='int16')
+        for r, c in zip(*A_sparse.nonzero()):
+            B_sparse[r, c] = A_sparse[r, c]
+        
+        point_indices_2d = np.arange(n_cams*n_frames*n_joints)\
+                             .reshape(n_cams, n_frames, n_joints)
+        point_indices_2d_rep = np.repeat(point_indices_2d[:, :, :, None], 2, axis=3)
+        point_indices_2d_good = point_indices_2d_rep[~np.isnan(p2ds)]
+
+        alpha_indices = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='int64')
+        for pnum in range(n_possible):
+            alpha_indices[:, :, :, pnum] = point_indices_2d
+
+        alpha_indices_good = alpha_indices[good_full]
+
+        point_indices_2d_good_find = defaultdict(list)
+        for ix, p in enumerate(point_indices_2d_good):
+            point_indices_2d_good_find[p].append(ix)
+
+        # alphas should change according to the reprojection error for each corresponding point
+        for alpha_index in alpha_indices_good:
+            B_sparse[point_indices_2d_good[alpha_index],
+                     n_params + alpha_index] = 1
+
+        return B_sparse
 
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
