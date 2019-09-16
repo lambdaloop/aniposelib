@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from copy import copy
-from scipy.sparse import lil_matrix
+from scipy.sparse import lil_matrix, dok_matrix
 from scipy import optimize
 from scipy import signal
 from numba import jit
@@ -885,7 +885,7 @@ class CameraGroup:
         else:
             n_errors = n_good_values
 
-        A_sparse = lil_matrix((n_errors, n_params), dtype='int16')
+        A_sparse = dok_matrix((n_errors, n_params), dtype='int16')
 
         cam_indices_good = cam_indices[good]
         point_indices_good = point_indices[good]
@@ -1101,14 +1101,16 @@ class CameraGroup:
         x0 = self._initialize_params_triangulation_possible(
             p3ds_intp, points, constraints=constraints, constraints_weak=constraints_weak)
 
+        print('getting jacobian...')
         jac = self._jac_sparsity_triangulation_possible(
             points,
             constraints=constraints,
             constraints_weak=constraints_weak,
             n_deriv_smooth=n_deriv_smooth)
 
-        beta = 0.5
-        
+        beta = 5
+
+        print('starting optimization...')
         opt2 = optimize.least_squares(self._error_fun_triangulation_possible,
                                       x0=x0, jac_sparsity=jac,
                                       loss='linear',
@@ -1126,14 +1128,14 @@ class CameraGroup:
                                             reproj_loss,
                                             n_deriv_smooth))
         params = opt2.x
-        
+
         p3ds_new2 = params[:p3ds.size].reshape(p3ds.shape)
 
         bad = np.isnan(points[:, :, :, :, 0])
         all_bad = np.all(bad, axis=3)
 
         n_params_norm = p3ds.size + len(constraints) + len(constraints_weak)
-        
+
         alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
         alphas[~bad] = params[n_params_norm:]
 
@@ -1143,7 +1145,7 @@ class CameraGroup:
         alphas_sum[all_bad] = 1
         alphas_norm = alphas_exp / alphas_sum[:, :, :, None]
         alphas_norm[bad] = np.nan
-        
+
         t2 = time.time()
 
         if verbose:
@@ -1295,7 +1297,10 @@ class CameraGroup:
         errors = self._error_fun_triangulation(params_rest, p2ds_adj,
                                                constraints, constraints_weak, *args)
 
-        return errors
+        alphas_test = alphas_norm[~all_bad]
+        errors_alphas = (1 - np.std(alphas_test, axis=1)) * 10
+
+        return np.hstack([errors, errors_alphas])
 
 
     def _initialize_params_triangulation(self, p3ds,
@@ -1335,7 +1340,7 @@ class CameraGroup:
         good = ~np.isnan(p2ds[:, :, :, :, 0])
 
         alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
-        alphas[:, :, :, 0] = 1
+        alphas[:, :, :, 0] = 0
 
         params = self._initialize_params_triangulation(p3ds, **kwargs)
         params_full = np.hstack([params, alphas[good]])
@@ -1373,7 +1378,7 @@ class CameraGroup:
 
         point_indices_good = point_indices[good]
 
-        A_sparse = lil_matrix((n_errors, n_params), dtype='int16')
+        A_sparse = dok_matrix((n_errors, n_params), dtype='int16')
 
         # constraints for reprojection errors
         ix_reproj = np.arange(n_errors_reproj)
@@ -1426,25 +1431,29 @@ class CameraGroup:
     def _jac_sparsity_triangulation_possible(self, p2ds_full, **kwargs):
         # initialize sparse jacobian using above function
         # extend to include alphas from parameters
+        ## TODO: this initialization is really slow for some reason
 
         n_cams, n_frames, n_joints, n_possible, _ = p2ds_full.shape
         good_full = ~np.isnan(p2ds_full[:, :, :, :, 0])
+        any_good = np.any(good_full, axis=3)
 
         n_alphas = np.sum(good_full)
-        
+        n_errors_alphas = np.sum(any_good)
+
         p2ds = p2ds_full[:, :, :, 0]
         A_sparse = self._jac_sparsity_triangulation(p2ds, **kwargs)
 
         n_errors, n_params = A_sparse.shape
 
-        B_sparse = lil_matrix((n_errors, n_params + n_alphas), dtype='int16')
+        B_sparse = dok_matrix((n_errors + n_errors_alphas, n_params + n_alphas), dtype='int16')
         for r, c in zip(*A_sparse.nonzero()):
             B_sparse[r, c] = A_sparse[r, c]
-        
+
         point_indices_2d = np.arange(n_cams*n_frames*n_joints)\
                              .reshape(n_cams, n_frames, n_joints)
         point_indices_2d_rep = np.repeat(point_indices_2d[:, :, :, None], 2, axis=3)
         point_indices_2d_good = point_indices_2d_rep[~np.isnan(p2ds)]
+        point_indices_good = point_indices_2d[any_good]
 
         alpha_indices = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='int64')
         for pnum in range(n_possible):
@@ -1452,14 +1461,24 @@ class CameraGroup:
 
         alpha_indices_good = alpha_indices[good_full]
 
+        # alphas should change according to the reprojection error for each corresponding point
         point_indices_2d_good_find = defaultdict(list)
         for ix, p in enumerate(point_indices_2d_good):
             point_indices_2d_good_find[p].append(ix)
 
-        # alphas should change according to the reprojection error for each corresponding point
-        for alpha_index in alpha_indices_good:
-            B_sparse[point_indices_2d_good[alpha_index],
-                     n_params + alpha_index] = 1
+        for ix, alpha_index in enumerate(alpha_indices_good):
+            B_sparse[point_indices_2d_good_find[alpha_index],
+                     n_params + ix] = 1
+
+        # alphas should change according to the alpha errors
+        point_indices_good_find = dict()
+        for ix, p in enumerate(point_indices_good):
+            point_indices_good_find[p] = ix
+            
+        for ix, alpha_index in enumerate(alpha_indices_good):
+            if alpha_index in point_indices_good_find:
+                err_ix = n_errors + point_indices_good_find[alpha_index]
+                B_sparse[err_ix, n_params + ix] = 1
 
         return B_sparse
 
