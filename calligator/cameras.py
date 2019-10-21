@@ -843,7 +843,7 @@ class CameraGroup:
             rvecs = params[a:a+n_boards*3].reshape(-1, 3)
             tvecs = params[a+n_boards*3:a+n_boards*6].reshape(-1, 3)
             expected = transform_points(objp, rvecs[ids], tvecs[ids])
-            errors_obj = (p3ds_test - expected).ravel() / min_scale
+            errors_obj = 2 * (p3ds_test - expected).ravel() / min_scale
         else:
             errors_obj = np.array([])
 
@@ -945,26 +945,28 @@ class CameraGroup:
 
         if extra is not None:
             ids = extra['ids_map']
-            rvecs_all = extra['rvecs']
-            tvecs_all = extra['tvecs']
-
             n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
             total_board_params = n_boards * (3 + 3) # rvecs + tvecs
 
+            # initialize to 0
             rvecs = np.zeros((n_boards, 3), dtype='float64')
             tvecs = np.zeros((n_boards, 3), dtype='float64')
 
-            for board_num in range(n_boards):
-                point_id = np.where(ids == board_num)[0][0]
-                cam_ids_possible = np.where(~np.isnan(p2ds[:, point_id, 0]))[0]
-                cam_id = np.random.choice(cam_ids_possible)
-                M_cam = self.cameras[cam_id].get_extrinsics_mat()
-                M_board_cam = make_M(rvecs_all[cam_id, point_id],
-                                     tvecs_all[cam_id, point_id])
-                M_board = np.matmul(np.linalg.inv(M_cam), M_board_cam)
-                rvec, tvec = get_rtvec(M_board)
-                rvecs[board_num] = rvec
-                tvecs[board_num] = tvec
+            if 'rvecs' in extra and 'tvecs' in extra:
+                rvecs_all = extra['rvecs']
+                tvecs_all = extra['tvecs']
+                for board_num in range(n_boards):
+                    point_id = np.where(ids == board_num)[0][0]
+                    cam_ids_possible = np.where(~np.isnan(p2ds[:, point_id, 0]))[0]
+                    cam_id = np.random.choice(cam_ids_possible)
+                    M_cam = self.cameras[cam_id].get_extrinsics_mat()
+                    M_board_cam = make_M(rvecs_all[cam_id, point_id],
+                                         tvecs_all[cam_id, point_id])
+                    M_board = np.matmul(np.linalg.inv(M_cam), M_board_cam)
+                    rvec, tvec = get_rtvec(M_board)
+                    rvecs[board_num] = rvec
+                    tvecs[board_num] = tvec
+
 
         else:
             total_board_params = 0
@@ -1474,7 +1476,7 @@ class CameraGroup:
         point_indices_good_find = dict()
         for ix, p in enumerate(point_indices_good):
             point_indices_good_find[p] = ix
-            
+
         for ix, alpha_index in enumerate(alpha_indices_good):
             if alpha_index in point_indices_good_find:
                 err_ix = n_errors + point_indices_good_find[alpha_index]
