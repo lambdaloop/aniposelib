@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="calligator",
-    version="0.2.8",
+    version="0.2.9",
     author="Pierre Karashchuk",
     author_email="krchtchk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python",
@@ -21,7 +21,7 @@ setuptools.setup(
         "Topic :: Scientific/Engineering :: Image Recognition"
     ],
     install_requires=[
-        'opencv-python',
+        'opencv-python~=3.4',
         'opencv-contrib-python~=3.4',
         'numba',
         'numpy', 'scipy', 'toml'
