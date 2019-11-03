@@ -447,7 +447,7 @@ class Checkerboard(CalibrationObject):
 
     def estimate_pose_points(self, camera, points, ids=None):
         ngood = np.sum(~np.isnan(points)) // 2
-        if points is None or ngood < 3:
+        if points is None or ngood < 4:
             return None, None
 
         n_points = points.size // 2
@@ -598,7 +598,7 @@ class CharucoBoard(CalibrationObject):
         return self.objPoints
 
     def estimate_pose_points(self, camera, corners, ids):
-        if corners is None or ids is None or len(corners) < 3:
+        if corners is None or ids is None or len(corners) < 4:
             return None, None
 
         n_corners = corners.size // 2
@@ -611,3 +611,9 @@ class CharucoBoard(CalibrationObject):
             corners, ids, self.board, K, D)
 
         return rvec, tvec
+
+
+
+
+
+
