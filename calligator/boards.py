@@ -457,6 +457,9 @@ class Checkerboard(CalibrationObject):
         D = camera.get_distortions()
         obj_points = self.get_object_points()
 
+        if points.shape[0] != obj_points.shape[0]:
+            return None, None
+
         retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
                                                          points,
                                                          K,
@@ -611,9 +614,3 @@ class CharucoBoard(CalibrationObject):
             corners, ids, self.board, K, D)
 
         return rvec, tvec
-
-
-
-
-
-
