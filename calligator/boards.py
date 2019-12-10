@@ -110,7 +110,6 @@ def extract_points(merged,
 
     objp_template = board.get_object_points().reshape(-1, 3)
 
-
     imgp = np.full((n_cams, n_detects, n_points_per_detect, 2),
                    np.nan, dtype='float64')
 
@@ -136,8 +135,8 @@ def extract_points(merged,
                 bad = np.any(np.isnan(filled), axis=1)
                 num_good = np.sum(~bad)
                 if num_good < min_points or \
-                   (row[cname].get('rvec', None) is None or \
-                    row[cname].get('tvec', None) is None):
+                        (row[cname].get('rvec', None) is None or \
+                         row[cname].get('tvec', None) is None):
                     continue
 
                 imgp[cix, rix] = filled
@@ -238,6 +237,10 @@ class CalibrationObject(ABC):
         pass
 
     @abstractmethod
+    def manually_verify_board_detection(self, image, corners):
+        pass
+
+    @abstractmethod
     def get_object_points(self):
         pass
 
@@ -271,7 +274,9 @@ class CalibrationObject(ABC):
             frame = cv2.imread(imname)
 
             corners, ids = self.detect_image(frame)
+
             if corners is not None:
+
                 if prefix is None:
                     key = framenum
                 else:
@@ -283,6 +288,7 @@ class CalibrationObject(ABC):
                     'ids': ids,
                     'fname': imname
                 }
+
                 rows.append(row)
 
         rows = self.fill_points_rows(rows)
@@ -309,6 +315,7 @@ class CalibrationObject(ABC):
                 continue
 
             corners, ids = self.detect_image(frame)
+
             if corners is not None and len(corners) > 0:
                 if prefix is None:
                     key = framenum
@@ -376,10 +383,11 @@ class Checkerboard(CalibrationObject):
                        cv2.TERM_CRITERIA_MAX_ITER,
                        30, 0.01)
 
-    def __init__(self, squaresX, squaresY, square_length=1):
+    def __init__(self, squaresX, squaresY, square_length=1, manually_verify=False):
         self.squaresX = squaresX
         self.squaresY = squaresY
         self.square_length = square_length
+        self.manually_verify = manually_verify
 
         total_size = squaresX * squaresY
 
@@ -422,25 +430,57 @@ class Checkerboard(CalibrationObject):
             return out
 
     def detect_image(self, image, subpix=True):
+
+        ids = None
+
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
 
         size = self.get_size()
-        ret, corners = cv2.findChessboardCorners(gray, size,
-                                                 self.DETECT_PARAMS)
+        pattern_found, corners = cv2.findChessboardCorners(gray, size, self.DETECT_PARAMS)
 
-        if ret and subpix:
-            corners = cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1),
-                                       self.SUBPIX_CRITERIA)
-
-        if corners is None:
-            ids = None
-        else:
+        # Does <findChessBoardCorners()> believe that it found the pattern?
+        if pattern_found:
             ids = self.ids
+            # Do we want sub-pixel accuracy?
+            if subpix:
+                # TODO: The docs at (https://docs.opencv.org/3.4.0/dd/d1a/group__imgproc__feature.html
+                #  #ga354e0d7c86d0d9da75de9b9701a9a87e) do not specify what the return value of <cornerSubPix()>
+                #  will be if the function fails. Undefined behavior from my perspective. Could break
+                #  things if <cornerSubPix()> fails.
+                corners = cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1), self.SUBPIX_CRITERIA)
+
+        # Does a human want to manually verify the detection?
+        if self.manually_verify:
+            # <manually_verify_board_detection()> returns True if a human selects that the detection is correct.
+            # Otherwise, it returns false.
+            if self.manually_verify_board_detection(gray, corners, pattern_found):
+                pass
+            else:
+                corners = None
+                ids = None
 
         return corners, ids
+
+    def manually_verify_board_detection(self, image, corners, pattern_was_found):
+
+        height, width = image.shape[:2]
+        image = cv2.drawChessboardCorners(image, self.get_size(), corners, pattern_was_found)
+        cv2.imshow('verify_detection', image)
+        while 1:
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('a'):
+                cv2.putText(image, 'Accepted!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.imshow('verify_detection', image)
+                cv2.waitKey(150)
+                return True
+            elif key == ord('d'):
+                cv2.putText(image, 'Rejected!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.imshow('verify_detection', image)
+                cv2.waitKey(150)
+                return False
 
     def get_object_points(self):
         return self.objPoints
@@ -498,11 +538,13 @@ class CharucoBoard(CalibrationObject):
                  marker_length,
                  marker_bits=4,
                  dict_size=50,
-                 aruco_dict=None):
+                 aruco_dict=None,
+                 manually_verify=False):
         self.squaresX = squaresX
         self.squaresY = squaresY
         self.square_length = square_length
         self.marker_length = marker_length
+        self.manually_verify = manually_verify
 
         dkey = (marker_bits, dict_size)
         self.dictionary = aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
@@ -581,21 +623,50 @@ class CharucoBoard(CalibrationObject):
         return detectedCorners, detectedIds
 
     def detect_image(self, image, camera=None):
+
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
 
         corners, ids = self.detect_markers(image, camera, refine=True)
-        if len(corners) > 0:
-            ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
-                corners, ids, gray, self.board)
-            if detectedIds is None:
-                detectedCorners = detectedIds = np.float64([])
-        else:
-            detectedCorners = detectedIds = np.float64([])
+        num_detected_corners = 0
+        if ids is not None:
+            num_detected_corners, detected_corners, detected_ids = aruco.interpolateCornersCharuco(corners, ids, gray,
+                                                                                                   self.board)
+        if num_detected_corners > 0:
 
-        return detectedCorners, detectedIds
+            # Does a human want to manually verify the detection?
+            if self.manually_verify:
+                # <manually_verify_board_detection()> returns True if a human selects that the detection is correct.
+                # Otherwise, it returns false.
+                if self.manually_verify_board_detection(gray, detected_corners, detected_ids):
+                    pass
+                else:
+                    detected_corners = detected_ids = np.float64([])
+
+        else:
+            detected_corners = detected_ids = np.float64([])
+
+        return detected_corners, detected_ids
+
+    def manually_verify_board_detection(self, image, corners, ids=None):
+
+        height, width = image.shape[:2]
+        image = aruco.drawDetectedCornersCharuco(image, corners, ids)
+        cv2.imshow('verify_detection', image)
+        while 1:
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('a'):
+                cv2.putText(image, 'Accepted!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.imshow('verify_detection', image)
+                cv2.waitKey(150)
+                return True
+            elif key == ord('d'):
+                cv2.putText(image, 'Rejected!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.imshow('verify_detection', image)
+                cv2.waitKey(150)
+                return False
 
     def get_object_points(self):
         return self.objPoints
