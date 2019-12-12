@@ -431,55 +431,48 @@ class Checkerboard(CalibrationObject):
 
     def detect_image(self, image, subpix=True):
 
-        ids = None
-
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
 
         size = self.get_size()
-        pattern_found, corners = cv2.findChessboardCorners(gray, size, self.DETECT_PARAMS)
+        pattern_was_found, corners = cv2.findChessboardCorners(gray, size, self.DETECT_PARAMS)
 
-        # Does <findChessBoardCorners()> believe that it found the pattern?
-        if pattern_found:
-            ids = self.ids
-            # Do we want sub-pixel accuracy?
+        if corners is not None:
+
             if subpix:
-                # TODO: The docs at (https://docs.opencv.org/3.4.0/dd/d1a/group__imgproc__feature.html
-                #  #ga354e0d7c86d0d9da75de9b9701a9a87e) do not specify what the return value of <cornerSubPix()>
-                #  will be if the function fails. Undefined behavior from my perspective. Could break
-                #  things if <cornerSubPix()> fails.
                 corners = cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1), self.SUBPIX_CRITERIA)
 
-        # Does a human want to manually verify the detection?
-        if self.manually_verify:
-            # <manually_verify_board_detection()> returns True if a human selects that the detection is correct.
-            # Otherwise, it returns false.
-            if self.manually_verify_board_detection(gray, corners, pattern_found):
-                pass
-            else:
-                corners = None
-                ids = None
+        if corners is not None \
+            and self.manually_verify \
+                and not self.manually_verify_board_detection(gray, corners):
+            corners = None
+
+        if corners is None:
+            ids = None
+        else:
+            ids = self.ids
 
         return corners, ids
 
-    def manually_verify_board_detection(self, image, corners, pattern_was_found):
+    def manually_verify_board_detection(self, image, corners):
 
         height, width = image.shape[:2]
-        image = cv2.drawChessboardCorners(image, self.get_size(), corners, pattern_was_found)
+        image = cv2.drawChessboardCorners(image, self.get_size(), corners, 1)
+        cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow('verify_detection', image)
         while 1:
             key = cv2.waitKey(0) & 0xFF
             if key == ord('a'):
-                cv2.putText(image, 'Accepted!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.putText(image, 'Accepted!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
                 cv2.imshow('verify_detection', image)
-                cv2.waitKey(150)
+                cv2.waitKey(100)
                 return True
             elif key == ord('d'):
-                cv2.putText(image, 'Rejected!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.putText(image, 'Rejected!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
                 cv2.imshow('verify_detection', image)
-                cv2.waitKey(150)
+                cv2.waitKey(100)
                 return False
 
     def get_object_points(self):
@@ -630,42 +623,39 @@ class CharucoBoard(CalibrationObject):
             gray = image
 
         corners, ids = self.detect_markers(image, camera, refine=True)
-        num_detected_corners = 0
-        if ids is not None:
-            num_detected_corners, detected_corners, detected_ids = aruco.interpolateCornersCharuco(corners, ids, gray,
-                                                                                                   self.board)
-        if num_detected_corners > 0:
-
-            # Does a human want to manually verify the detection?
-            if self.manually_verify:
-                # <manually_verify_board_detection()> returns True if a human selects that the detection is correct.
-                # Otherwise, it returns false.
-                if self.manually_verify_board_detection(gray, detected_corners, detected_ids):
-                    pass
-                else:
-                    detected_corners = detected_ids = np.float64([])
-
+        if len(corners) > 0:
+            ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
+                corners, ids, gray, self.board)
+            if detectedIds is None:
+                detectedCorners = detectedIds = np.float64([])
         else:
-            detected_corners = detected_ids = np.float64([])
+            detectedCorners = detectedIds = np.float64([])
 
-        return detected_corners, detected_ids
+        if len(detectedCorners) > 0 \
+            and self.manually_verify \
+            and not self.manually_verify_board_detection(gray, detectedCorners, detectedIds):
+            detectedCorners = detectedIds = np.float64([])
+
+        return detectedCorners, detectedIds
+
 
     def manually_verify_board_detection(self, image, corners, ids=None):
 
         height, width = image.shape[:2]
         image = aruco.drawDetectedCornersCharuco(image, corners, ids)
+        cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow('verify_detection', image)
         while 1:
             key = cv2.waitKey(0) & 0xFF
             if key == ord('a'):
-                cv2.putText(image, 'Accepted!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.putText(image, 'Accepted!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
                 cv2.imshow('verify_detection', image)
-                cv2.waitKey(150)
+                cv2.waitKey(100)
                 return True
             elif key == ord('d'):
-                cv2.putText(image, 'Rejected!', (int(width/4), int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 3, 255, 2, cv2.LINE_AA)
+                cv2.putText(image, 'Rejected!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
                 cv2.imshow('verify_detection', image)
-                cv2.waitKey(150)
+                cv2.waitKey(100)
                 return False
 
     def get_object_points(self):
