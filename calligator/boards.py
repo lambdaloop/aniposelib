@@ -298,6 +298,9 @@ class CalibrationObject(ABC):
     def detect_video(self, vidname, prefix=None, skip=20, progress=False):
         cap = cv2.VideoCapture(vidname)
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if length < 10:
+            length = int(1e9)
+            progress = False
         rows = []
 
         go = int(skip / 2)
