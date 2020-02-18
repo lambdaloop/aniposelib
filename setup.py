@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="calligator",
-    version="0.3.1",
+    version="0.3.2",
     author="Pierre Karashchuk",
     author_email="krchtchk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python",
