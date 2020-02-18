@@ -1191,6 +1191,11 @@ class CameraGroup:
             p3ds = self.triangulate(points_shaped, progress=init_progress)
         p3ds = p3ds.reshape((n_frames, n_joints, 3))
 
+        c = np.isfinite(p3ds[:, :, 0])
+        if np.sum(c) < 20:
+            print("warning: not enough 3D points to run optimization")
+            return p3ds
+
         return self.optim_points(points, p3ds, **kwargs)
 
 
