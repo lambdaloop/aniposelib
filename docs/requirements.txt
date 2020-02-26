@@ -4,3 +4,4 @@ numba
 numpy
 scipy
 toml
+tqdm
