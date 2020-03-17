@@ -1,6 +1,9 @@
-# Calligator
+# Anipose lib
 
-An easy-to-use library for calibrating cameras in python
+An easy-to-use library for calibrating cameras and triangulation in Python.
 
-Documentation on the API is available at
-https://calligator.readthedocs.io/en/latest/
+This is the backend library for the [Anipose](https://github.com/lambdaloop/anipose) package.
+
+
+
+

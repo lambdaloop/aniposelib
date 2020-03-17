@@ -4,14 +4,14 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="calligator",
+    name="anipose-lib",
     version="0.3.2",
     author="Pierre Karashchuk",
     author_email="krchtchk@gmail.com",
-    description="An easy-to-use library for calibrating cameras in python",
+    description="An easy-to-use library for calibrating cameras in python, made for Anipose",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/lambdaloop/calligator",
+    url="https://github.com/lambdaloop/anipose-lib",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
