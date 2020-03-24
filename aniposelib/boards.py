@@ -91,7 +91,8 @@ def extract_points(merged,
                    board,
                    cam_names=None,
                    min_cameras=1,
-                   min_points=4):
+                   min_points=4,
+                   check_rtvecs=True):
     """Takes a list of merged rows (output of merge_rows) and a board object.
     Returns an array of object points and another array of image points, both of size CxNx2,
     where C is the number of cameras, N is the number of points.
@@ -134,11 +135,17 @@ def extract_points(merged,
                 filled = row[cname]['filled'].reshape(-1, 2)
                 bad = np.any(np.isnan(filled), axis=1)
                 num_good = np.sum(~bad)
-                if num_good < min_points or \
-                        (row[cname].get('rvec', None) is None or \
-                         row[cname].get('tvec', None) is None):
+                if num_good < min_points:
                     continue
 
+                if row[cname].get('rvec', None) is None or \
+                   row[cname].get('tvec', None) is None:
+                    if check_rtvecs:
+                        continue
+                    else:
+                        row[cname]['rvec'] = np.full(3, np.nan, dtype='float64')
+                        row[cname]['tvec'] = np.full(3, np.nan, dtype='float64')
+                
                 imgp[cix, rix] = filled
 
                 rvecs[cix, rix, ~bad] = row[cname]['rvec'].ravel()

@@ -745,7 +745,7 @@ class CameraGroup:
         extra_good = subset_extra(extra, good)
         self.bundle_adjust(p2ds[:, good], extra_good,
                            loss='linear',
-                           ftol=ftol, max_nfev=1000,
+                           ftol=ftol, max_nfev=max(200, max_nfev),
                            verbose=verbose)
 
         error = self.average_error(p2ds, median=True)
