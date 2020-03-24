@@ -490,7 +490,7 @@ class Checkerboard(CalibrationObject):
 
     def estimate_pose_points(self, camera, points, ids=None):
         ngood = np.sum(~np.isnan(points)) // 2
-        if points is None or ngood < 4:
+        if points is None or ngood < 6:
             return None, None
 
         n_points = points.size // 2
@@ -503,14 +503,19 @@ class Checkerboard(CalibrationObject):
         if points.shape[0] != obj_points.shape[0]:
             return None, None
 
-        retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
-                                                         points,
-                                                         K,
-                                                         D,
-                                                         confidence=0.9,
-                                                         reprojectionError=30)
+        try:
+            retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
+                                                             points,
+                                                             K,
+                                                             D,
+                                                             confidence=0.9,
+                                                             reprojectionError=30)
+            return rvec, tvec
 
-        return rvec, tvec
+        except:
+            print("W: failed to find checkerboard pose in image")
+            return None, None
+
 
 
 ARUCO_DICTS = {
@@ -672,7 +677,7 @@ class CharucoBoard(CalibrationObject):
         return self.objPoints
 
     def estimate_pose_points(self, camera, corners, ids):
-        if corners is None or ids is None or len(corners) < 4:
+        if corners is None or ids is None or len(corners) < 5:
             return None, None
 
         n_corners = corners.size // 2
