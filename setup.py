@@ -23,7 +23,7 @@ setuptools.setup(
     install_requires=[
         'opencv-python~=3.4',
         'opencv-contrib-python~=3.4',
-        'numba',
+        'numba', 'pandas',
         'numpy', 'scipy', 'toml', 'tqdm'
     ],
     extras_require={

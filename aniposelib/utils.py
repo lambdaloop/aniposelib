@@ -4,7 +4,7 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.cluster.vq import whiten
 from collections import defaultdict, Counter
 import queue
-
+import pandas as pd
 
 def make_M(rvec, tvec):
     out = np.zeros((4,4))
@@ -183,3 +183,55 @@ def get_initial_extrinsics(rtvecs):
     rvecs = np.array(rvecs)
     tvecs = np.array(tvecs)
     return rvecs, tvecs
+
+
+## convenience function to load a set of DeepLabCut pose-2d files
+def load_pose2d_fnames(fname_dict, offsets_dict=None, cam_names=None):
+    if cam_names is None:
+        cam_names = sorted(fname_dict.keys())
+    pose_names = [fname_dict[cname] for cname in cam_names]
+
+    if offsets_dict is None:
+        offsets_dict = dict([(cname, (0,0)) for cname in cam_names])
+
+    datas = []
+    for ix_cam, (cam_name, pose_name) in \
+            enumerate(zip(cam_names, pose_names)):
+        dlabs = pd.read_hdf(pose_name)
+        if len(dlabs.columns.levels) > 2:
+            scorer = dlabs.columns.levels[0][0]
+            dlabs = dlabs.loc[:, scorer]
+
+        bp_index = dlabs.columns.names.index('bodyparts')
+        joint_names = list(dlabs.columns.get_level_values(bp_index).unique())
+        dx = offsets_dict[cam_name][0]
+        dy = offsets_dict[cam_name][1]
+
+        for joint in joint_names:
+            dlabs.loc[:, (joint, 'x')] += dx
+            dlabs.loc[:, (joint, 'y')] += dy
+
+        datas.append(dlabs)
+
+    n_cams = len(cam_names)
+    n_joints = len(joint_names)
+    n_frames = min([d.shape[0] for d in datas])
+
+    # frame, camera, bodypart, xy
+    points = np.full((n_cams, n_frames, n_joints, 2), np.nan, 'float')
+    scores = np.full((n_cams, n_frames, n_joints), np.nan, 'float')
+
+    for cam_ix, dlabs in enumerate(datas):
+        for joint_ix, joint_name in enumerate(joint_names):
+            points[cam_ix, :, joint_ix] = np.array(dlabs.loc[:, (joint_name, ('x', 'y'))])[:n_frames]
+            try:
+                scores[cam_ix, :, joint_ix] = np.array(dlabs.loc[:, (joint_name, ('likelihood'))])[:n_frames].ravel()
+            except KeyError:
+                pass
+
+    return {
+        'cam_names': cam_names,
+        'points': points,
+        'scores': scores,
+        'bodyparts': joint_names
+    }
