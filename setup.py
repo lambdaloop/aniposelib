@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="aniposelib",
-    version="0.3.8",
+    version="0.3.9",
     author="Pierre Karashchuk",
     author_email="krchtchk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python, made for Anipose",
@@ -21,7 +21,6 @@ setuptools.setup(
         "Topic :: Scientific/Engineering :: Image Recognition"
     ],
     install_requires=[
-        'opencv-python~=3.4',
         'opencv-contrib-python~=3.4',
         'numba', 'pandas',
         'numpy', 'scipy', 'toml', 'tqdm'
