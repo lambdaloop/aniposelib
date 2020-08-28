@@ -1028,6 +1028,8 @@ class CameraGroup:
         x0 = self._initialize_params_triangulation(
             p3ds_intp, constraints, constraints_weak)
 
+        x0[~np.isfinite(x0)] = 0
+
         jac = self._jac_sparsity_triangulation(
             points, constraints, constraints_weak, n_deriv_smooth)
 
@@ -1543,8 +1545,9 @@ class CameraGroup:
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                matrix = cv2.initCameraMatrix2D([objp.astype('float32')],
-                                                [imgp.astype('float32')], size)
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) > 5]
+                objp, imgp = zip(*mixed)
+                matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
                 camera.set_camera_matrix(matrix)
 
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):

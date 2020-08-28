@@ -371,14 +371,14 @@ class CalibrationObject(ABC):
             good = np.all(~np.isnan(filled_test), axis=1)
             filled_app = row['filled'].reshape(-1, 2)
             objp = np.copy(objpoints)
-            all_obj.append(objp[good])
-            all_img.append(filled_app[good])
+            all_obj.append(np.float32(objp[good]))
+            all_img.append(np.float32(filled_app[good]))
 
-        all_obj = np.vstack(all_obj)
-        all_img = np.vstack(all_img)
+        # all_obj = np.vstack(all_obj)
+        # all_img = np.vstack(all_img)
 
-        all_obj = np.array(all_obj, dtype='float64')
-        all_img = np.array(all_img, dtype='float64')
+        # all_obj = np.array(all_obj, dtype='float64')
+        # all_img = np.array(all_img, dtype='float64')
 
         return all_obj, all_img
 
