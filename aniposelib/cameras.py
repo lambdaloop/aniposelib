@@ -273,7 +273,7 @@ class Camera:
         matrix = self.get_camera_matrix()
         new_matrix = matrix * scale
         new_matrix[2, 2] = 1
-        self.set_size(size)
+        self.set_size(new_size)
         self.set_camera_matrix(new_matrix)
 
     def get_params(self):
