@@ -17,6 +17,8 @@ def get_video_params_cap(cap):
 
 def get_video_params(fname):
     cap = cv2.VideoCapture(fname)
+    if not cap.isOpened():
+        raise FileNotFoundError(f'missing file "{fname}"')
     params = get_video_params_cap(cap)
     cap.release()
     return params
@@ -304,6 +306,8 @@ class CalibrationObject(ABC):
 
     def detect_video(self, vidname, prefix=None, skip=20, progress=False):
         cap = cv2.VideoCapture(vidname)
+        if not cap.isOpened():
+            raise FileNotFoundError(f'missing video file "{vidname}"')
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if length < 10:
             length = int(1e9)
