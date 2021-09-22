@@ -1560,7 +1560,7 @@ class CameraGroup:
             rtvecs = extract_rtvecs(merged)
             if verbose:
                 pprint(get_connections(rtvecs, self.get_names()))
-            rvecs, tvecs = get_initial_extrinsics(rtvecs)
+            rvecs, tvecs = get_initial_extrinsics(rtvecs, self.get_names())
             self.set_rotations(rvecs)
             self.set_translations(tvecs)
 

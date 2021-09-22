@@ -120,7 +120,10 @@ def get_calibration_graph(rtvecs, cam_names=None):
 
     for edgenum in range(n_cams-1):
         if len(edges) == 0:
-            return None
+            raise ValueError("""Could not build calibration graph.
+            Some group of cameras could not be paired by simultaneous calibration board detections.
+            Check which cameras have different group numbers below to see the missing edges.
+            {}""".format(components))
 
         (a, b), weight = max(edges, key=lambda x: x[1])
         graph[a].append(b)
@@ -168,8 +171,8 @@ def compute_camera_matrices(rtvecs, pairs):
         extrinsics[b] = np.matmul(ext, extrinsics[a])
     return extrinsics
 
-def get_initial_extrinsics(rtvecs):
-    graph = get_calibration_graph(rtvecs)
+def get_initial_extrinsics(rtvecs, cam_names=None):
+    graph = get_calibration_graph(rtvecs, cam_names)
     pairs = find_calibration_pairs(graph, source=0)
     extrinsics = compute_camera_matrices(rtvecs, pairs)
 
