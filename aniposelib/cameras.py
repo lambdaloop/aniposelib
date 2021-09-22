@@ -613,7 +613,7 @@ class CameraGroup:
                                          progress=progress)
 
 
-    @jit(nopython=True, parallel=True, forceobj=True)
+    @jit(parallel=True, forceobj=True)
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -815,7 +815,7 @@ class CameraGroup:
         error = self.average_error(p2ds)
         return error
 
-    @jit(nopython=True, parallel=True, forceobj=True)
+    @jit(parallel=True, forceobj=True)
     def _error_fun_bundle(self, params, p2ds, n_cam_params, extra):
         """Error function for bundle adjustment"""
         good = ~np.isnan(p2ds)
@@ -1202,7 +1202,7 @@ class CameraGroup:
 
 
 
-    @jit(nopython=True, forceobj=True, parallel=True)
+    @jit(forceobj=True, parallel=True)
     def _error_fun_triangulation(self, params, p2ds,
                                  constraints=[],
                                  constraints_weak=[],
@@ -1536,7 +1536,9 @@ class CameraGroup:
     def calibrate_rows(self, all_rows, board,
                        init_intrinsics=True, init_extrinsics=True, verbose=True,
                        **kwargs):
-        """Assumes camera sizes are set properly"""
+        assert len(all_rows) == len(self.cameras), \
+            "Number of camera detections does not match number of cameras"
+
         for rows, camera in zip(all_rows, self.cameras):
             size = camera.get_size()
 
