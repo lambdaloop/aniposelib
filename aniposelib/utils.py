@@ -109,17 +109,18 @@ def get_calibration_graph(rtvecs, cam_names=None):
     if cam_names is None:
         cam_names = np.arange(n_cams)
 
-    connections = get_connections(rtvecs, cam_names)
+    connections = get_connections(rtvecs, np.arange(n_cams))
 
-    components = dict(zip(cam_names, range(n_cams)))
+    components = dict(zip(np.arange(n_cams), range(n_cams)))
     edges = set(connections.items())
-
-    # print(sorted(edges))
 
     graph = defaultdict(list)
 
     for edgenum in range(n_cams-1):
         if len(edges) == 0:
+            component_names = dict()
+            for k,v in components.items():
+                components[cam_names[k]] = v
             raise ValueError("""Could not build calibration graph.
             Some group of cameras could not be paired by simultaneous calibration board detections.
             Check which cameras have different group numbers below to see the missing edges.
