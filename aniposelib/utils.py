@@ -119,12 +119,13 @@ def get_calibration_graph(rtvecs, cam_names=None):
     for edgenum in range(n_cams-1):
         if len(edges) == 0:
             component_names = dict()
-            for k,v in components.items():
-                components[cam_names[k]] = v
-            raise ValueError("""Could not build calibration graph.
-            Some group of cameras could not be paired by simultaneous calibration board detections.
-            Check which cameras have different group numbers below to see the missing edges.
-            {}""".format(components))
+            for k,v in list(components.items()):
+                component_names[cam_names[k]] = v
+            raise ValueError("""
+Could not build calibration graph.
+Some group of cameras could not be paired by simultaneous calibration board detections.
+Check which cameras have different group numbers below to see the missing edges.
+{}""".format(component_names))
 
         (a, b), weight = max(edges, key=lambda x: x[1])
         graph[a].append(b)
