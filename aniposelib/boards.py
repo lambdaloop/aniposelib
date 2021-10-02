@@ -1,5 +1,4 @@
 import cv2
-from cv2 import aruco
 import numpy as np
 from abc import ABC, abstractmethod
 from tqdm import trange
@@ -522,25 +521,6 @@ class Checkerboard(CalibrationObject):
 
 
 
-ARUCO_DICTS = {
-    (4, 50): aruco.DICT_4X4_50,
-    (5, 50): aruco.DICT_5X5_50,
-    (6, 50): aruco.DICT_6X6_50,
-    (7, 50): aruco.DICT_7X7_50,
-    (4, 100): aruco.DICT_4X4_100,
-    (5, 100): aruco.DICT_5X5_100,
-    (6, 100): aruco.DICT_6X6_100,
-    (7, 100): aruco.DICT_7X7_100,
-    (4, 250): aruco.DICT_4X4_250,
-    (5, 250): aruco.DICT_5X5_250,
-    (6, 250): aruco.DICT_6X6_250,
-    (7, 250): aruco.DICT_7X7_250,
-    (4, 1000): aruco.DICT_4X4_1000,
-    (5, 1000): aruco.DICT_5X5_1000,
-    (6, 1000): aruco.DICT_6X6_1000,
-    (7, 1000): aruco.DICT_7X7_1000
-}
-
 
 class CharucoBoard(CalibrationObject):
     def __init__(self,
@@ -557,6 +537,29 @@ class CharucoBoard(CalibrationObject):
         self.square_length = square_length
         self.marker_length = marker_length
         self.manually_verify = manually_verify
+
+        # import aruco only here so that we only require opencv-contrib-python when using ChArUco module
+        global aruco
+        from cv2 import aruco
+
+        ARUCO_DICTS = {
+            (4, 50): aruco.DICT_4X4_50,
+            (5, 50): aruco.DICT_5X5_50,
+            (6, 50): aruco.DICT_6X6_50,
+            (7, 50): aruco.DICT_7X7_50,
+            (4, 100): aruco.DICT_4X4_100,
+            (5, 100): aruco.DICT_5X5_100,
+            (6, 100): aruco.DICT_6X6_100,
+            (7, 100): aruco.DICT_7X7_100,
+            (4, 250): aruco.DICT_4X4_250,
+            (5, 250): aruco.DICT_5X5_250,
+            (6, 250): aruco.DICT_6X6_250,
+            (7, 250): aruco.DICT_7X7_250,
+            (4, 1000): aruco.DICT_4X4_1000,
+            (5, 1000): aruco.DICT_5X5_1000,
+            (6, 1000): aruco.DICT_6X6_1000,
+            (7, 1000): aruco.DICT_7X7_1000
+        }
 
         dkey = (marker_bits, dict_size)
         self.dictionary = aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
