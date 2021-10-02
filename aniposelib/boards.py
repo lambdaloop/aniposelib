@@ -694,6 +694,6 @@ class CharucoBoard(CalibrationObject):
         D = camera.get_distortions()
 
         ret, rvec, tvec = aruco.estimatePoseCharucoBoard(
-            corners, ids, self.board, K, D)
+            corners, ids, self.board, K, D, None, None)
 
         return rvec, tvec
