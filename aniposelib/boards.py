@@ -618,7 +618,6 @@ class CharucoBoard(CalibrationObject):
             corners, ids, rejectedImgPoints = aruco.detectMarkers(
                 gray, self.dictionary, parameters=params) 
         except Exception:
-            print('Exception raised from `aruco.detectMarkers()` in anipose\'s `boards.py`')
             ids = None
 
 
