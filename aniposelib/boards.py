@@ -615,8 +615,12 @@ class CharucoBoard(CalibrationObject):
         params.adaptiveThreshConstant = 0
         # params.useArucoDetection = False
 
-        corners, ids, rejectedImgPoints = aruco.detectMarkers(
-            gray, self.dictionary, parameters=params)
+        try:
+            corners, ids, rejectedImgPoints = aruco.detectMarkers(
+                gray, self.dictionary, parameters=params) 
+        except Exception:
+            ids = None
+
 
         if ids is None:
             return [], []
