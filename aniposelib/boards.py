@@ -609,10 +609,11 @@ class CharucoBoard(CalibrationObject):
 
         params = aruco.DetectorParameters_create()
         params.cornerRefinementMethod = aruco.CORNER_REFINE_CONTOUR
-        params.adaptiveThreshWinSizeMin = 100
-        params.adaptiveThreshWinSizeMax = 700
-        params.adaptiveThreshWinSizeStep = 50
+        params.adaptiveThreshWinSizeMin = 5
+        params.adaptiveThreshWinSizeMax = 400
+        params.adaptiveThreshWinSizeStep = 25
         params.adaptiveThreshConstant = 0
+        # params.useArucoDetection = False
 
         corners, ids, rejectedImgPoints = aruco.detectMarkers(
             gray, self.dictionary, parameters=params)
