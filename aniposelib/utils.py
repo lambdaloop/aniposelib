@@ -73,9 +73,9 @@ def get_transform(rtvecs, left, right):
             L.append(M)
     L_best = select_matrices(L)
     M_mean = mean_transform(L_best)
-    # M_mean = mean_transform_robust(L, M_mean, error=0.5)
+    M_mean = mean_transform_robust(L, M_mean, error=0.5)
     # M_mean = mean_transform_robust(L, M_mean, error=0.2)
-    M_mean = mean_transform_robust(L, M_mean, error=0.1)
+    # M_mean = mean_transform_robust(L, M_mean, error=0.1)
     return M_mean
 
 
