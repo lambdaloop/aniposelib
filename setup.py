@@ -26,6 +26,5 @@ setuptools.setup(
         'numpy', 'scipy', 'toml', 'tqdm'
     ],
     extras_require={
-        'full':  ["checkerboard"]
     }
 )
