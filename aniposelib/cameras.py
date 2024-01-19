@@ -1547,7 +1547,7 @@ class CameraGroup:
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 7]
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 8]
                 objp, imgp = zip(*mixed)
                 matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
                 camera.set_camera_matrix(matrix)
@@ -1555,7 +1555,8 @@ class CameraGroup:
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)
 
-        merged = merge_rows(all_rows)
+        new_rows = [[r for r in rows if r['ids'].size >= 8] for rows in all_rows]
+        merged = merge_rows(new_rows)
         imgp, extra = extract_points(merged, board, min_cameras=2)
 
         if init_extrinsics:
