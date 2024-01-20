@@ -237,6 +237,9 @@ class Camera:
     def set_distortions(self, dist):
         self.dist = np.array(dist, dtype='float64').ravel()
 
+    def zero_distortions(self):
+        self.dist = self.dist * 0
+
     def set_rotation(self, rvec):
         self.rvec = np.array(rvec, dtype='float64').ravel()
 
@@ -276,10 +279,15 @@ class Camera:
         self.set_size(new_size)
         self.set_camera_matrix(new_matrix)
 
-    def get_params(self):
-        params = np.zeros(8 + self.extra_dist, dtype='float64')
+    def get_params(self, only_extrinsics=False):
+        if only_extrinsics:
+            params = np.zeros(6, dtype='float64')
+        else:
+            params = np.zeros(8 + self.extra_dist, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
+        if only_extrinsics:
+            return params
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
@@ -287,9 +295,12 @@ class Camera:
             params[8] = dist[1]
         return params
 
-    def set_params(self, params):
+    def set_params(self, params, only_extrinsics=False):
         self.set_rotation(params[0:3])
         self.set_translation(params[3:6])
+        if only_extrinsics:
+            return
+
         self.set_focal_length(params[6])
 
         dist = np.zeros(5, dtype='float64')
@@ -389,9 +400,13 @@ class FisheyeCamera(Camera):
                                            self.dist.astype('float64'))
         return out
 
-    def set_params(self, params):
+    def set_params(self, params, only_extrinsics):
         self.set_rotation(params[0:3])
         self.set_translation(params[3:6])
+
+        if only_extrinsics:
+            return
+        
         self.set_focal_length(params[6])
 
         dist = np.zeros(4, dtype='float64')
@@ -402,10 +417,15 @@ class FisheyeCamera(Camera):
         # dist[3] = params[10]
         self.set_distortions(dist)
 
-    def get_params(self):
-        params = np.zeros(8+self.extra_dist, dtype='float64')
+    def get_params(self, only_extrinsics=False):
+        if only_extrinsics:
+            params = np.zeros(6, dtype='float64')
+        else:
+            params = np.zeros(8+self.extra_dist, dtype='float64')
         params[0:3] = self.get_rotation()
         params[3:6] = self.get_translation()
+        if only_extrinsics:
+            return params
         params[6] = self.get_focal_length()
         dist = self.get_distortions()
         params[7] = dist[0]
@@ -657,7 +677,7 @@ class CameraGroup:
                            n_iters=6, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4,
                            n_samp_iter=200, n_samp_full=1000,
-                           error_threshold=0.3,
+                           error_threshold=0.3, only_extrinsics=False,
                            verbose=False):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -720,7 +740,7 @@ class CameraGroup:
 
             self.bundle_adjust(p2ds_samp, extra_samp,
                                loss='linear', ftol=ftol,
-                               max_nfev=max_nfev,
+                               max_nfev=max_nfev, only_extrinsics=only_extrinsics,
                                verbose=verbose)
 
 
@@ -746,6 +766,7 @@ class CameraGroup:
         self.bundle_adjust(p2ds[:, good], extra_good,
                            loss='linear',
                            ftol=ftol, max_nfev=max(200, max_nfev),
+                           only_extrinsics=only_extrinsics,
                            verbose=verbose)
 
         error = self.average_error(p2ds, median=True)
@@ -768,6 +789,7 @@ class CameraGroup:
                       max_nfev=1000,
                       weights=None,
                       start_params=None,
+                      only_extrinsics=False,
                       verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -782,11 +804,11 @@ class CameraGroup:
         if extra is not None:
             extra['ids_map'] = remap_ids(extra['ids'])
 
-        x0, n_cam_params = self._initialize_params_bundle(p2ds, extra)
+        x0, n_cam_params = self._initialize_params_bundle(p2ds, extra, only_extrinsics)
 
         if start_params is not None:
             x0 = start_params
-            n_cam_params = len(self.cameras[0].get_params())
+            # n_cam_params = len(self.cameras[0].get_params(only_extrinsics))
 
         error_fun = self._error_fun_bundle
 
@@ -804,19 +826,19 @@ class CameraGroup:
                                      tr_solver='lsmr',
                                      verbose=2 * verbose,
                                      max_nfev=max_nfev,
-                                     args=(p2ds, n_cam_params, extra))
+                                     args=(p2ds, n_cam_params, extra, only_extrinsics))
         best_params = opt.x
 
         for i, cam in enumerate(self.cameras):
             a = i * n_cam_params
             b = (i + 1) * n_cam_params
-            cam.set_params(best_params[a:b])
+            cam.set_params(best_params[a:b], only_extrinsics)
 
         error = self.average_error(p2ds)
         return error
 
     @jit(parallel=True, forceobj=True)
-    def _error_fun_bundle(self, params, p2ds, n_cam_params, extra):
+    def _error_fun_bundle(self, params, p2ds, n_cam_params, extra, only_extrinsics):
         """Error function for bundle adjustment"""
         good = ~np.isnan(p2ds)
         n_cams = len(self.cameras)
@@ -825,7 +847,7 @@ class CameraGroup:
             cam = self.cameras[i]
             a = i * n_cam_params
             b = (i + 1) * n_cam_params
-            cam.set_params(params[a:b])
+            cam.set_params(params[a:b], only_extrinsics)
 
         n_cams = len(self.cameras)
         sub = n_cam_params * n_cams
@@ -926,12 +948,12 @@ class CameraGroup:
 
         return A_sparse
 
-    def _initialize_params_bundle(self, p2ds, extra):
+    def _initialize_params_bundle(self, p2ds, extra, only_extrinsics):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         initializes the parameters for bundle adjustment"""
 
-        cam_params = np.hstack([cam.get_params() for cam in self.cameras])
+        cam_params = np.hstack([cam.get_params(only_extrinsics) for cam in self.cameras])
         n_cam_params = len(cam_params) // len(self.cameras)
 
         total_cam_params = len(cam_params)
@@ -1547,10 +1569,13 @@ class CameraGroup:
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 8]
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 9]
                 objp, imgp = zip(*mixed)
                 matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
-                camera.set_camera_matrix(matrix)
+                camera.set_camera_matrix(matrix.copy())
+                camera.zero_distortions()
+
+        print(self.get_dicts())
 
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)
