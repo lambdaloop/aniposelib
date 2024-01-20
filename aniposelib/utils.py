@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.cluster.vq import whiten
+from scipy.linalg import inv
 from collections import defaultdict, Counter
 import queue
 import pandas as pd
@@ -69,13 +70,13 @@ def get_transform(rtvecs, left, right):
         if good[left] and good[right]:
             M_left = make_M(d[left, 0:3], d[left, 3:6])
             M_right = make_M(d[right, 0:3], d[right, 3:6])
-            M = np.matmul(M_left, np.linalg.inv(M_right))
+            M = np.matmul(M_left, inv(M_right))
             L.append(M)
     L_best = select_matrices(L)
     M_mean = mean_transform(L_best)
-    # M_mean = mean_transform_robust(L, M_mean, error=0.5)
+    M_mean = mean_transform_robust(L, M_mean, error=0.5)
     # M_mean = mean_transform_robust(L, M_mean, error=0.2)
-    M_mean = mean_transform_robust(L, M_mean, error=0.1)
+    # M_mean = mean_transform_robust(L, M_mean, error=0.1)
     return M_mean
 
 

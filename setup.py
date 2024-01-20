@@ -5,9 +5,9 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="aniposelib",
-    version="0.4.3",
-    author="Pierre Karashchuk",
-    author_email="krchtchk@gmail.com",
+    version="0.5.1",
+    author="Lili Karashchuk",
+    author_email="lili.karashchuk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python, made for Anipose",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -26,6 +26,5 @@ setuptools.setup(
         'numpy', 'scipy', 'toml', 'tqdm'
     ],
     extras_require={
-        'full':  ["checkerboard"]
     }
 )

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix, dok_matrix
+from scipy.linalg import inv
 from scipy import optimize
 from scipy import signal
 from numba import jit
@@ -654,9 +655,9 @@ class CameraGroup:
 
 
     def bundle_adjust_iter(self, p2ds, extra=None,
-                           n_iters=10, start_mu=15, end_mu=1,
+                           n_iters=6, start_mu=15, end_mu=1,
                            max_nfev=200, ftol=1e-4,
-                           n_samp_iter=100, n_samp_full=1000,
+                           n_samp_iter=200, n_samp_full=1000,
                            error_threshold=0.3,
                            verbose=False):
         """Given an CxNx2 array of 2D points,
@@ -962,7 +963,7 @@ class CameraGroup:
                     M_cam = self.cameras[cam_id].get_extrinsics_mat()
                     M_board_cam = make_M(rvecs_all[cam_id, point_id],
                                          tvecs_all[cam_id, point_id])
-                    M_board = np.matmul(np.linalg.inv(M_cam), M_board_cam)
+                    M_board = np.matmul(inv(M_cam), M_board_cam)
                     rvec, tvec = get_rtvec(M_board)
                     rvecs[board_num] = rvec
                     tvecs[board_num] = tvec
@@ -1547,7 +1548,7 @@ class CameraGroup:
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 7]
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 8]
                 objp, imgp = zip(*mixed)
                 matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
                 camera.set_camera_matrix(matrix)
@@ -1555,7 +1556,8 @@ class CameraGroup:
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)
 
-        merged = merge_rows(all_rows)
+        new_rows = [[r for r in rows if r['ids'].size >= 8] for rows in all_rows]
+        merged = merge_rows(new_rows)
         imgp, extra = extract_points(merged, board, min_cameras=2)
 
         if init_extrinsics:
