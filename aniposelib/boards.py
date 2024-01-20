@@ -538,33 +538,29 @@ class CharucoBoard(CalibrationObject):
         self.marker_length = marker_length
         self.manually_verify = manually_verify
 
-        # import aruco only here so that we only require opencv-contrib-python when using ChArUco module
-        global aruco
-        from cv2 import aruco
-
         ARUCO_DICTS = {
-            (4, 50): aruco.DICT_4X4_50,
-            (5, 50): aruco.DICT_5X5_50,
-            (6, 50): aruco.DICT_6X6_50,
-            (7, 50): aruco.DICT_7X7_50,
-            (4, 100): aruco.DICT_4X4_100,
-            (5, 100): aruco.DICT_5X5_100,
-            (6, 100): aruco.DICT_6X6_100,
-            (7, 100): aruco.DICT_7X7_100,
-            (4, 250): aruco.DICT_4X4_250,
-            (5, 250): aruco.DICT_5X5_250,
-            (6, 250): aruco.DICT_6X6_250,
-            (7, 250): aruco.DICT_7X7_250,
-            (4, 1000): aruco.DICT_4X4_1000,
-            (5, 1000): aruco.DICT_5X5_1000,
-            (6, 1000): aruco.DICT_6X6_1000,
-            (7, 1000): aruco.DICT_7X7_1000
+            (4, 50): cv2.aruco.DICT_4X4_50,
+            (5, 50): cv2.aruco.DICT_5X5_50,
+            (6, 50): cv2.aruco.DICT_6X6_50,
+            (7, 50): cv2.aruco.DICT_7X7_50,
+            (4, 100): cv2.aruco.DICT_4X4_100,
+            (5, 100): cv2.aruco.DICT_5X5_100,
+            (6, 100): cv2.aruco.DICT_6X6_100,
+            (7, 100): cv2.aruco.DICT_7X7_100,
+            (4, 250): cv2.aruco.DICT_4X4_250,
+            (5, 250): cv2.aruco.DICT_5X5_250,
+            (6, 250): cv2.aruco.DICT_6X6_250,
+            (7, 250): cv2.aruco.DICT_7X7_250,
+            (4, 1000): cv2.aruco.DICT_4X4_1000,
+            (5, 1000): cv2.aruco.DICT_5X5_1000,
+            (6, 1000): cv2.aruco.DICT_6X6_1000,
+            (7, 1000): cv2.aruco.DICT_7X7_1000
         }
 
         dkey = (marker_bits, dict_size)
-        self.dictionary = aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
+        self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
 
-        self.board = aruco.CharucoBoard_create(squaresX, squaresY,
+        self.board = cv2.aruco.CharucoBoard([squaresX, squaresY],
                                                square_length, marker_length,
                                                self.dictionary)
 
@@ -607,16 +603,15 @@ class CharucoBoard(CalibrationObject):
         else:
             gray = image
 
-        params = aruco.DetectorParameters_create()
-        params.cornerRefinementMethod = aruco.CORNER_REFINE_CONTOUR
+        params = cv2.aruco.DetectorParameters()
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
         params.adaptiveThreshWinSizeMin = 5
         params.adaptiveThreshWinSizeMax = 400
         params.adaptiveThreshWinSizeStep = 25
         params.adaptiveThreshConstant = 0
-        # params.useArucoDetection = False
 
         try:
-            corners, ids, rejectedImgPoints = aruco.detectMarkers(
+            corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(
                 gray, self.dictionary, parameters=params) 
         except Exception:
             ids = None
@@ -633,7 +628,7 @@ class CharucoBoard(CalibrationObject):
 
         if refine:
             detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
-                aruco.refineDetectedMarkers(gray, self.board, corners, ids,
+                cv2.aruco.refineDetectedMarkers(gray, self.board, corners, ids,
                                             rejectedImgPoints,
                                             K, D,
                                             parameters=params)
@@ -651,7 +646,7 @@ class CharucoBoard(CalibrationObject):
 
         corners, ids = self.detect_markers(image, camera, refine=True)
         if len(corners) > 0:
-            ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
+            ret, detectedCorners, detectedIds = cv2.aruco.interpolateCornersCharuco(
                 corners, ids, gray, self.board)
             if detectedIds is None:
                 detectedCorners = detectedIds = np.float64([])
@@ -669,7 +664,7 @@ class CharucoBoard(CalibrationObject):
     def manually_verify_board_detection(self, image, corners, ids=None):
 
         height, width = image.shape[:2]
-        image = aruco.drawDetectedCornersCharuco(image, corners, ids)
+        image = cv2.aruco.drawDetectedCornersCharuco(image, corners, ids)
         cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow('verify_detection', image)
         while 1:
@@ -698,7 +693,7 @@ class CharucoBoard(CalibrationObject):
         K = camera.get_camera_matrix()
         D = camera.get_distortions()
 
-        ret, rvec, tvec = aruco.estimatePoseCharucoBoard(
+        ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             corners, ids, self.board, K, D, None, None)
 
         return rvec, tvec
