@@ -561,8 +561,8 @@ class CharucoBoard(CalibrationObject):
         self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
 
         self.board = cv2.aruco.CharucoBoard([squaresX, squaresY],
-                                               square_length, marker_length,
-                                               self.dictionary)
+                                            square_length, marker_length,
+                                            self.dictionary)
 
         total_size = (squaresX - 1) * (squaresY - 1)
 
