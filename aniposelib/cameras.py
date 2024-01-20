@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from copy import copy
 from scipy.sparse import lil_matrix, dok_matrix
+from scipy.linalg import inv
 from scipy import optimize
 from scipy import signal
 from numba import jit
@@ -984,7 +985,7 @@ class CameraGroup:
                     M_cam = self.cameras[cam_id].get_extrinsics_mat()
                     M_board_cam = make_M(rvecs_all[cam_id, point_id],
                                          tvecs_all[cam_id, point_id])
-                    M_board = np.matmul(np.linalg.inv(M_cam), M_board_cam)
+                    M_board = np.matmul(inv(M_cam), M_board_cam)
                     rvec, tvec = get_rtvec(M_board)
                     rvecs[board_num] = rvec
                     tvecs[board_num] = tvec
