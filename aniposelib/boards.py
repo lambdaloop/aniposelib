@@ -605,9 +605,9 @@ class CharucoBoard(CalibrationObject):
 
         params = cv2.aruco.DetectorParameters()
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-        params.adaptiveThreshWinSizeMin = 5
-        params.adaptiveThreshWinSizeMax = 400
-        params.adaptiveThreshWinSizeStep = 25
+        params.adaptiveThreshWinSizeMin = 50
+        params.adaptiveThreshWinSizeMax = 700
+        params.adaptiveThreshWinSizeStep = 50
         params.adaptiveThreshConstant = 0
 
         try:
