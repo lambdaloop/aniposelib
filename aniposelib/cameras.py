@@ -1012,7 +1012,8 @@ class CameraGroup:
                      scale_smooth=4,
                      scale_length=2, scale_length_weak=0.5,
                      reproj_error_threshold=15, reproj_loss='soft_l1',
-                     n_deriv_smooth=1, scores=None, verbose=False):
+                     n_deriv_smooth=1, scores=None, verbose=False,
+                     n_fixed=0):
         """
         Take in an array of 2D points of shape CxNxJx2,
         an array of 3D points of shape NxJx3,
@@ -1053,6 +1054,11 @@ class CameraGroup:
 
         x0[~np.isfinite(x0)] = 0
 
+        if n_fixed > 0:
+            p3ds_fixed = p3ds_intp[:n_fixed]
+        else:
+            p3ds_fixed = None
+
         jac = self._jac_sparsity_triangulation(
             points, constraints, constraints_weak, n_deriv_smooth)
 
@@ -1070,9 +1076,13 @@ class CameraGroup:
                                             scale_length_weak,
                                             reproj_error_threshold,
                                             reproj_loss,
-                                            n_deriv_smooth))
+                                            n_deriv_smooth,
+                                            p3ds_fixed))
 
         p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
+
+        if n_fixed > 0:
+            p3ds_new2 = np.vstack([p3ds_fixed, p3ds_new2[n_fixed:]])
 
         t2 = time.time()
 
@@ -1235,10 +1245,11 @@ class CameraGroup:
                                  scale_length_weak=0.2,
                                  reproj_error_threshold=100,
                                  reproj_loss='soft_l1',
-                                 n_deriv_smooth=1):
+                                 n_deriv_smooth=1,
+                                 p3ds_fixed=None):
         n_cams, n_frames, n_joints, _ = p2ds.shape
 
-        n_3d = n_frames*n_joints*3
+        n_3d = n_frames * n_joints * 3
         n_constraints = len(constraints)
         n_constraints_weak = len(constraints_weak)
 
@@ -1246,6 +1257,13 @@ class CameraGroup:
         p3ds = params[:n_3d].reshape((n_frames, n_joints, 3))
         joint_lengths = np.array(params[n_3d:n_3d+n_constraints])
         joint_lengths_weak = np.array(params[n_3d+n_constraints:])
+
+        ## if fixed points, first n_fixed parameter points are ignored
+        ## and replacement points are put in
+        ## this way we can keep rest of code the same, especially _jac_sparsity_triangulation
+        if p3ds_fixed is not None:
+            n_fixed = p3ds_fixed.shape[0]
+            p3ds = np.vstack([p3ds_fixed, p3ds[n_fixed:]])
 
         # reprojection errors
         p3ds_flat = p3ds.reshape(-1, 3)
