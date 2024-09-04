@@ -360,7 +360,7 @@ class CalibrationObject(ABC):
             row['filled'] = self.fill_points(row['corners'], row['ids'])
         return rows
 
-    def get_all_calibration_points(self, rows):
+    def get_all_calibration_points(self, rows, min_points=5):
         rows = self.fill_points_rows(rows)
 
         objpoints = self.get_object_points()
@@ -374,8 +374,9 @@ class CalibrationObject(ABC):
             good = np.all(~np.isnan(filled_test), axis=1)
             filled_app = row['filled'].reshape(-1, 2)
             objp = np.copy(objpoints)
-            all_obj.append(np.float32(objp[good]))
-            all_img.append(np.float32(filled_app[good]))
+            if np.sum(good) >= min_points:
+                all_obj.append(np.float32(objp[good]))
+                all_img.append(np.float32(filled_app[good]))
 
         # all_obj = np.vstack(all_obj)
         # all_img = np.vstack(all_img)
