@@ -481,7 +481,7 @@ class CameraGroup:
 
         return out
 
-    def triangulate(self, points, undistort=True, progress=False):
+    def triangulate(self, points, undistort=True, progress=False, fast=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
@@ -506,21 +506,36 @@ class CameraGroup:
 
         n_cams, n_points, _ = points.shape
 
-        out = np.empty((n_points, 3))
-        out[:] = np.nan
 
-        cam_mats = np.array([cam.get_extrinsics_mat() for cam in self.cameras])
+        if fast:
+            cam_Rt_mats = np.array([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
+            
+            p3d_allview_withnan = []
+            for j1, j2 in itertools.combinations(range(n_cams), 2):
+                pts1, pts2 = points[j1], points[j2]
+                Rt1, Rt2 = cam_Rt_mats[j1], cam_Rt_mats[j2]
+                tri = cv2.triangulatePoints(Rt1, Rt2, pts1.T, pts2.T)
+                tri = tri[:3]/tri[3]
+                p3d_allview_withnan.append(tri.T)
+            p3d_allview_withnan = np.array(p3d_allview_withnan)
+            out = np.nanmedian(p3d_allview_withnan, axis=0)
 
-        if progress:
-            iterator = trange(n_points, ncols=70)
         else:
-            iterator = range(n_points)
+            out = np.empty((n_points, 3))
+            out[:] = np.nan
 
-        for ip in iterator:
-            subp = points[:, ip, :]
-            good = ~np.isnan(subp[:, 0])
-            if np.sum(good) >= 2:
-                out[ip] = triangulate_simple(subp[good], cam_mats[good])
+            cam_mats = np.array([cam.get_extrinsics_mat() for cam in self.cameras])
+
+            if progress:
+                iterator = trange(n_points, ncols=70)
+            else:
+                iterator = range(n_points)
+
+            for ip in iterator:
+                subp = points[:, ip, :]
+                good = ~np.isnan(subp[:, 0])
+                if np.sum(good) >= 2:
+                    out[ip] = triangulate_simple(subp[good], cam_mats[good])
 
         if one_point:
             out = out[0]
