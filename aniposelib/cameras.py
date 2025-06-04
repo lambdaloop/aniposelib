@@ -1637,7 +1637,12 @@ class CameraGroup:
             rows_cam = []
             for vnum, vidname in enumerate(cam_videos):
                 if verbose: print(vidname)
-                rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
+                try:
+                    rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
+                except Exception as e:
+                    print("anipose warning: board detection failed for video {}".format(vidname))
+                    print(e)
+                    rows = []
                 if verbose: print("{} boards detected".format(len(rows)))
                 rows_cam.extend(rows)
             all_rows.append(rows_cam)
