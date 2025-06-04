@@ -1640,7 +1640,7 @@ class CameraGroup:
                 try:
                     rows = board.detect_video(vidname, prefix=vnum, progress=verbose)
                 except Exception as e:
-                    print("anipose warning: board detection failed for video {}".format(vidname))
+                    print("WARNING: board detection failed for video {}".format(vidname))
                     print(e)
                     rows = []
                 if verbose: print("{} boards detected".format(len(rows)))
@@ -1653,9 +1653,14 @@ class CameraGroup:
         for cix, (cam, cam_videos) in enumerate(zip(self.cameras, videos)):
             rows_cam = []
             for vnum, vidname in enumerate(cam_videos):
-                params = get_video_params(vidname)
-                size = (params['width'], params['height'])
-                cam.set_size(size)
+                try:
+                    params = get_video_params(vidname)
+                    size = (params['width'], params['height'])
+                    cam.set_size(size)
+                except Exception as e:
+                    print("WARNING: camera size detection failed for video {}".format(vidname))
+                    print(e)
+
 
     def calibrate_videos(self, videos, board,
                          init_intrinsics=True, init_extrinsics=True, verbose=True,

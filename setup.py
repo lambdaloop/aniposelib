@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="aniposelib",
-    version="0.7.1",
+    version="0.7.2",
     author="Lili Karashchuk",
     author_email="lili.karashchuk@gmail.com",
     description="An easy-to-use library for calibrating cameras in python, made for Anipose",
