@@ -23,7 +23,8 @@ setuptools.setup(
     install_requires=[
         'opencv-contrib-python>=4.7.0.68',
         'numba', 'pandas',
-        'numpy', 'scipy', 'toml', 'tqdm'
+        'numpy', 'scipy', 'toml', 'tqdm',
+        'pytest', 'pytest-cov', 'hypothesis'
     ],
     extras_require={
     }
