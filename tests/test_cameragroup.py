@@ -7,12 +7,8 @@ from hypothesis.extra.numpy import arrays
 import numpy as np
 # from aniposelib.cameras import Camera, CameraGroup
 
-import importlib
-import aniposelib.cameras
-importlib.reload(aniposelib.cameras)
 from aniposelib.cameras import Camera, CameraGroup
 
-from collections import namedtuple
 import cv2
 
 @given(st.integers())
