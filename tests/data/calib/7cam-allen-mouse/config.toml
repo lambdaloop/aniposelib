@@ -1,0 +1,92 @@
+project = "mouse"
+model_folder = "/scratch/mouse47-scorer-2025-02-28"
+nesting = 0
+video_extension = "mp4"
+converted_video_speed = 0.5
+
+[pipeline]
+calibration_videos = "calibration-videos"
+calibration_results = "calibration-videos"
+videos_raw = "behavior-videos"
+
+[calibration]
+board_type = "charuco"
+board_size = [ 6, 5,]
+board_marker_bits = 4
+board_marker_dict_number = 50
+board_marker_length = 18
+board_square_side_length = 24
+animal_calibration = true
+
+[filter]
+enabled = true
+type = [ "viterbi", "autoencoder",]
+score_threshold = 0.05
+multiprocessing = true
+autoencoder_path = "/scratch/autoencoder.pickle"
+
+[triangulation]
+cam_regex = "(cam[0-9]+)_"
+optim = true
+constraints = [ [ "nose", "L-ear",], [ "nose", "R-ear",], [ "neck", "spine-mid",], [ "spine-mid", "tail-base",], [ "tail-1/3", "tail-2/3",], [ "tail-2/3", "tail-end",], [ "neck", "LF-shoulder",], [ "LF-shoulder", "LF-elbow",], [ "LF-elbow", "LF-wrist",], [ "LF-wrist", "LF-index-base",], [ "LF-wrist", "LF-pinkie-base",], [ "LF-index-base", "LF-pinkie-base",], [ "neck", "RF-shoulder",], [ "RF-shoulder", "RF-elbow",], [ "RF-elbow", "RF-wrist",], [ "RF-wrist", "RF-index-base",], [ "RF-wrist", "RF-pinkie-base",], [ "RF-index-base", "RF-pinkie-base",], [ "tail-base", "LH-hip",], [ "LH-hip", "LH-knee",], [ "LH-knee", "LH-wrist",], [ "LH-wrist", "LH-thumb-base",], [ "LH-wrist", "LH-pinkie-base",], [ "LH-thumb-base", "LH-pinkie-base",], [ "tail-base", "RH-hip",], [ "RH-hip", "RH-knee",], [ "RH-knee", "RH-wrist",], [ "RH-wrist", "RH-thumb-base",], [ "RH-wrist", "RH-pinkie-base",], [ "RH-thumb-base", "RH-pinkie-base",],]
+constraints_weak = [ [ "LF-index", "LF-index-base",], [ "LF-middle", "LF-index-base",], [ "LF-pinkie", "LF-pinkie-base",], [ "LF-ring", "LF-pinkie-base",], [ "RF-index", "RF-index-base",], [ "RF-middle", "RF-index-base",], [ "RF-pinkie", "RF-pinkie-base",], [ "RF-ring", "RF-pinkie-base",], [ "LH-thumb", "LH-thumb-base",], [ "LH-index", "LH-thumb-base",], [ "LH-middle", "LH-thumb-base",], [ "LH-pinkie", "LH-pinkie-base",], [ "LH-ring", "LH-pinkie-base",], [ "RH-thumb", "LH-thumb-base",], [ "RH-index", "RH-thumb-base",], [ "RH-middle", "RH-thumb-base",], [ "RH-pinkie", "RH-pinkie-base",], [ "RH-ring", "RH-pinkie-base",],]
+scale_smooth = 4
+score_threshold = 0.4
+n_deriv_smooth = 3
+scale_length = 3
+scale_length_weak = 1
+optim_chunking = true
+optim_chunking_size = 1000
+
+[angles]
+L_nose_ear = [ "nose", "L-ear", "R-ear",]
+R_nose_ear = [ "nose", "R-ear", "R-ear",]
+nose_neck = [ "nose", "neck", "spine-mid",]
+spine_ang = [ "neck", "spine-mid", "tail-base",]
+tail_chain = [ "chain", "tail-base", "tail-1/3", "tail-2/3", "tail-end",]
+LF_chain = [ "chain", "LF-shoulder", "LF-elbow", "LF-wrist", "LF-index-base",]
+LF_index = [ "LF-wrist", "LF-index-base", "LF-index",]
+LF_middle = [ "LF-wrist", "LF-index-base", "LF-middle",]
+LF_ring = [ "LF-wrist", "LF-pinkie-base", "LF-ring",]
+LF_pinkie = [ "LF-wrist", "LF-pinkie-base", "LF-pinkie",]
+RF_chain = [ "chain", "RF-shoulder", "RF-elbow", "RF-wrist", "RF-index-base",]
+RF_index = [ "RF-wrist", "RF-index-base", "RF-index",]
+RF_middle = [ "RF-wrist", "RF-index-base", "RF-middle",]
+RF_ring = [ "RF-wrist", "RF-pinkie-base", "RF-ring",]
+RF_pinkie = [ "RF-wrist", "RF-pinkie-base", "RF-pinkie",]
+LH_chain = [ "chain", "LH-hip", "LH-knee", "LH-wrist", "LH-middle",]
+LH_thumb = [ "LH-wrist", "LH-thumb-base", "LH-thumb",]
+LH_index = [ "LH-wrist", "LH-thumb-base", "LH-index",]
+LH_middle = [ "LH-wrist", "LH-thumb-base", "LH-middle",]
+LH_ring = [ "LH-wrist", "LH-pinkie-base", "LH-ring",]
+LH_pinkie = [ "LH-wrist", "LH-pinkie-base", "LH-pinkie",]
+RH_chain = [ "chain", "RH-hip", "RH-knee", "RH-wrist", "RH-middle",]
+RH_thumb = [ "RH-wrist", "RH-thumb-base", "RH-thumb",]
+RH_index = [ "RH-wrist", "RH-thumb-base", "RH-index",]
+RH_middle = [ "RH-wrist", "RH-thumb-base", "RH-middle",]
+RH_ring = [ "RH-wrist", "RH-pinkie-base", "RH-ring",]
+RH_pinkie = [ "RH-wrist", "RH-pinkie-base", "RH-pinkie",]
+
+[labeling]
+scheme = [ [ "nose", "L-ear", "R-ear",], [ "neck", "spine-mid", "tail-base", "tail-1/3", "tail-2/3", "tail-end",], [ "neck", "LF-shoulder", "LF-elbow", "LF-wrist",], [ "LF-wrist", "LF-index-base", "LF-index", "LF-index-base", "LF-middle", "LF-index-base", "LF-pinkie-base", "LF-ring", "LF-pinkie-base", "LF-pinkie",], [ "neck", "RF-shoulder", "RF-elbow", "RF-wrist",], [ "RF-wrist", "RF-index-base", "RF-index", "RF-index-base", "RF-middle", "RF-index-base", "RF-pinkie-base", "RF-ring", "RF-pinkie-base", "RF-pinkie",], [ "tail-base", "LH-hip", "LH-knee", "LH-wrist",], [ "LH-wrist", "LH-thumb-base", "LH-thumb", "LH-thumb-base", "LH-index", "LH-thumb-base", "LH-middle", "LH-thumb-base", "LH-pinkie-base", "LH-ring", "LH-pinkie-base", "LH-pinkie",], [ "tail-base", "RH-hip", "RH-knee", "RH-wrist",], [ "RH-wrist", "RH-thumb-base", "RH-thumb", "RH-thumb-base", "RH-index", "RH-thumb-base", "RH-middle", "RH-thumb-base", "RH-pinkie-base", "RH-ring", "RH-pinkie-base", "RH-pinkie",],]
+
+[cameras.cam088]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam091]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam581]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam592]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam593]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam712]
+offset = [ 120, 140, 1200, 800,]
+
+[cameras.cam746]
+offset = [ 120, 140, 1200, 800,]
