@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aniposelib"
+version = "0.7.2"
+description = "An easy-to-use library for calibrating cameras in python, made for Anipose"
+readme = "README.md"
+authors = [
+    {name = "Lili Karashchuk", email = "lili.karashchuk@gmail.com"}
+]
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: BSD License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Image Recognition"
+]
+dependencies = [
+    "opencv-contrib-python>=4.7.0.68",
+    "numba",
+    "pandas",
+    "numpy",
+    "scipy",
+    "toml",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "hypothesis", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/lambdaloop/aniposelib"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration"
+]
