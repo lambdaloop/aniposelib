@@ -6,7 +6,7 @@ from scipy.linalg import inv
 from scipy import optimize
 from scipy import signal
 from numba import jit
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, namedtuple
 import toml
 import itertools
 from tqdm import trange
@@ -18,7 +18,7 @@ from .boards import merge_rows, extract_points, \
 from .utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
-@jit(nopython=True, parallel=True)
+# @jit(nopython=True, parallel=True)
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
     A = np.zeros((num_cams * 2, 4))
@@ -170,6 +170,64 @@ def transform_points(points, rvecs, tvecs):
 
     return rotated + tvecs
 
+Ray = namedtuple('Ray', ['origin', 'direction'])
+
+def closest_point_between_rays(r1, r2):
+    """
+    Find the closest points between two rays.
+    
+    Parameters:
+    Takes two rays of the form
+    r1 = (a1, d1)
+    r2 = (a2, d2)
+    where
+     (a1, a2): origin points of rays (numpy arrays)
+     (d1, d2): direction vectors of rays (numpy arrays, need not be normalized)
+    
+    Returns:
+    p1: closest point on ray 1
+    p2: closest point on ray 2
+    distance: minimum distance between the rays
+    """
+
+    a1 = r1.origin
+    d1 = r1.direction
+    a2 = r2.origin
+    d2 = r2.direction
+    
+    # Normalize direction vectors
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = d2 / np.linalg.norm(d2)
+    
+    # Vector between origins
+    w0 = a1 - a2
+    
+    # Dot products
+    a = np.dot(d1, d1)  # always 1 if normalized
+    b = np.dot(d1, d2)
+    c = np.dot(d2, d2)  # always 1 if normalized
+    d = np.dot(d1, w0)
+    e = np.dot(d2, w0)
+    
+    # Solve for parameters
+    denom = a * c - b * b
+    
+    if abs(denom) < 1e-10:
+        # Parallel rays
+        return None
+    else:
+        t1 = (b * e - c * d) / denom
+        t2 = (a * e - b * d) / denom
+
+    # best point behind rays
+    if t1 < 0 or t2 < 0:
+        return None
+        
+    # Closest points
+    p1 = a1 + t1 * d1
+    p2 = a2 + t2 * d2
+    
+    return (p1 + p2) / 2.0
 
 class Camera:
     def __init__(self,
@@ -332,7 +390,7 @@ class Camera:
         out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
                                    self.matrix.astype('float64'),
                                    self.dist.astype('float64'))
-        return out
+        return out.reshape(points.shape[0], 2)
 
     def reprojection_error(self, p3d, p2d):
         proj = self.project(p3d).reshape(p2d.shape)
@@ -347,6 +405,143 @@ class Camera:
                    tvec=self.get_translation().copy(),
                    name=self.get_name(),
                    extra_dist=self.extra_dist)
+
+    def is_point_visible(self, p3d, margin=0):
+        """
+        Check if 3D points project into camera view.
+        margin: pixels from border (e.g., 10 to avoid edge effects)
+        """
+        p2d = self.project(p3d)
+        w, h = self.get_size()
+
+        # check if in bounds
+        in_bounds = (
+            (p2d[:, 0] >= margin) & 
+            (p2d[:, 0] < w - margin) &
+            (p2d[:, 1] >= margin) & 
+            (p2d[:, 1] < h - margin)
+        )
+
+        # check if point is in front of camera
+        R = cv2.Rodrigues(self.get_rotation())[0]
+        t = self.get_translation().ravel()
+        p_cam = (R @ p3d.T).T + t
+        in_front = p_cam[:, 2] > 0
+
+        return in_bounds & in_front
+
+    def projection_sensitivity(self, p):
+        """
+        Compute the sensitivity (Jacobian) of camera projection to 3D point movement.
+
+        Parameters:
+        -----------
+        p : array_like, shape (3,) or (N, 3)
+            3D point(s) in world coordinates [x, y, z]
+
+        Returns:
+        --------
+        J : ndarray, shape (2, 3) or (N, 2, 3)
+            Jacobian matrix where J[i,j] = ∂pixel_i/∂world_j
+            Each column gives pixel sensitivity to movement in x, y, z directions
+            If multiple points: J[k] is the Jacobian for point k
+        """
+        p = np.array(p, dtype='float64')
+        one_point = False
+        if p.ndim == 1:
+            p = p.reshape(1, 3)
+            one_point = True
+
+        n_points = p.shape[0]
+
+        # Get camera parameters
+        R = cv2.Rodrigues(self.rvec)[0]  # Convert rotation vector to matrix
+        t = self.tvec
+        fx, fy = self.get_focal_length(both=True)
+
+        # Transform to camera coordinates
+        p_cam = (R @ p.T).T + t
+        X = p_cam[:, 0]
+        Y = p_cam[:, 1]
+        Z = p_cam[:, 2]
+        
+        # Jacobian of projection w.r.t camera coordinates
+        # J_proj[i] has shape (2, 3) for point i
+        J_proj = np.zeros((n_points, 2, 3), dtype='float64')
+        J_proj[:, 0, 0] = fx / Z
+        J_proj[:, 0, 2] = -fx * X / (Z**2)
+        J_proj[:, 1, 1] = fy / Z
+        J_proj[:, 1, 2] = -fy * Y / (Z**2)
+        
+        # Chain rule: J = J_proj @ R
+        # Using einsum for batch matrix multiplication
+        J = np.einsum('nij,jk->nik', J_proj, R)
+
+        if one_point:
+            J = J[0]
+
+        return J
+
+    def get_center_world(self):
+        R = cv2.Rodrigues(self.get_rotation())[0]
+        t = self.get_translation()
+        return -R.T @ t 
+
+    def get_camera_rays(self):
+        """
+        Shoot rays from the 4 corners and center of a camera into 3D space.
+
+        Parameters:
+        -----------
+        camera : Camera
+            The camera to shoot rays from
+
+        Returns:
+        --------
+        rays : dict
+            Dictionary with keys 'origins' (5x3) and 'directions' (5x3)
+            Order: [top_left, top_right, bottom_right, bottom_left, center]
+        """
+        if self.get_size() is None:
+            raise ValueError("Camera must have size set")
+
+        w, h = self.get_size()
+
+        # Define corner and center points in image coordinates
+        # Order: top_left, top_right, bottom_right, bottom_left, center
+        img_points = np.array([
+            [0, 0],           # top left
+            [w-1, 0],         # top right
+            [w-1, h-1],       # bottom right
+            [0, h-1],         # bottom left
+            [w/2, h/2]        # center
+        ], dtype='float64')
+
+        # Undistort to get normalized camera coordinates
+        norm_points = self.undistort_points(img_points)
+
+        # Convert to 3D rays in camera frame
+        # Normalized points are already x/z, y/z, so we append z=1
+        rays_camera = np.hstack([norm_points, np.ones((5, 1))])
+
+        # Normalize the direction vectors
+        rays_camera = rays_camera / np.linalg.norm(rays_camera, axis=1, keepdims=True)
+
+        # Transform rays to world coordinates
+        R = cv2.Rodrigues(self.get_rotation())[0]
+        t = self.get_translation()
+
+        # Ray origins are all at camera center in world coordinates
+        center = self.get_center_world()
+
+        # Ray directions in world frame
+        directions = (R.T @ rays_camera.T).T
+
+        rays = [Ray(origin=center, direction=d)
+                for d in directions]
+
+        return rays
+
 
 class FisheyeCamera(Camera):
     def __init__(self,
@@ -1728,3 +1923,87 @@ class CameraGroup:
     def resize_cameras(self, scale):
         for cam in self.cameras:
             cam.resize_camera(scale)
+
+    def is_point_visible(self, p3d, margin=0):
+        """Takes a Nx3 set of 3D points.
+        Returns a boolean array of CxN where C is the number of cameras,
+        representing if each camera can see each point.
+        """
+        all_visible = [cam.is_point_visible(p3d)
+                       for cam in self.cameras]
+        return np.stack(all_visible)
+
+    
+    def get_triangulation_sensitivity(self, p):
+        """
+        Compute triangulation sensitivity for a set of 3D points.
+        This is the minimum singular value of all the projection sensitivities from each camera.
+        Generally, a higher value means that large movements of the 3D point
+          would result in small movements in the projections, meaning that the triangulation
+          is likely to be less reliable.
+
+        Parameters:
+        -----------
+        p : array_like, shape (3,) or (N, 3)
+            3D point(s) in world coordinates
+
+        Returns:
+        --------
+        sensitivity : float or ndarray
+            Lower number means more reliable triangulation 
+        """
+        p = np.array(p, dtype='float64')
+
+        n_points = p.shape[0]
+        n_cams = len(self.cameras)
+
+        J_all = np.zeros((n_points, 2*n_cams, 3), dtype='float64')
+        visibles = self.is_point_visible(p)
+        
+        for i, cam in enumerate(self.cameras):
+            J_cam = cam.projection_sensitivity(p)
+            J_cam = J_cam * visibles[i, :, None, None]
+            J_all[:, 2*i:2*i+2, :] = J_cam
+
+        # handle nans
+        J_all[~np.isfinite(J_all)] = 0
+        
+        # Compute conditioning
+        s = np.linalg.svd(J_all, compute_uv=False)
+        sensitivity = s[:, 0] / (s[:, -1] + 1e-10)
+        # sensitivity = 1/(s[:, -1] + 1e-6)
+
+        # sensitivity = np.min(np.max(np.abs(J_all), axis=1), axis=1)
+        
+        count = np.sum(visibles, axis=0)
+        sensitivity[count < 2] = np.nan
+
+        return sensitivity
+
+
+    def get_point_cloud(self, sensitivity_threshold=4):
+        points = []
+        for c1, c2 in itertools.combinations(self.cameras, 2):
+            rays1 = c1.get_camera_rays()
+            rays2 = c2.get_camera_rays()
+            for r1, r2 in itertools.product(rays1, rays2):
+                p = closest_point_between_rays(r1, r2)
+                if p is not None:
+                    points.append(p)
+        points = np.array(points)
+
+        low, high = np.percentile(points, [5, 95], axis=0)
+        scale = np.max(high - low) * 0.15
+
+        all_points = [points]
+        for i in range(15):
+            pp = points + np.random.normal(size=points.shape) * scale 
+            all_points.append(pp)
+        all_points = np.vstack(all_points)
+
+        s = self.get_triangulation_sensitivity(all_points)
+        s[np.isnan(s)] = np.inf
+
+        good = s < sensitivity_threshold
+        
+        return all_points[good], s[good]
