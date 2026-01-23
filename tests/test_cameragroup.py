@@ -110,7 +110,7 @@ def test_projection_sensitivity(p):
     cam = Camera(matrix=K, rvec=rvec, tvec=tvec, dist=dist)
     
     # Analytical Jacobian
-    J_analytical = cam.projection_sensitivity(p)
+    J_analytical = cam.projection_sensitivity(p[None])[0]
     
     # Numerical Jacobian using finite differences
     epsilon = 1e-5

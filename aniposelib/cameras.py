@@ -13,9 +13,13 @@ from tqdm import trange
 from pprint import pprint
 import time
 
-from .boards import merge_rows, extract_points, \
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from aniposelib.boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
-from .utils import get_initial_extrinsics, make_M, get_rtvec, \
+from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
 # @jit(nopython=True, parallel=True)
@@ -229,7 +233,93 @@ def closest_point_between_rays(r1, r2):
     
     return (p1 + p2) / 2.0
 
-class Camera:
+def to_tensor(x, device=None, dtype=torch.float64):
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        t = x.clone().detach().to(dtype=dtype)
+    else:
+        if isinstance(x, (list, tuple)) and len(x) > 0 and torch.is_tensor(x[0]):
+            t = torch.stack(x).to(dtype=dtype)
+        else:
+            t = torch.tensor(np.array(x), dtype=dtype)
+    if device is not None:
+        t = t.to(device)
+    return t
+
+def to_homogeneous(p):
+    one_size = p.shape[:-1] + (1,)
+    ones = torch.ones(size=one_size, dtype=p.dtype, device=p.device)
+    return torch.cat([p, ones], dim=-1)
+
+
+def from_homogeneous(p, eps=1e-10):
+    return p[..., :-1] / (p[..., -1, None] + eps) 
+
+def rodrigues(rvec):
+    """
+    Convert rotation vector to rotation matrix using Rodrigues formula.
+    
+    Args:
+        rvec: rotation vector of shape (3,) or (3, 1)
+    
+    Returns:
+        R: rotation matrix of shape (3, 3)
+    """
+    if rvec.dim() == 2:
+        rvec = rvec.squeeze()
+    
+    theta = torch.norm(rvec)
+    
+    if theta < 1e-10:
+        # Small angle approximation
+        return torch.eye(3, dtype=rvec.dtype, device=rvec.device)
+    
+    # Normalized axis
+    k = rvec / theta
+    
+    # Skew-symmetric matrix
+    K = torch.tensor([
+        [0, -k[2], k[1]],
+        [k[2], 0, -k[0]],
+        [-k[1], k[0], 0]
+    ], dtype=rvec.dtype, device=rvec.device)
+    
+    # Rodrigues formula: R = I + sin(theta)*K + (1-cos(theta))*K^2
+    I = torch.eye(3, dtype=rvec.dtype, device=rvec.device)
+    R = I + torch.sin(theta) * K + (1 - torch.cos(theta)) * torch.mm(K, K)
+    
+    return R
+
+def project_points(p3d, ext, matrix, dist):
+    p2d_proj_raw = torch.matmul(to_homogeneous(p3d), ext.T)
+    p2d_proj_raw = from_homogeneous(p2d_proj_raw[..., :3])
+
+    k1, k2, p1, p2, k3 = dist
+    k4 = k5 = k6 = 0
+    r2 = torch.sum(torch.square(p2d_proj_raw), axis=1)
+    r4 = r2 * r2
+    r6 = r4 * r2
+    kscale = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
+    #TODO: add p1, p2 effect
+    p2d_dist = kscale[:, None] * p2d_proj_raw
+
+    p2d_raw = torch.matmul(to_homogeneous(p2d_dist), matrix.T)
+    p2d = from_homogeneous(p2d_raw)
+
+    #TODO: handle offset
+
+    return p2d
+
+def make_M_torch(rvec, tvec):
+    R = rodrigues(rvec)
+    M = torch.eye(4, device=rvec.device, dtype=rvec.dtype)
+    M[:3, :3] = R
+    M[:3, 3] = tvec.reshape(3)
+    return M
+
+
+class Camera(nn.Module):
     def __init__(self,
                  matrix=np.eye(3),
                  dist=np.zeros(5),
@@ -238,12 +328,19 @@ class Camera:
                  tvec=np.zeros(3),
                  name=None,
                  extra_dist=False):
+        super().__init__()
 
-        self.set_camera_matrix(matrix)
-        self.set_distortions(dist)
+        self.register_parameter('matrix', nn.Parameter(to_tensor(matrix)))
+        self.register_parameter('dist', nn.Parameter(to_tensor(dist)))
+        self.register_parameter('rvec', nn.Parameter(to_tensor(rvec).view(-1)))
+        self.register_parameter('tvec', nn.Parameter(to_tensor(tvec).view(-1)))
+        
+        # self.set_camera_matrix(matrix)
+        # self.set_distortions(dist)
+        # self.set_rotation(rvec)
+        # self.set_translation(tvec)
+        
         self.set_size(size)
-        self.set_rotation(rvec)
-        self.set_translation(tvec)
         self.set_name(name)
         self.extra_dist = extra_dist
 
@@ -251,10 +348,10 @@ class Camera:
         return {
             'name': self.get_name(),
             'size': list(self.get_size()),
-            'matrix': self.get_camera_matrix().tolist(),
-            'distortions': self.get_distortions().tolist(),
-            'rotation': self.get_rotation().tolist(),
-            'translation': self.get_translation().tolist(),
+            'matrix': self.matrix.detach().numpy().tolist(),
+            'distortions': self.dist.detach().numpy().tolist(),
+            'rotation': self.rvec.detach().numpy().tolist(),
+            'translation': self.tvec.detach().numpy().tolist(),
         }
 
     def load_dict(self, d):
@@ -271,49 +368,59 @@ class Camera:
         return cam
 
     def get_camera_matrix(self):
-        return self.matrix
+        return self.matrix.detach().numpy()
 
     def get_distortions(self):
-        return self.dist
+        return self.dist.detach().numpy()
 
     def set_camera_matrix(self, matrix):
-        self.matrix = np.array(matrix, dtype='float64')
+        # self.matrix = np.array(matrix, dtype='float64')
+        self.matrix.data = to_tensor(matrix, device=self.matrix.device)
 
     def set_focal_length(self, fx, fy=None):
         if fy is None:
             fy = fx
-        self.matrix[0, 0] = fx
-        self.matrix[1, 1] = fy
+        # self.matrix[0, 0] = fx
+        # self.matrix[1, 1] = fy
+        self.matrix.data[0, 0] = float(fx)
+        self.matrix.data[1, 1] = float(fy)
 
     def get_focal_length(self, both=False):
-        fx = self.matrix[0, 0]
-        fy = self.matrix[1, 1]
+        fx = self.matrix[0, 0].item()
+        fy = self.matrix[1, 1].item()
         if both:
             return (fx, fy)
         else:
             return (fx + fy) / 2.0
 
     def set_distortions(self, dist):
-        self.dist = np.array(dist, dtype='float64').ravel()
+        # self.dist = np.array(dist, dtype='float64').ravel()
+        self.dist.data = to_tensor(dist, device=self.dist.device).view(-1)
 
     def zero_distortions(self):
-        self.dist = self.dist * 0
+        # self.dist = self.dist * 0
+        self.dist.data.zero_()
 
     def set_rotation(self, rvec):
-        self.rvec = np.array(rvec, dtype='float64').ravel()
+        # self.rvec = np.array(rvec, dtype='float64').ravel()
+        self.rvec.data = to_tensor(rvec, device=self.rvec.device).view(-1)
 
     def get_rotation(self):
-        return self.rvec
+        return self.rvec.detach().numpy()
 
     def set_translation(self, tvec):
-        self.tvec = np.array(tvec, dtype='float64').ravel()
+        # self.tvec = np.array(tvec, dtype='float64').ravel()
+        self.tvec.data = to_tensor(tvec, device=self.tvec.device).view(-1)
 
     def get_translation(self):
-        return self.tvec
+        return self.tvec.detach().numpy()
 
     def get_extrinsics_mat(self):
-        return make_M(self.rvec, self.tvec)
+        return make_M_torch(self.rvec, self.tvec).detach().numpy()
 
+    def get_extrinsics_mat_torch(self):
+        return make_M_torch(self.rvec, self.tvec)
+    
     def get_name(self):
         return self.name
 
@@ -332,11 +439,15 @@ class Camera:
         """resize the camera by scale factor, updating intrinsics to match"""
         size = self.get_size()
         new_size = size[0] * scale, size[1] * scale
-        matrix = self.get_camera_matrix()
-        new_matrix = matrix * scale
-        new_matrix[2, 2] = 1
         self.set_size(new_size)
-        self.set_camera_matrix(new_matrix)
+
+        self.matrix.data *= scale
+        self.matrix.data[2, 2] = 1
+        
+        # matrix = self.get_camera_matrix()
+        # new_matrix = matrix * scale
+        # new_matrix[2, 2] = 1
+        # self.set_camera_matrix(new_matrix)
 
     def get_params(self, only_extrinsics=False):
         if only_extrinsics:
@@ -369,48 +480,88 @@ class Camera:
         self.set_distortions(dist)
 
     def distort_points(self, points):
-        shape = points.shape
-        points = points.reshape(-1, 1, 2)
-        new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
-        out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
-                                   self.matrix.astype('float64'),
-                                   self.dist.astype('float64'))
-        return out.reshape(shape)
+        # shape = points.shape
+        # points = points.reshape(-1, 1, 2)
+        # new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
+        # out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
+        #                            self.matrix.astype('float64'),
+        #                            self.dist.astype('float64'))
+        # return out.reshape(shape)
+        points = to_homogeneous(to_tensor(points).reshape(-1, 2))
+        eye = torch.eye(4, dtype=torch.float64, device=self.rvec.device)
+        out = project_points(points, eye, self.matrix, self.dist)
+        return out.detach().numpy()
+
+    # def undistort_points(self, points):
+    #     shape = points.shape
+    #     points = points.reshape(-1, 1, 2)
+    #     out = cv2.undistortPoints(points,
+    #                               self.matrix.astype('float64'),
+    #                               self.dist.astype('float64'))
+    #     return out.reshape(shape)
 
     def undistort_points(self, points):
-        shape = points.shape
-        points = points.reshape(-1, 1, 2)
-        out = cv2.undistortPoints(points,
-                                  self.matrix.astype('float64'),
-                                  self.dist.astype('float64'))
-        return out.reshape(shape)
-
+        t_points = to_tensor(points, device=self.matrix.device)
+        shape = t_points.shape
+        t_points = t_points.reshape(-1, 2)
+        fx, fy = self.matrix[0, 0], self.matrix[1, 1]
+        cx, cy = self.matrix[0, 2], self.matrix[1, 2]
+        x = (t_points[:, 0] - cx) / fx
+        y = (t_points[:, 1] - cy) / fy
+        x0, y0 = x.clone(), y.clone()
+        for _ in range(5):
+            r2 = x*x + y*y
+            r4 = r2*r2
+            r6 = r4*r2
+            k1, k2, p1, p2 = self.dist[0], self.dist[1], self.dist[2], self.dist[3]
+            if self.dist.shape[0] > 4:
+                k3 = self.dist[4]
+            else:
+                k3 = torch.tensor(0.0, device=dist.device, dtype=dist.dtype)
+            radial = 1 + k1*r2 + k2*r4 + k3*r6
+            dx = 2*p1*x*y + p2*(r2 + 2*x*x)
+            dy = p1*(r2 + 2*y*y) + 2*p2*x*y
+            x = (x0 - dx) / radial
+            y = (y0 - dy) / radial
+        return torch.stack([x, y], dim=1).reshape(shape).detach().numpy()
+    
     def project(self, points):
-        points = points.reshape(-1, 1, 3)
-        out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
-                                   self.matrix.astype('float64'),
-                                   self.dist.astype('float64'))
-        return out.reshape(points.shape[0], 2)
+        # points = points.reshape(-1, 1, 3)
+        # out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
+        #                            self.matrix.astype('float64'),
+        #                            self.dist.astype('float64'))
+        # return out.reshape(points.shape[0], 2)
+        points = to_tensor(points).reshape(-1, 3)
+        out = project_points(points, self.get_extrinsics_mat_torch(),
+                             self.matrix, self.dist)
+        return out.detach().numpy()
 
     def reprojection_error(self, p3d, p2d):
         proj = self.project(p3d).reshape(p2d.shape)
-        return p2d - proj
+        return (p2d - proj)
 
     def copy(self):
-        return \
-            Camera(matrix=self.get_camera_matrix().copy(),
-                   dist=self.get_distortions().copy(),
-                   size=self.get_size(),
-                   rvec=self.get_rotation().copy(),
-                   tvec=self.get_translation().copy(),
-                   name=self.get_name(),
-                   extra_dist=self.extra_dist)
+        new_cam = Camera(name=self.name, size=self.size, extra_dist=self.extra_dist)
+        new_cam.load_state_dict(self.state_dict())
+        return new_cam
+    
+    # def copy(self):
+    #     return \
+    #         Camera(matrix=self.get_camera_matrix().copy(),
+    #                dist=self.get_distortions().copy(),
+    #                size=self.get_size(),
+    #                rvec=self.get_rotation().copy(),
+    #                tvec=self.get_translation().copy(),
+    #                name=self.get_name(),
+    #                extra_dist=self.extra_dist)
 
     def is_point_visible(self, p3d, margin=0):
         """
+        Takes as input a set of 3D points: (N, 3).
         Check if 3D points project into camera view.
         margin: pixels from border (e.g., 10 to avoid edge effects)
         """
+        p3d = to_tensor(p3d)
         p2d = self.project(p3d)
         w, h = self.get_size()
 
@@ -423,10 +574,15 @@ class Camera:
         )
 
         # check if point is in front of camera
-        R = cv2.Rodrigues(self.get_rotation())[0]
-        t = self.get_translation().ravel()
+        R = rodrigues(self.rvec)
+        t = self.tvec
         p_cam = (R @ p3d.T).T + t
-        in_front = p_cam[:, 2] > 0
+
+        # ext = self.get_extrinsics_mat()
+        # p_cam = torch.matmul(to_homogeneous(p3d), ext.T)
+        # p_cam = from_homogeneous(p_cam[..., :3])
+
+        in_front = (p_cam[:, 2] > 0).detach().numpy()
 
         return in_bounds & in_front
 
@@ -446,28 +602,25 @@ class Camera:
             Each column gives pixel sensitivity to movement in x, y, z directions
             If multiple points: J[k] is the Jacobian for point k
         """
-        p = np.array(p, dtype='float64')
-        one_point = False
-        if p.ndim == 1:
-            p = p.reshape(1, 3)
-            one_point = True
+        p = to_tensor(p)
 
         n_points = p.shape[0]
 
         # Get camera parameters
-        R = cv2.Rodrigues(self.rvec)[0]  # Convert rotation vector to matrix
+        R = rodrigues(self.rvec)  # Convert rotation vector to matrix
         t = self.tvec
         fx, fy = self.get_focal_length(both=True)
 
         # Transform to camera coordinates
         p_cam = (R @ p.T).T + t
+
         X = p_cam[:, 0]
         Y = p_cam[:, 1]
         Z = p_cam[:, 2]
         
         # Jacobian of projection w.r.t camera coordinates
         # J_proj[i] has shape (2, 3) for point i
-        J_proj = np.zeros((n_points, 2, 3), dtype='float64')
+        J_proj = torch.zeros((n_points, 2, 3), dtype=torch.float64)
         J_proj[:, 0, 0] = fx / Z
         J_proj[:, 0, 2] = -fx * X / (Z**2)
         J_proj[:, 1, 1] = fy / Z
@@ -475,17 +628,14 @@ class Camera:
         
         # Chain rule: J = J_proj @ R
         # Using einsum for batch matrix multiplication
-        J = np.einsum('nij,jk->nik', J_proj, R)
+        J = torch.einsum('nij,jk->nik', J_proj, R)
 
-        if one_point:
-            J = J[0]
-
-        return J
+        return J.detach().numpy()
 
     def get_center_world(self):
-        R = cv2.Rodrigues(self.get_rotation())[0]
-        t = self.get_translation()
-        return -R.T @ t 
+        R = rodrigues(self.rvec)
+        t = self.tvec
+        return (-R.T @ t).detach().numpy() 
 
     def get_camera_rays(self):
         """
@@ -528,8 +678,8 @@ class Camera:
         rays_camera = rays_camera / np.linalg.norm(rays_camera, axis=1, keepdims=True)
 
         # Transform rays to world coordinates
-        R = cv2.Rodrigues(self.get_rotation())[0]
-        t = self.get_translation()
+        R = rodrigues(self.rvec).detach().numpy()
+        t = self.tvec.detach().numpy()
 
         # Ray origins are all at camera center in world coordinates
         center = self.get_center_world()
