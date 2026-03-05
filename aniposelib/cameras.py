@@ -23,15 +23,16 @@ from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
 # @jit(nopython=True, parallel=True)
+@torch.compile
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
-    A = np.zeros((num_cams * 2, 4))
+    A = torch.zeros((num_cams * 2, 4), dtype=points.dtype, device=points.device)
     for i in range(num_cams):
         x, y = points[i]
         mat = camera_mats[i]
         A[(i * 2):(i * 2 + 1)] = x * mat[2] - mat[0]
         A[(i * 2 + 1):(i * 2 + 2)] = y * mat[2] - mat[1]
-    u, s, vh = np.linalg.svd(A, full_matrices=True)
+    u, s, vh = torch.linalg.svd(A, full_matrices=True)
     p3d = vh[-1]
     p3d = p3d[:3] / p3d[3]
     return p3d
@@ -200,18 +201,18 @@ def closest_point_between_rays(r1, r2):
     d2 = r2.direction
     
     # Normalize direction vectors
-    d1 = d1 / np.linalg.norm(d1)
-    d2 = d2 / np.linalg.norm(d2)
+    d1 = d1 / torch.linalg.norm(d1)
+    d2 = d2 / torch.linalg.norm(d2)
     
     # Vector between origins
     w0 = a1 - a2
     
     # Dot products
-    a = np.dot(d1, d1)  # always 1 if normalized
-    b = np.dot(d1, d2)
-    c = np.dot(d2, d2)  # always 1 if normalized
-    d = np.dot(d1, w0)
-    e = np.dot(d2, w0)
+    a = torch.dot(d1, d1)  # always 1 if normalized
+    b = torch.dot(d1, d2)
+    c = torch.dot(d2, d2)  # always 1 if normalized
+    d = torch.dot(d1, w0)
+    e = torch.dot(d2, w0)
     
     # Solve for parameters
     denom = a * c - b * b
@@ -237,7 +238,7 @@ def to_tensor(x, device=None, dtype=torch.float64):
     if x is None:
         return None
     if torch.is_tensor(x):
-        t = x.clone().detach().to(dtype=dtype)
+        t = x.to(dtype=dtype)
     else:
         if isinstance(x, (list, tuple)) and len(x) > 0 and torch.is_tensor(x[0]):
             t = torch.stack(x).to(dtype=dtype)
@@ -368,10 +369,10 @@ class Camera(nn.Module):
         return cam
 
     def get_camera_matrix(self):
-        return self.matrix.detach().numpy()
+        return self.matrix
 
     def get_distortions(self):
-        return self.dist.detach().numpy()
+        return self.dist
 
     def set_camera_matrix(self, matrix):
         # self.matrix = np.array(matrix, dtype='float64')
@@ -406,19 +407,16 @@ class Camera(nn.Module):
         self.rvec.data = to_tensor(rvec, device=self.rvec.device).view(-1)
 
     def get_rotation(self):
-        return self.rvec.detach().numpy()
+        return self.rvec
 
     def set_translation(self, tvec):
         # self.tvec = np.array(tvec, dtype='float64').ravel()
         self.tvec.data = to_tensor(tvec, device=self.tvec.device).view(-1)
 
     def get_translation(self):
-        return self.tvec.detach().numpy()
+        return self.tvec
 
     def get_extrinsics_mat(self):
-        return make_M_torch(self.rvec, self.tvec).detach().numpy()
-
-    def get_extrinsics_mat_torch(self):
         return make_M_torch(self.rvec, self.tvec)
     
     def get_name(self):
@@ -449,35 +447,35 @@ class Camera(nn.Module):
         # new_matrix[2, 2] = 1
         # self.set_camera_matrix(new_matrix)
 
-    def get_params(self, only_extrinsics=False):
-        if only_extrinsics:
-            params = np.zeros(6, dtype='float64')
-        else:
-            params = np.zeros(8 + self.extra_dist, dtype='float64')
-        params[0:3] = self.get_rotation()
-        params[3:6] = self.get_translation()
-        if only_extrinsics:
-            return params
-        params[6] = self.get_focal_length()
-        dist = self.get_distortions()
-        params[7] = dist[0]
-        if self.extra_dist:
-            params[8] = dist[1]
-        return params
+    # def get_params(self, only_extrinsics=False):
+    #     if only_extrinsics:
+    #         params = np.zeros(6, dtype='float64')
+    #     else:
+    #         params = np.zeros(8 + self.extra_dist, dtype='float64')
+    #     params[0:3] = self.get_rotation()
+    #     params[3:6] = self.get_translation()
+    #     if only_extrinsics:
+    #         return params
+    #     params[6] = self.get_focal_length()
+    #     dist = self.get_distortions()
+    #     params[7] = dist[0]
+    #     if self.extra_dist:
+    #         params[8] = dist[1]
+    #     return params
 
-    def set_params(self, params, only_extrinsics=False):
-        self.set_rotation(params[0:3])
-        self.set_translation(params[3:6])
-        if only_extrinsics:
-            return
+    # def set_params(self, params, only_extrinsics=False):
+    #     self.set_rotation(params[0:3])
+    #     self.set_translation(params[3:6])
+    #     if only_extrinsics:
+    #         return
 
-        self.set_focal_length(params[6])
+    #     self.set_focal_length(params[6])
 
-        dist = np.zeros(5, dtype='float64')
-        dist[0] = params[7]
-        if self.extra_dist:
-            dist[1] = params[8]
-        self.set_distortions(dist)
+    #     dist = np.zeros(5, dtype='float64')
+    #     dist[0] = params[7]
+    #     if self.extra_dist:
+    #         dist[1] = params[8]
+    #     self.set_distortions(dist)
 
     def distort_points(self, points):
         # shape = points.shape
@@ -490,7 +488,7 @@ class Camera(nn.Module):
         points = to_homogeneous(to_tensor(points).reshape(-1, 2))
         eye = torch.eye(4, dtype=torch.float64, device=self.rvec.device)
         out = project_points(points, eye, self.matrix, self.dist)
-        return out.detach().numpy()
+        return out
 
     # def undistort_points(self, points):
     #     shape = points.shape
@@ -523,7 +521,7 @@ class Camera(nn.Module):
             dy = p1*(r2 + 2*y*y) + 2*p2*x*y
             x = (x0 - dx) / radial
             y = (y0 - dy) / radial
-        return torch.stack([x, y], dim=1).reshape(shape).detach().numpy()
+        return torch.stack([x, y], dim=1).reshape(shape)
     
     def project(self, points):
         # points = points.reshape(-1, 1, 3)
@@ -532,13 +530,13 @@ class Camera(nn.Module):
         #                            self.dist.astype('float64'))
         # return out.reshape(points.shape[0], 2)
         points = to_tensor(points).reshape(-1, 3)
-        out = project_points(points, self.get_extrinsics_mat_torch(),
+        out = project_points(points, self.get_extrinsics_mat(),
                              self.matrix, self.dist)
-        return out.detach().numpy()
+        return out
 
     def reprojection_error(self, p3d, p2d):
         proj = self.project(p3d).reshape(p2d.shape)
-        return (p2d - proj)
+        return p2d - proj
 
     def copy(self):
         new_cam = Camera(name=self.name, size=self.size, extra_dist=self.extra_dist)
@@ -582,7 +580,7 @@ class Camera(nn.Module):
         # p_cam = torch.matmul(to_homogeneous(p3d), ext.T)
         # p_cam = from_homogeneous(p_cam[..., :3])
 
-        in_front = (p_cam[:, 2] > 0).detach().numpy()
+        in_front = (p_cam[:, 2] > 0)
 
         return in_bounds & in_front
 
@@ -630,12 +628,12 @@ class Camera(nn.Module):
         # Using einsum for batch matrix multiplication
         J = torch.einsum('nij,jk->nik', J_proj, R)
 
-        return J.detach().numpy()
+        return J
 
     def get_center_world(self):
         R = rodrigues(self.rvec)
         t = self.tvec
-        return (-R.T @ t).detach().numpy() 
+        return (-R.T @ t) 
 
     def get_camera_rays(self):
         """
@@ -672,14 +670,14 @@ class Camera(nn.Module):
 
         # Convert to 3D rays in camera frame
         # Normalized points are already x/z, y/z, so we append z=1
-        rays_camera = np.hstack([norm_points, np.ones((5, 1))])
+        rays_camera = to_homogeneous(norm_points)
 
         # Normalize the direction vectors
-        rays_camera = rays_camera / np.linalg.norm(rays_camera, axis=1, keepdims=True)
+        rays_camera = rays_camera / torch.linalg.norm(rays_camera, dim=1, keepdim=True)
 
         # Transform rays to world coordinates
-        R = rodrigues(self.rvec).detach().numpy()
-        t = self.tvec.detach().numpy()
+        R = rodrigues(self.rvec)
+        t = self.tvec
 
         # Ray origins are all at camera center in world coordinates
         center = self.get_center_world()
@@ -791,9 +789,10 @@ class FisheyeCamera(Camera):
             name=self.get_name(),
             extra_dist=self.extra_dist)
 
-class CameraGroup:
+class CameraGroup(nn.Module):
     def __init__(self, cameras, metadata={}):
-        self.cameras = cameras
+        super().__init__()
+        self.cameras = nn.ModuleList(cameras)
         self.metadata = metadata
 
     def subset_cameras(self, indices):
@@ -816,11 +815,11 @@ class CameraGroup:
     def project(self, points):
         """Given an Nx3 array of points, this returns an CxNx2 array of 2D points,
         where C is the number of cameras"""
-        points = points.reshape(-1, 1, 3)
+        points = points.reshape(-1, 3)
         n_points = points.shape[0]
         n_cams = len(self.cameras)
 
-        out = np.empty((n_cams, n_points, 2), dtype='float64')
+        out = torch.empty((n_cams, n_points, 2), dtype=torch.float64)
         for cnum, cam in enumerate(self.cameras):
             out[cnum] = cam.project(points).reshape(n_points, 2)
 
@@ -836,51 +835,53 @@ class CameraGroup:
                 len(self.cameras), points.shape
             )
 
+        points = to_tensor(points)
+        
         one_point = False
         if len(points.shape) == 2:
             points = points.reshape(-1, 1, 2)
             one_point = True
 
         if undistort:
-            new_points = np.empty(points.shape)
+            new_points = torch.empty_like(points)
             for cnum, cam in enumerate(self.cameras):
                 # must copy in order to satisfy opencv underneath
-                sub = np.copy(points[cnum])
-                new_points[cnum] = cam.undistort_points(sub)
+                # sub = np.copy(points[cnum])
+                new_points[cnum] = cam.undistort_points(points[cnum])
             points = new_points
 
         n_cams, n_points, _ = points.shape
 
 
-        if fast:
-            cam_Rt_mats = np.array([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
+        # if fast:
+        #     cam_Rt_mats = torch.stack([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
             
-            p3d_allview_withnan = []
-            for j1, j2 in itertools.combinations(range(n_cams), 2):
-                pts1, pts2 = points[j1], points[j2]
-                Rt1, Rt2 = cam_Rt_mats[j1], cam_Rt_mats[j2]
-                tri = cv2.triangulatePoints(Rt1, Rt2, pts1.T, pts2.T)
-                tri = tri[:3]/tri[3]
-                p3d_allview_withnan.append(tri.T)
-            p3d_allview_withnan = np.array(p3d_allview_withnan)
-            out = np.nanmedian(p3d_allview_withnan, axis=0)
+        #     p3d_allview_withnan = []
+        #     for j1, j2 in itertools.combinations(range(n_cams), 2):
+        #         pts1, pts2 = points[j1], points[j2]
+        #         Rt1, Rt2 = cam_Rt_mats[j1], cam_Rt_mats[j2]
+        #         tri = cv2.triangulatePoints(Rt1, Rt2, pts1.T, pts2.T)
+        #         tri = tri[:3]/tri[3]
+        #         p3d_allview_withnan.append(tri.T)
+        #     p3d_allview_withnan = np.array(p3d_allview_withnan)
+        #     out = np.nanmedian(p3d_allview_withnan, axis=0)
 
+        # else:
+        out = torch.full((n_points, 3), torch.nan,
+                         device=points.device, dtype=torch.float64)
+
+        cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
+
+        if progress:
+            iterator = trange(n_points, ncols=70)
         else:
-            out = np.empty((n_points, 3))
-            out[:] = np.nan
+            iterator = range(n_points)
 
-            cam_mats = np.array([cam.get_extrinsics_mat() for cam in self.cameras])
-
-            if progress:
-                iterator = trange(n_points, ncols=70)
-            else:
-                iterator = range(n_points)
-
-            for ip in iterator:
-                subp = points[:, ip, :]
-                good = ~np.isnan(subp[:, 0])
-                if np.sum(good) >= 2:
-                    out[ip] = triangulate_simple(subp[good], cam_mats[good])
+        for ip in iterator:
+            subp = points[:, ip, :]
+            good = ~torch.isnan(subp[:, 0])
+            if torch.sum(good) >= 2:
+                out[ip] = triangulate_simple(subp[good], cam_mats[good])
 
         if one_point:
             out = out[0]
@@ -897,22 +898,26 @@ class CameraGroup:
         N: number of points
         P: number of possible options per point
         """
+        points = to_tensor(points)
+        device = points.device
 
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
                 len(self.cameras), points.shape
             )
-
+        
         n_cams, n_points, n_possible, _ = points.shape
 
-        cam_nums, point_nums, possible_nums = np.where(
-            ~np.isnan(points[:, :, :, 0]))
+        cam_nums, point_nums, possible_nums = torch.where(
+            ~torch.isnan(points[:, :, :, 0]))
 
+        
         all_iters = defaultdict(dict)
 
-        for cam_num, point_num, possible_num in zip(cam_nums, point_nums,
-                                                    possible_nums):
+        for cam_num, point_num, possible_num in zip(cam_nums.tolist(),
+                                                    point_nums.tolist(),
+                                                    possible_nums.tolist()):
             if cam_num not in all_iters[point_num]:
                 all_iters[point_num][cam_num] = []
             all_iters[point_num][cam_num].append((cam_num, possible_num))
@@ -921,10 +926,11 @@ class CameraGroup:
             for cam_num in all_iters[point_num].keys():
                 all_iters[point_num][cam_num].append(None)
 
-        out = np.full((n_points, 3), np.nan, dtype='float64')
-        picked_vals = np.zeros((n_cams, n_points, n_possible), dtype='bool')
-        errors = np.zeros(n_points, dtype='float64')
-        points_2d = np.full((n_cams, n_points, 2), np.nan, dtype='float64')
+                
+        out = torch.full((n_points, 3), torch.nan, dtype=torch.float64, device=device)
+        picked_vals = torch.zeros((n_cams, n_points, n_possible), dtype=torch.bool, device=device)
+        errors = torch.zeros(n_points, dtype=torch.float64, device=device)
+        points_2d = torch.full((n_cams, n_points, 2), torch.nan, dtype=torch.float64, device=device)
 
         if progress:
             iterator = trange(n_points, ncols=70)
@@ -936,10 +942,10 @@ class CameraGroup:
             best_error = 200
 
             n_cams_max = len(all_iters[point_ix])
-
+            
             for picked in itertools.product(*all_iters[point_ix].values()):
                 picked = [p for p in picked if p is not None]
-                if len(picked) < min_cams and len(picked) != n_cams_max:
+                if len(picked) < min_cams or len(picked) == n_cams_max:
                     continue
 
                 cnums = [p[0] for p in picked]
@@ -947,7 +953,7 @@ class CameraGroup:
 
                 pts = points[cnums, point_ix, xnums]
                 cc = self.subset_cameras(cnums)
-
+                
                 p3d = cc.triangulate(pts, undistort=undistort)
                 err = cc.reprojection_error(p3d, pts, mean=True)
 
@@ -994,13 +1000,15 @@ class CameraGroup:
                                          progress=progress)
 
 
-    @jit(parallel=True, forceobj=True)
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this returns an CxNx2 array of errors.
         Optionally mean=True, this averages the errors and returns array of length N of errors"""
 
+        p3ds = to_tensor(p3ds)
+        p2ds = to_tensor(p2ds)
+        
         one_point = False
         if len(p3ds.shape) == 1 and len(p2ds.shape) == 2:
             p3ds = p3ds.reshape(1, 3)
@@ -1012,18 +1020,18 @@ class CameraGroup:
             "shapes of 2D and 3D points are not consistent: " \
             "2D={}, 3D={}".format(p2ds.shape, p3ds.shape)
 
-        errors = np.empty((n_cams, n_points, 2))
+        errors = torch.empty((n_cams, n_points, 2), dtype=torch.float64, device=p2ds.device)
 
         for cnum, cam in enumerate(self.cameras):
             errors[cnum] = cam.reprojection_error(p3ds, p2ds[cnum])
 
         if mean:
-            errors_norm = np.linalg.norm(errors, axis=2)
-            good = ~np.isnan(errors_norm)
+            errors_norm = torch.linalg.norm(errors, dim=2)
+            good = ~torch.isnan(errors_norm)
             errors_norm[~good] = 0
-            denom = np.sum(good, axis=0).astype('float64')
-            denom[denom < 1.5] = np.nan
-            errors = np.sum(errors_norm, axis=0) / denom
+            denom = torch.sum(good, dim=0).to(torch.float64)
+            # denom[denom < 1.5] = torch.nan # less than 2 cameras
+            errors = torch.sum(errors_norm, axis=0) / denom
 
         if one_point:
             if mean:
@@ -1910,14 +1918,14 @@ class CameraGroup:
         for cam in self.cameras:
             rvec = cam.get_rotation()
             rvecs.append(rvec)
-        return np.array(rvecs)
+        return torch.stack(rvecs)
 
     def get_translations(self):
         tvecs = []
         for cam in self.cameras:
             tvec = cam.get_translation()
             tvecs.append(tvec)
-        return np.array(tvecs)
+        return torch.stack(tvecs)
 
     def get_names(self):
         return [cam.get_name() for cam in self.cameras]
@@ -1930,9 +1938,9 @@ class CameraGroup:
         p3ds = self.triangulate(p2ds)
         errors = self.reprojection_error(p3ds, p2ds, mean=True)
         if median:
-            return np.median(errors)
+            return torch.median(errors)
         else:
-            return np.mean(errors)
+            return torch.mean(errors)
 
     def calibrate_rows(self, all_rows, board,
                        init_intrinsics=True, init_extrinsics=True, verbose=True,
@@ -2081,7 +2089,7 @@ class CameraGroup:
         """
         all_visible = [cam.is_point_visible(p3d)
                        for cam in self.cameras]
-        return np.stack(all_visible)
+        return torch.stack(all_visible)
 
     
     def get_triangulation_sensitivity(self, p):
@@ -2102,12 +2110,13 @@ class CameraGroup:
         sensitivity : float or ndarray
             Lower number means more reliable triangulation 
         """
-        p = np.array(p, dtype='float64')
-
+        # p = np.array(p, dtype='float64')
+        p = to_tensor(p)
+        
         n_points = p.shape[0]
         n_cams = len(self.cameras)
 
-        J_all = np.zeros((n_points, 2*n_cams, 3), dtype='float64')
+        J_all = torch.zeros((n_points, 2*n_cams, 3), dtype=torch.float64)
         visibles = self.is_point_visible(p)
         
         for i, cam in enumerate(self.cameras):
@@ -2116,17 +2125,17 @@ class CameraGroup:
             J_all[:, 2*i:2*i+2, :] = J_cam
 
         # handle nans
-        J_all[~np.isfinite(J_all)] = 0
+        J_all[~torch.isfinite(J_all)] = 0
         
         # Compute conditioning
-        s = np.linalg.svd(J_all, compute_uv=False)
+        s = torch.linalg.svdvals(J_all)
         sensitivity = s[:, 0] / (s[:, -1] + 1e-10)
         # sensitivity = 1/(s[:, -1] + 1e-6)
 
         # sensitivity = np.min(np.max(np.abs(J_all), axis=1), axis=1)
         
-        count = np.sum(visibles, axis=0)
-        sensitivity[count < 2] = np.nan
+        count = torch.sum(visibles, dim=0)
+        sensitivity[count < 2] = torch.nan
 
         return sensitivity
 
@@ -2140,20 +2149,23 @@ class CameraGroup:
                 p = closest_point_between_rays(r1, r2)
                 if p is not None:
                     points.append(p)
-        points = np.array(points)
+        points = torch.stack(points)
 
-        low, high = np.percentile(points, [5, 95], axis=0)
-        scale = np.max(high - low) * 0.15
+        low, high = torch.quantile(points,
+                                   to_tensor([0.05, 0.95], device=points.device),
+                                   dim=0)
+        scale = torch.max(high - low) * 0.15
 
         all_points = [points]
         for i in range(15):
-            pp = points + np.random.normal(size=points.shape) * scale 
+            pp = points + torch.randn(points.shape) * scale 
             all_points.append(pp)
-        all_points = np.vstack(all_points)
+        all_points = torch.vstack(all_points)
 
         s = self.get_triangulation_sensitivity(all_points)
-        s[np.isnan(s)] = np.inf
+        s[torch.isnan(s)] = torch.inf
 
         good = s < sensitivity_threshold
         
         return all_points[good], s[good]
+
