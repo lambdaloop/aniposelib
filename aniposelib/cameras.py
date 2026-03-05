@@ -1591,6 +1591,7 @@ class CameraGroup:
 
     def calibrate_rows(self, all_rows, board,
                        init_intrinsics=True, init_extrinsics=True, verbose=True,
+                       min_corners_intrinsic=9,
                        **kwargs):
         assert len(all_rows) == len(self.cameras), \
             "Number of camera detections does not match number of cameras"
@@ -1603,7 +1604,7 @@ class CameraGroup:
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 9]
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= min_corners_intrinsic]
                 objp, imgp = zip(*mixed)
                 matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
                 camera.set_camera_matrix(matrix.copy())
@@ -1664,6 +1665,7 @@ class CameraGroup:
 
     def calibrate_videos(self, videos, board,
                          init_intrinsics=True, init_extrinsics=True, verbose=True,
+                         min_corners_intrinsic=9,
                          **kwargs):
         """Takes as input a list of list of video filenames, one list of each camera.
         Also takes a board which specifies what should be detected in the videos"""
@@ -1675,7 +1677,9 @@ class CameraGroup:
         error = self.calibrate_rows(all_rows, board,
                                     init_intrinsics=init_intrinsics,
                                     init_extrinsics=init_extrinsics,
-                                    verbose=verbose, **kwargs)
+                                    verbose=verbose,
+                                    min_corners_intrinsic=min_corners_intrinsic,
+                                    **kwargs)
         return error, all_rows
 
     def get_dicts(self):
