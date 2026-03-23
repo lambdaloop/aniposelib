@@ -1868,8 +1868,6 @@ class CameraGroup(nn.Module):
                 camera.set_camera_matrix(matrix.copy())
                 camera.zero_distortions()
 
-        print(self.get_dicts())
-
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)
 
