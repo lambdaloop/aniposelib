@@ -297,14 +297,20 @@ def project_points(p3d, ext, matrix, dist):
     p2d_proj_raw = torch.matmul(to_homogeneous(p3d), ext.T)
     p2d_proj_raw = from_homogeneous(p2d_proj_raw[..., :3])
 
-    k1, k2, p1, p2, k3 = dist
+    k1, k2, p1, p2, k3 = dist[:5]
     k4 = k5 = k6 = 0
     r2 = torch.sum(torch.square(p2d_proj_raw), axis=1)
     r4 = r2 * r2
     r6 = r4 * r2
     kscale = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
-    #TODO: add p1, p2 effect
-    p2d_dist = kscale[:, None] * p2d_proj_raw
+
+    x = p2d_proj_raw[..., 0]
+    y = p2d_proj_raw[..., 1]
+    dx = 2*p1*x*y + p2 * (r2 + 2*x*x)
+    dy = p1*(r2 + 2*y*y) + 2*p2*x*y
+    p1_p2_add = torch.stack([dx, dy], dim=-1)
+
+    p2d_dist = kscale[:, None] * p2d_proj_raw + p1_p2_add
 
     p2d_raw = torch.matmul(to_homogeneous(p2d_dist), matrix.T)
     p2d = from_homogeneous(p2d_raw)
@@ -1024,11 +1030,11 @@ class CameraGroup(nn.Module):
             "shapes of 2D and 3D points are not consistent: " \
             "2D={}, 3D={}".format(p2ds.shape, p3ds.shape)
 
-        errors = torch.empty((n_cams, n_points, 2), dtype=torch.float64, device=p2ds.device)
-
+        errors = []
         for cnum, cam in enumerate(self.cameras):
-            errors[cnum] = cam.reprojection_error(p3ds, p2ds[cnum])
-
+            errors.append(cam.reprojection_error(p3ds, p2ds[cnum]))
+        errors = torch.stack(errors)
+            
         if mean:
             errors_norm = torch.linalg.norm(errors, dim=2)
             good = ~torch.isnan(errors_norm)
@@ -1197,17 +1203,19 @@ class CameraGroup(nn.Module):
             optimizer.zero_grad()
             loss = self._error_fun_bundle(params, p2ds, extra)
 
-            if i % 20 == 0:
+            if verbose and i % 20 == 0:
                 print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
             if i > 100 and old_loss - loss < ftol * loss:
-                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
-                print("termination condition reached (delta loss < ftol * loss)")
+                if verbose:
+                    print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
+                    print("termination condition reached (delta loss < ftol * loss)")
                 break
             old_loss = loss.item()
             loss.backward()
             optimizer.step()
 
-        print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
+        if verbose:
+            print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
             
         error = self.average_error(p2ds)
         return error
@@ -1287,7 +1295,8 @@ class CameraGroup(nn.Module):
                      scale_length=2, scale_length_weak=0.5,
                      reproj_error_threshold=15, reproj_loss='soft_l1',
                      n_deriv_smooth=1, scores=None, verbose=False,
-                     n_fixed=0):
+                     n_fixed=0,
+                     n_iters=800):
         """
         Take in an array of 2D points of shape CxNxJx2,
         an array of 3D points of shape NxJx3,
@@ -1314,57 +1323,64 @@ class CameraGroup(nn.Module):
         constraints = np.array(constraints)
         constraints_weak = np.array(constraints_weak)
 
+        if torch.is_tensor(p3ds):
+            p3ds = p3ds.detach().cpu().numpy()
+        else:
+            p3ds = np.array(p3ds)
+        
         p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
 
         p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
-
         default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
         scale_smooth_full = scale_smooth * default_smooth
 
         t1 = time.time()
 
-        x0 = self._initialize_params_triangulation(
+        params = self._initialize_params_triangulation(
             p3ds_intp, constraints, constraints_weak)
 
-        x0[~np.isfinite(x0)] = 0
-
         if n_fixed > 0:
-            p3ds_fixed = p3ds_intp[:n_fixed]
+            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed])
         else:
             p3ds_fixed = None
 
-        jac = self._jac_sparsity_triangulation(
-            points, constraints, constraints_weak, n_deriv_smooth)
+        points_tensor = to_tensor(points)
+            
+        all_params = list(params.values())
+        optimizer = optim.Adam(all_params, lr=1e-2, weight_decay=0, fused=True)
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5.0, total_steps=n_iters,
+                                                  pct_start=0.2)
 
-        opt2 = optimize.least_squares(self._error_fun_triangulation,
-                                      x0=x0, jac_sparsity=jac,
-                                      loss='linear',
-                                      ftol=1e-3,
-                                      verbose=2*verbose,
-                                      args=(points,
-                                            constraints,
-                                            constraints_weak,
-                                            scores,
-                                            scale_smooth_full,
-                                            scale_length,
-                                            scale_length_weak,
-                                            reproj_error_threshold,
-                                            reproj_loss,
-                                            n_deriv_smooth,
-                                            p3ds_fixed))
+        ftol = 1e-3
+        old_loss = torch.inf
+        for i in range(n_iters):
+            optimizer.zero_grad()
+            loss = self._error_fun_triangulation(params, points_tensor,
+                                                 constraints=constraints,
+                                                 constraints_weak=constraints_weak,
+                                                 scores=scores,
+                                                 scale_smooth=scale_smooth_full,
+                                                 scale_length=scale_length,
+                                                 scale_length_weak=scale_length_weak,
+                                                 reproj_error_threshold=reproj_error_threshold,
+                                                 reproj_loss=reproj_loss,
+                                                 n_deriv_smooth=n_deriv_smooth,
+                                                 p3ds_fixed=p3ds_fixed
+                                                 )
+            if verbose and i % 20 == 0:
+                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
 
-        p3ds_new2 = opt2.x[:p3ds.size].reshape(p3ds.shape)
-
-        if n_fixed > 0:
-            p3ds_new2 = np.vstack([p3ds_fixed, p3ds_new2[n_fixed:]])
+            old_loss = loss.item()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
         t2 = time.time()
 
         if verbose:
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
-        return p3ds_new2
-
+        return params['p3d'].detach()
 
     def optim_points_possible(self, points, p3ds,
                               constraints=[],
@@ -1480,6 +1496,8 @@ class CameraGroup(nn.Module):
         constraints = [[0, 1], [1, 2], [2, 3]]
         (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
 
+        Under the hood, this runs optim_points after initializing with triangulation.
+        See optim_points for all keyword parameters
         """
 
         assert points.shape[0] == len(self.cameras), \
@@ -1500,8 +1518,8 @@ class CameraGroup(nn.Module):
             p3ds = self.triangulate(points_shaped, progress=init_progress)
         p3ds = p3ds.reshape((n_frames, n_joints, 3))
 
-        c = np.isfinite(p3ds[:, :, 0])
-        if np.sum(c) < 20:
+        c = torch.isfinite(p3ds[:, :, 0])
+        if torch.sum(c) < 20:
             print("warning: not enough 3D points to run optimization")
             return p3ds
 
@@ -1509,7 +1527,7 @@ class CameraGroup(nn.Module):
 
 
 
-    @jit(forceobj=True, parallel=True)
+    @torch.compile
     def _error_fun_triangulation(self, params, p2ds,
                                  constraints=[],
                                  constraints_weak=[],
@@ -1528,16 +1546,16 @@ class CameraGroup(nn.Module):
         n_constraints_weak = len(constraints_weak)
 
         # load params
-        p3ds = params[:n_3d].reshape((n_frames, n_joints, 3))
-        joint_lengths = np.array(params[n_3d:n_3d+n_constraints])
-        joint_lengths_weak = np.array(params[n_3d+n_constraints:])
+        p3ds = params['p3d']
+        joint_lengths = params['joint_lengths']
+        joint_lengths_weak = params['joint_lengths_weak']
 
         ## if fixed points, first n_fixed parameter points are ignored
         ## and replacement points are put in
-        ## this way we can keep rest of code the same, especially _jac_sparsity_triangulation
+        ## this way we can keep rest of code the same
         if p3ds_fixed is not None:
             n_fixed = p3ds_fixed.shape[0]
-            p3ds = np.vstack([p3ds_fixed, p3ds[n_fixed:]])
+            p3ds = torch.vstack([p3ds_fixed, p3ds[n_fixed:]])
 
         # reprojection errors
         p3ds_flat = p3ds.reshape(-1, 3)
@@ -1546,38 +1564,49 @@ class CameraGroup(nn.Module):
         if scores is not None:
             scores_flat = scores.reshape((n_cams, -1))
             errors = errors * scores_flat[:, :, None]
-        errors_reproj = errors[~np.isnan(p2ds_flat)]
+        errors_reproj = errors[torch.isfinite(p2ds_flat)]
 
         rp = reproj_error_threshold
-        errors_reproj = np.abs(errors_reproj)
+        errors_reproj = torch.abs(errors_reproj)
         if reproj_loss == 'huber':
             bad = errors_reproj > rp
-            errors_reproj[bad] = rp*(2*np.sqrt(errors_reproj[bad]/rp) - 1)
+            errors_reproj[bad] = rp*(2*torch.sqrt(errors_reproj[bad]/rp) - 1)
         elif reproj_loss == 'linear':
             pass
         elif reproj_loss == 'soft_l1':
-            errors_reproj = rp*2*(np.sqrt(1+errors_reproj/rp)-1)
+            errors_reproj = rp*2*(torch.sqrt(1+errors_reproj/rp)-1)
+
+        # print(torch.mean(errors_reproj))
+        sum_reproj = torch.sum(torch.square(errors_reproj)) 
+        total_error = torch.tensor(0.0, dtype=sum_reproj.dtype, device=sum_reproj.device)
+        total_error += sum_reproj
 
         # temporal constraint
-        errors_smooth = np.diff(p3ds, n=n_deriv_smooth, axis=0).ravel() * scale_smooth
+        errors_smooth = torch.diff(p3ds, n=n_deriv_smooth, dim=0)
+        sum_smooth = torch.sum(torch.square(errors_smooth)) * scale_smooth
+        total_error += sum_smooth
 
         # joint length constraint
-        errors_lengths = np.empty((n_constraints, n_frames), dtype='float64')
+        error_lengths = 0
         for cix, (a, b) in enumerate(constraints):
-            lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
-            expected = joint_lengths[cix]
-            errors_lengths[cix] = 100*(lengths - expected)/expected
-        errors_lengths = errors_lengths.ravel() * scale_length
+            lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
+            expected = torch.abs(joint_lengths[cix])
+            error_lengths += torch.sum(torch.square(lengths - expected))/expected
+        sum_lengths = error_lengths * scale_length * 100 
+        total_error += sum_lengths
 
-        errors_lengths_weak = np.empty((n_constraints_weak, n_frames), dtype='float64')
+        error_lengths_weak = 0
         for cix, (a, b) in enumerate(constraints_weak):
-            lengths = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
-            expected = joint_lengths_weak[cix]
-            errors_lengths_weak[cix] = 100*(lengths - expected)/expected
-        errors_lengths_weak = errors_lengths_weak.ravel() * scale_length_weak
+            lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
+            expected = torch.abs(joint_lengths_weak[cix])
+            error_lengths_weak += torch.sum(torch.square(lengths - expected))/expected 
+        sum_lengths_weak = error_lengths_weak * scale_length_weak * 100
+        total_error += sum_lengths_weak
 
-        return np.hstack([errors_reproj, errors_smooth,
-                          errors_lengths, errors_lengths_weak])
+        # print("reproj: {:.2f}   smooth: {:.2f}   len: {:.2f}  len_weak: {:.2f}".format(
+        #       sum_reproj.item(), sum_smooth.item(), sum_lengths.item(), sum_lengths_weak.item()))
+
+        return total_error
 
     def _error_fun_triangulation_possible(self, params, p2ds,
                                           beta=2,
@@ -1627,9 +1656,7 @@ class CameraGroup(nn.Module):
         return np.hstack([errors, errors_alphas])
 
 
-    def _initialize_params_triangulation(self, p3ds,
-                                         constraints=[],
-                                         constraints_weak=[]):
+    def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[]):
         joint_lengths = np.empty(len(constraints), dtype='float64')
         joint_lengths_weak = np.empty(len(constraints_weak), dtype='float64')
 
@@ -1654,7 +1681,13 @@ class CameraGroup(nn.Module):
         joint_lengths[joint_lengths > med+mad*5] = med
         joint_lengths_weak[joint_lengths_weak > med+mad*5] = med
 
-        return np.hstack([p3ds.ravel(), joint_lengths, joint_lengths_weak])
+        params = {
+            'p3d': nn.Parameter(to_tensor(p3ds)),
+            'joint_lengths': nn.Parameter(to_tensor(joint_lengths)),
+            'joint_lengths_weak': nn.Parameter(to_tensor(joint_lengths_weak))
+        }
+
+        return params
 
     def _initialize_params_triangulation_possible(self, p3ds, p2ds, **kwargs):
         # initialize params using above function
