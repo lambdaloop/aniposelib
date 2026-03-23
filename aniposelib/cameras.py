@@ -161,18 +161,19 @@ def transform_points(points, rvecs, tvecs):
     """Rotate points by given rotation vectors and translate.
     Rodrigues' rotation formula is used.
     """
-    theta = np.linalg.norm(rvecs, axis=1)[:, np.newaxis]
-    with np.errstate(invalid='ignore'):
-        v = rvecs / theta
-        v = np.nan_to_num(v)
-    dot = np.sum(points * v, axis=1)[:, np.newaxis]
-    cos_theta = np.cos(theta)
-    sin_theta = np.sin(theta)
-
+    theta = torch.linalg.norm(rvecs, dim=1, keepdim=True)
+    
+    # Handle division by zero
+    v = rvecs / torch.where(theta > 1e-10, theta, torch.ones_like(theta))
+    
+    dot = torch.sum(points * v, dim=1, keepdim=True)
+    cos_theta = torch.cos(theta)
+    sin_theta = torch.sin(theta)
+    
     rotated = cos_theta * points + \
-        sin_theta * np.cross(v, points) + \
-        dot * (1 - cos_theta) * v
-
+              sin_theta * torch.cross(v, points, dim=1) + \
+              dot * (1 - cos_theta) * v
+    
     return rotated + tvecs
 
 Ray = namedtuple('Ray', ['origin', 'direction'])
@@ -418,6 +419,9 @@ class Camera(nn.Module):
 
     def get_extrinsics_mat(self):
         return make_M_torch(self.rvec, self.tvec)
+
+    def get_extrinsics_params(self):
+        return [self.rvec, self.tvec]
     
     def get_name(self):
         return self.name
@@ -744,40 +748,40 @@ class FisheyeCamera(Camera):
                                            self.dist.astype('float64'))
         return out
 
-    def set_params(self, params, only_extrinsics):
-        self.set_rotation(params[0:3])
-        self.set_translation(params[3:6])
+    # def set_params(self, params, only_extrinsics):
+    #     self.set_rotation(params[0:3])
+    #     self.set_translation(params[3:6])
 
-        if only_extrinsics:
-            return
+    #     if only_extrinsics:
+    #         return
         
-        self.set_focal_length(params[6])
+    #     self.set_focal_length(params[6])
 
-        dist = np.zeros(4, dtype='float64')
-        dist[0] = params[7]
-        if self.extra_dist:
-            dist[1] = params[8]
-        # dist[2] = params[9]
-        # dist[3] = params[10]
-        self.set_distortions(dist)
+    #     dist = np.zeros(4, dtype='float64')
+    #     dist[0] = params[7]
+    #     if self.extra_dist:
+    #         dist[1] = params[8]
+    #     # dist[2] = params[9]
+    #     # dist[3] = params[10]
+    #     self.set_distortions(dist)
 
-    def get_params(self, only_extrinsics=False):
-        if only_extrinsics:
-            params = np.zeros(6, dtype='float64')
-        else:
-            params = np.zeros(8+self.extra_dist, dtype='float64')
-        params[0:3] = self.get_rotation()
-        params[3:6] = self.get_translation()
-        if only_extrinsics:
-            return params
-        params[6] = self.get_focal_length()
-        dist = self.get_distortions()
-        params[7] = dist[0]
-        if self.extra_dist:
-            params[8] = dist[1]
-        # params[9] = dist[2]
-        # params[10] = dist[3]
-        return params
+    # def get_params(self, only_extrinsics=False):
+    #     if only_extrinsics:
+    #         params = np.zeros(6, dtype='float64')
+    #     else:
+    #         params = np.zeros(8+self.extra_dist, dtype='float64')
+    #     params[0:3] = self.get_rotation()
+    #     params[3:6] = self.get_translation()
+    #     if only_extrinsics:
+    #         return params
+    #     params[6] = self.get_focal_length()
+    #     dist = self.get_distortions()
+    #     params[7] = dist[0]
+    #     if self.extra_dist:
+    #         params[8] = dist[1]
+    #     # params[9] = dist[2]
+    #     # params[10] = dist[3]
+    #     return params
 
     def copy(self):
         return FisheyeCamera(
@@ -1044,7 +1048,7 @@ class CameraGroup(nn.Module):
 
     def bundle_adjust_iter(self, p2ds, extra=None,
                            n_iters=6, start_mu=15, end_mu=1,
-                           max_nfev=200, ftol=1e-4,
+                           max_nfev=1000, ftol=1e-4,
                            n_samp_iter=200, n_samp_full=1000,
                            error_threshold=0.3, only_extrinsics=False,
                            verbose=False):
@@ -1067,7 +1071,7 @@ class CameraGroup(nn.Module):
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
-        error = self.average_error(p2ds, median=True)
+        error = self.average_error(p2ds, median=True).item()
 
         if verbose:
             print('error: ', error)
@@ -1081,8 +1085,8 @@ class CameraGroup(nn.Module):
             p2ds, extra = resample_points(p2ds_full, extra_full,
                                           n_samp=n_samp_full)
             p3ds = self.triangulate(p2ds)
-            errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
-            errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
+            errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
+            errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
 
             error_dict = get_error_dict(errors_full)
             max_error = 0
@@ -1116,8 +1120,8 @@ class CameraGroup(nn.Module):
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
         p3ds = self.triangulate(p2ds)
-        errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
-        errors_norm = self.reprojection_error(p3ds, p2ds, mean=True)
+        errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
+        errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
         error_dict = get_error_dict(errors_full)
         if verbose:
             pprint(error_dict)
@@ -1138,10 +1142,10 @@ class CameraGroup(nn.Module):
                            only_extrinsics=only_extrinsics,
                            verbose=verbose)
 
-        error = self.average_error(p2ds, median=True)
+        error = self.average_error(p2ds, median=True).item()
 
         p3ds = self.triangulate(p2ds)
-        errors_full = self.reprojection_error(p3ds, p2ds, mean=False)
+        errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
         error_dict = get_error_dict(errors_full)
         if verbose:
             pprint(error_dict)
@@ -1153,16 +1157,14 @@ class CameraGroup(nn.Module):
 
     def bundle_adjust(self, p2ds, extra=None,
                       loss='linear',
-                      threshold=50,
                       ftol=1e-4,
                       max_nfev=1000,
-                      weights=None,
-                      start_params=None,
+                      lr=1e-3,
                       only_extrinsics=False,
                       verbose=True):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
-        this performs bundle adjustsment to fine-tune the parameters of the cameras"""
+        this performs bundle adjustment to fine-tune the parameters of the cameras"""
 
         assert p2ds.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -1170,162 +1172,72 @@ class CameraGroup(nn.Module):
                 len(self.cameras), p2ds.shape
             )
 
+        p2ds = to_tensor(p2ds)
+        
         if extra is not None:
+            extra = dict(extra)
             extra['ids_map'] = remap_ids(extra['ids'])
+            extra['objp'] = torch.as_tensor(extra['objp'])
+            objp = extra['objp']
+            extra['min_scale'] = torch.amin(objp[objp > 0])
 
-        x0, n_cam_params = self._initialize_params_bundle(p2ds, extra, only_extrinsics)
+        params = self._initialize_params_bundle(p2ds, extra)
 
-        if start_params is not None:
-            x0 = start_params
-            # n_cam_params = len(self.cameras[0].get_params(only_extrinsics))
+        if only_extrinsics:
+            cam_params = self.get_extrinsics_params()
+        else:
+            cam_params = self.parameters()
 
-        error_fun = self._error_fun_bundle
+        all_params = list(cam_params) + list(params.values())
+            
+        optimizer = optim.Adam(all_params, lr=1e-3, weight_decay=0, fused=True)
 
-        jac_sparse = self._jac_sparsity_bundle(p2ds, n_cam_params, extra)
+        old_loss = torch.inf
+        for i in range(max_nfev):
+            optimizer.zero_grad()
+            loss = self._error_fun_bundle(params, p2ds, extra)
 
-        f_scale = threshold
-        opt = optimize.least_squares(error_fun,
-                                     x0,
-                                     jac_sparsity=jac_sparse,
-                                     f_scale=f_scale,
-                                     x_scale='jac',
-                                     loss=loss,
-                                     ftol=ftol,
-                                     method='trf',
-                                     tr_solver='lsmr',
-                                     verbose=2 * verbose,
-                                     max_nfev=max_nfev,
-                                     args=(p2ds, n_cam_params, extra, only_extrinsics))
-        best_params = opt.x
+            if i % 20 == 0:
+                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
+            if i > 100 and old_loss - loss < ftol * loss:
+                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
+                print("termination condition reached (delta loss < ftol * loss)")
+                break
+            old_loss = loss.item()
+            loss.backward()
+            optimizer.step()
 
-        for i, cam in enumerate(self.cameras):
-            a = i * n_cam_params
-            b = (i + 1) * n_cam_params
-            cam.set_params(best_params[a:b], only_extrinsics)
-
+        print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
+            
         error = self.average_error(p2ds)
         return error
 
-    @jit(parallel=True, forceobj=True)
-    def _error_fun_bundle(self, params, p2ds, n_cam_params, extra, only_extrinsics):
+    @torch.compile
+    def _error_fun_bundle(self, params, p2ds, extra):
         """Error function for bundle adjustment"""
-        good = ~np.isnan(p2ds)
-        n_cams = len(self.cameras)
 
-        for i in range(n_cams):
-            cam = self.cameras[i]
-            a = i * n_cam_params
-            b = (i + 1) * n_cam_params
-            cam.set_params(params[a:b], only_extrinsics)
-
-        n_cams = len(self.cameras)
-        sub = n_cam_params * n_cams
-        n3d = p2ds.shape[1] * 3
-        p3ds_test = params[sub:sub+n3d].reshape(-1, 3)
-        errors = self.reprojection_error(p3ds_test, p2ds)
-        errors_reproj = errors[good]
-
+        p3d = params['p3d']
+        valid = torch.isfinite(p2ds)
+        proj = self.project(p3d)
+        loss_reproj = torch.mean(torch.square(proj[valid] - p2ds[valid]))
+        total_loss = loss_reproj
+        
         if extra is not None:
             ids = extra['ids_map']
-            objp = extra['objp']
-            min_scale = np.min(objp[objp > 0])
-            n_boards = int(np.max(ids)) + 1
-            a = sub+n3d
-            rvecs = params[a:a+n_boards*3].reshape(-1, 3)
-            tvecs = params[a+n_boards*3:a+n_boards*6].reshape(-1, 3)
-            expected = transform_points(objp, rvecs[ids], tvecs[ids])
-            errors_obj = 2 * (p3ds_test - expected).ravel() / min_scale
-        else:
-            errors_obj = np.array([])
+            expected = transform_points(extra['objp'],
+                                        params['rvecs'][ids],
+                                        params['tvecs'][ids])
+            loss_obj = torch.mean(torch.linalg.norm(expected - p3d, dim=-1))
+            total_loss = total_loss + loss_obj / extra['min_scale']
 
-        return np.hstack([errors_reproj, errors_obj])
+        return total_loss
 
 
-    def _jac_sparsity_bundle(self, p2ds, n_cam_params, extra):
-        """Given an CxNx2 array of 2D points,
-        where N is the number of points and C is the number of cameras,
-        compute the sparsity structure of the jacobian for bundle adjustment"""
 
-        point_indices = np.zeros(p2ds.shape, dtype='int32')
-        cam_indices = np.zeros(p2ds.shape, dtype='int32')
-
-        for i in range(p2ds.shape[1]):
-            point_indices[:, i] = i
-
-        for j in range(p2ds.shape[0]):
-            cam_indices[j] = j
-
-        good = ~np.isnan(p2ds)
-
-        if extra is not None:
-            ids = extra['ids_map']
-            n_boards = int(np.max(ids)) + 1
-            total_board_params = n_boards * (3 + 3) # rvecs + tvecs
-        else:
-            n_boards = 0
-            total_board_params = 0
-
-        n_cams = p2ds.shape[0]
-        n_points = p2ds.shape[1]
-        total_params_reproj = n_cams * n_cam_params + n_points * 3
-        n_params = total_params_reproj + total_board_params
-
-        n_good_values = np.sum(good)
-        if extra is not None:
-            n_errors = n_good_values + n_points * 3
-        else:
-            n_errors = n_good_values
-
-        A_sparse = dok_matrix((n_errors, n_params), dtype='int16')
-
-        cam_indices_good = cam_indices[good]
-        point_indices_good = point_indices[good]
-
-        # -- reprojection error --
-        ix = np.arange(n_good_values)
-
-        ## update camera params based on point error
-        for i in range(n_cam_params):
-            A_sparse[ix, cam_indices_good * n_cam_params + i] = 1
-
-        ## update point position based on point error
-        for i in range(3):
-            A_sparse[ix, n_cams * n_cam_params + point_indices_good * 3 + i] = 1
-
-        # -- match for the object points--
-        if extra is not None:
-            point_ix = np.arange(n_points)
-
-            ## update all the camera parameters
-            # A_sparse[n_good_values:n_good_values+n_points*3,
-            #          0:n_cams*n_cam_params] = 1
-
-            ## update board rotation and translation based on error from expected
-            for i in range(3):
-                for j in range(3):
-                    A_sparse[n_good_values + point_ix*3 + i,
-                             total_params_reproj + ids*3 + j] = 1
-                    A_sparse[n_good_values + point_ix*3 + i,
-                             total_params_reproj + n_boards*3 + ids*3 + j] = 1
-
-
-            ## update point position based on error from expected
-            for i in range(3):
-                A_sparse[n_good_values + point_ix*3 + i,
-                         n_cams*n_cam_params + point_ix*3 + i] = 1
-
-
-        return A_sparse
-
-    def _initialize_params_bundle(self, p2ds, extra, only_extrinsics):
+    def _initialize_params_bundle(self, p2ds, extra):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         initializes the parameters for bundle adjustment"""
-
-        cam_params = np.hstack([cam.get_params(only_extrinsics) for cam in self.cameras])
-        n_cam_params = len(cam_params) // len(self.cameras)
-
-        total_cam_params = len(cam_params)
 
         n_cams, n_points, _ = p2ds.shape
         assert n_cams == len(self.cameras), \
@@ -1333,12 +1245,17 @@ class CameraGroup(nn.Module):
             "match number of cameras in 2D points given"
 
         p3ds = self.triangulate(p2ds)
+        params = {
+            'p3d': nn.Parameter(p3ds)
+        }
 
+
+        
         if extra is not None:
             ids = extra['ids_map']
             n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
-            total_board_params = n_boards * (3 + 3) # rvecs + tvecs
-
+            valid = torch.isfinite(p2ds[:, :, 0]).detach().numpy()
+            
             # initialize to 0
             rvecs = np.zeros((n_boards, 3), dtype='float64')
             tvecs = np.zeros((n_boards, 3), dtype='float64')
@@ -1348,9 +1265,9 @@ class CameraGroup(nn.Module):
                 tvecs_all = extra['tvecs']
                 for board_num in range(n_boards):
                     point_id = np.where(ids == board_num)[0][0]
-                    cam_ids_possible = np.where(~np.isnan(p2ds[:, point_id, 0]))[0]
+                    cam_ids_possible = np.where(valid[:, point_id])[0]
                     cam_id = np.random.choice(cam_ids_possible)
-                    M_cam = self.cameras[cam_id].get_extrinsics_mat()
+                    M_cam = self.cameras[cam_id].get_extrinsics_mat().detach().numpy()
                     M_board_cam = make_M(rvecs_all[cam_id, point_id],
                                          tvecs_all[cam_id, point_id])
                     M_board = np.matmul(inv(M_cam), M_board_cam)
@@ -1358,21 +1275,10 @@ class CameraGroup(nn.Module):
                     rvecs[board_num] = rvec
                     tvecs[board_num] = tvec
 
+            params['rvecs'] = nn.Parameter(torch.as_tensor(rvecs))
+            params['tvecs'] = nn.Parameter(torch.as_tensor(tvecs))
 
-        else:
-            total_board_params = 0
-
-        x0 = np.zeros(total_cam_params + p3ds.size + total_board_params)
-        x0[:total_cam_params] = cam_params
-        x0[total_cam_params:total_cam_params+p3ds.size] = p3ds.ravel()
-
-        if extra is not None:
-            start_board = total_cam_params+p3ds.size
-            x0[start_board:start_board + n_boards*3] = rvecs.ravel()
-            x0[start_board + n_boards*3:start_board + n_boards*6] = \
-                tvecs.ravel()
-
-        return x0, n_cam_params
+        return params
 
     def optim_points(self, points, p3ds,
                      constraints=[],
@@ -2031,6 +1937,11 @@ class CameraGroup(nn.Module):
                                     verbose=verbose, **kwargs)
         return error, all_rows
 
+    def get_extrinsics_params(self):
+        for cam in self.cameras:
+            for p in cam.get_extrinsics_params():
+                yield p
+        
     def get_dicts(self):
         out = []
         for cam in self.cameras:
