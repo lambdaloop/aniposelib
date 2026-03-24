@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from copy import copy
@@ -12,8 +13,6 @@ import itertools
 from tqdm import trange
 from pprint import pprint
 import time
-import jax
-import jax.numpy as jnp
 
 from .boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
@@ -21,13 +20,17 @@ from .utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
 def build_triangulate_syseq(point, camera_mat):
+    import jax.numpy as jnp
+
     eqs = jnp.expand_dims(point, axis=-1) * jnp.expand_dims(camera_mat[2], axis=0)
     eqs = eqs - camera_mat[0:2]
 
     return eqs
 
-@jax.jit
 def triangulate_simple(points, camera_mats, valid):
+    import jax
+    import jax.numpy as jnp
+
     A = jax.vmap(build_triangulate_syseq)(points, camera_mats)
     A = jnp.where(jnp.expand_dims(valid, axis=(1, 2)), A, 0)
     A = jnp.reshape(A, (-1, 4))
@@ -486,9 +489,14 @@ class CameraGroup:
 
         return out
 
-    def triangulate(self, points, undistort=True, progress=False, fast=False):
+    def triangulate(self, points, undistort=True, progress=False, fast=False, disable_64bit=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
+        import jax
+        import jax.numpy as jnp
+
+        if (not disable_64bit) and (os.getenv("ANIPOSE_DISABLE_JAX_X64", "0").lower() in ("0", "no", "false")):
+            jax.config.update("jax_enable_x64", True)
 
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -537,7 +545,7 @@ class CameraGroup:
             out = np.full((n_points, 3), np.nan)
 
             # Get vectorized triangulate function
-            vtriangulate = jax.vmap(triangulate_simple, in_axes=(1, None, 1))
+            vtriangulate = jax.vmap(jax.jit(triangulate_simple), in_axes=(1, None, 1))
 
             # Process in batches
             for batch_idx in range(num_batches):
