@@ -916,6 +916,9 @@ class CameraGroup(nn.Module):
             " number of cameras ({}), but shape is {}".format(
                 len(self.cameras), points.shape
             )
+
+        raise NotImplementedError("triangulate_possible not converted to pytorch yet, post an issue on github or email Lili Karashchuk if you need this function")
+
         
         n_cams, n_points, n_possible, _ = points.shape
 
@@ -1412,6 +1415,8 @@ class CameraGroup(nn.Module):
                 len(self.cameras), points.shape
             )
 
+        raise NotImplementedError("optim_points_possible not converted to pytorch yet, post an issue on github or email Lili Karashchuk if you need this function")
+        
         n_cams, n_frames, n_joints, n_possible, _ = points.shape
         constraints = np.array(constraints)
         constraints_weak = np.array(constraints_weak)
