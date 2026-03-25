@@ -22,8 +22,7 @@ from aniposelib.boards import merge_rows, extract_points, \
 from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
-# @jit(nopython=True, parallel=True)
-@torch.compile
+# @torch.compile
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
     A = torch.zeros((num_cams * 2, 4), dtype=points.dtype, device=points.device)
