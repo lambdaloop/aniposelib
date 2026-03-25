@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from copy import copy
@@ -18,18 +19,25 @@ from .boards import merge_rows, extract_points, \
 from .utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
-@jit(nopython=True, parallel=True)
-def triangulate_simple(points, camera_mats):
-    num_cams = len(camera_mats)
-    A = np.zeros((num_cams * 2, 4))
-    for i in range(num_cams):
-        x, y = points[i]
-        mat = camera_mats[i]
-        A[(i * 2):(i * 2 + 1)] = x * mat[2] - mat[0]
-        A[(i * 2 + 1):(i * 2 + 2)] = y * mat[2] - mat[1]
-    u, s, vh = np.linalg.svd(A, full_matrices=True)
+def build_triangulate_syseq(point, camera_mat):
+    import jax.numpy as jnp
+
+    eqs = jnp.expand_dims(point, axis=-1) * jnp.expand_dims(camera_mat[2], axis=0)
+    eqs = eqs - camera_mat[0:2]
+
+    return eqs
+
+def triangulate_simple(points, camera_mats, valid):
+    import jax
+    import jax.numpy as jnp
+
+    A = jax.vmap(build_triangulate_syseq)(points, camera_mats)
+    A = jnp.where(jnp.expand_dims(valid, axis=(1, 2)), A, 0)
+    A = jnp.reshape(A, (-1, 4))
+    _, _, vh = jnp.linalg.svd(A, full_matrices=True)
     p3d = vh[-1]
     p3d = p3d[:3] / p3d[3]
+
     return p3d
 
 
@@ -407,7 +415,7 @@ class FisheyeCamera(Camera):
 
         if only_extrinsics:
             return
-        
+
         self.set_focal_length(params[6])
 
         dist = np.zeros(4, dtype='float64')
@@ -481,9 +489,14 @@ class CameraGroup:
 
         return out
 
-    def triangulate(self, points, undistort=True, progress=False, fast=False):
+    def triangulate(self, points, undistort=True, progress=False, fast=False, disable_64bit=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
+        import jax
+        import jax.numpy as jnp
+
+        if (not disable_64bit) and (os.getenv("ANIPOSE_DISABLE_JAX_X64", "0").lower() in ("0", "no", "false")):
+            jax.config.update("jax_enable_x64", True)
 
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -509,7 +522,7 @@ class CameraGroup:
 
         if fast:
             cam_Rt_mats = np.array([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
-            
+
             p3d_allview_withnan = []
             for j1, j2 in itertools.combinations(range(n_cams), 2):
                 pts1, pts2 = points[j1], points[j2]
@@ -521,21 +534,36 @@ class CameraGroup:
             out = np.nanmedian(p3d_allview_withnan, axis=0)
 
         else:
-            out = np.empty((n_points, 3))
-            out[:] = np.nan
+            # Determine batch size and prepare for batching
+            batch_size = min(100000, n_points)
+            num_batches = (n_points + batch_size - 1) // batch_size
 
-            cam_mats = np.array([cam.get_extrinsics_mat() for cam in self.cameras])
+            # Get camera matrices once since these don't need batching
+            cam_mats = jnp.stack([cam.get_extrinsics_mat() for cam in self.cameras])
 
-            if progress:
-                iterator = trange(n_points, ncols=70)
-            else:
-                iterator = range(n_points)
+            # Initialize output array
+            out = np.full((n_points, 3), np.nan)
 
-            for ip in iterator:
-                subp = points[:, ip, :]
-                good = ~np.isnan(subp[:, 0])
-                if np.sum(good) >= 2:
-                    out[ip] = triangulate_simple(subp[good], cam_mats[good])
+            # Get vectorized triangulate function
+            vtriangulate = jax.vmap(jax.jit(triangulate_simple), in_axes=(1, None, 1))
+
+            # Process in batches
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, n_points)
+                current_batch_size = end_idx - start_idx
+                # Extract current batch
+                batch_points = points[:, start_idx:end_idx].copy()
+                # Convert to JAX arrays and prepare for triangulation
+                batch_points = jnp.array(batch_points)
+                batch_good = ~jnp.isnan(batch_points[:, :, 0])
+                batch_is_good = jnp.expand_dims(jnp.sum(batch_good, axis=0) >= 2, axis=-1)
+                # Triangulate
+                batch_out = vtriangulate(batch_points, cam_mats, batch_good)
+                # Filter points based on successfull triangulation
+                batch_out = jnp.where(batch_is_good[:current_batch_size], batch_out, jnp.nan)
+                # Store in the output array
+                out[start_idx:end_idx] = np.array(batch_out)
 
         if one_point:
             out = out[0]

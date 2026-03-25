@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from tqdm import trange
 from collections import defaultdict
 
-
 def get_video_params_cap(cap):
     params = dict()
     params['width'] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -146,7 +145,7 @@ def extract_points(merged,
                     else:
                         row[cname]['rvec'] = np.full(3, np.nan, dtype='float64')
                         row[cname]['tvec'] = np.full(3, np.nan, dtype='float64')
-                
+
                 imgp[cix, rix] = filled
 
                 rvecs[cix, rix, ~bad] = row[cname]['rvec'].ravel()
@@ -539,6 +538,10 @@ class CharucoBoard(CalibrationObject):
         self.marker_length = marker_length
         self.manually_verify = manually_verify
 
+        # import aruco only here so that we only require opencv-contrib-python when using ChArUco module
+        global aruco
+        from cv2 import aruco
+
         ARUCO_DICTS = {
             (4, 50): cv2.aruco.DICT_4X4_50,
             (5, 50): cv2.aruco.DICT_5X5_50,
@@ -564,6 +567,18 @@ class CharucoBoard(CalibrationObject):
         self.board = cv2.aruco.CharucoBoard([squaresX, squaresY],
                                             square_length, marker_length,
                                             self.dictionary)
+        # set up detector parameters for ArUco marker detection
+        self.detector_params = cv2.aruco.DetectorParameters()
+        self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+        self.detector_params.adaptiveThreshWinSizeMin = 50
+        self.detector_params.adaptiveThreshWinSizeMax = 700
+        self.detector_params.adaptiveThreshWinSizeStep = 50
+        self.detector_params.adaptiveThreshConstant = 0
+        # create detector instances using the OpenCV 4.7+ class-based API
+        self.detector = cv2.aruco.ArucoDetector(self.dictionary,
+                                                self.detector_params)
+        self.charuco_detector = cv2.aruco.CharucoDetector(self.board)
+        self.charuco_detector.setDetectorParameters(self.detector_params)
 
         total_size = (squaresX - 1) * (squaresY - 1)
 
@@ -587,7 +602,7 @@ class CharucoBoard(CalibrationObject):
         return np.copy(self.empty_detection)
 
     def draw(self, size):
-        return self.board.draw(size)
+        return self.board.generateImage(size)
 
     def fill_points(self, corners, ids):
         out = self.get_empty_detection()
@@ -603,20 +618,10 @@ class CharucoBoard(CalibrationObject):
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-
-        params = cv2.aruco.DetectorParameters()
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-        params.adaptiveThreshWinSizeMin = 50
-        params.adaptiveThreshWinSizeMax = 700
-        params.adaptiveThreshWinSizeStep = 50
-        params.adaptiveThreshConstant = 0
-
         try:
-            corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(
-                gray, self.dictionary, parameters=params) 
+            corners, ids, rejectedImgPoints = self.detector.detectMarkers(gray)
         except Exception:
             ids = None
-
 
         if ids is None:
             return [], []
@@ -629,10 +634,10 @@ class CharucoBoard(CalibrationObject):
 
         if refine:
             detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
-                cv2.aruco.refineDetectedMarkers(gray, self.board, corners, ids,
-                                            rejectedImgPoints,
-                                            K, D,
-                                            parameters=params)
+                self.detector.refineDetectedMarkers(gray, self.board,
+                    corners, ids,
+                    rejectedImgPoints,
+                    K, D)
         else:
             detectedCorners, detectedIds = corners, ids
 
@@ -645,13 +650,10 @@ class CharucoBoard(CalibrationObject):
         else:
             gray = image
 
-        corners, ids = self.detect_markers(image, camera, refine=True)
-        if len(corners) > 0:
-            ret, detectedCorners, detectedIds = cv2.aruco.interpolateCornersCharuco(
-                corners, ids, gray, self.board)
-            if detectedIds is None:
-                detectedCorners = detectedIds = np.float64([])
-        else:
+        # use CharucoDetector which combines marker detection + charuco
+        # corner interpolation in one step (OpenCV 4.7+ API)
+        detectedCorners, detectedIds, _, _ = self.charuco_detector.detectBoard(gray)
+        if detectedCorners is None:
             detectedCorners = detectedIds = np.float64([])
 
         if len(detectedCorners) > 0 \
@@ -693,8 +695,23 @@ class CharucoBoard(CalibrationObject):
 
         K = camera.get_camera_matrix()
         D = camera.get_distortions()
-
-        ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            corners, ids, self.board, K, D, None, None)
-
-        return rvec, tvec
+        # use getChessboardCorners + solvePnP (OpenCV 4.7+ API)
+        all_obj_points = self.board.getChessboardCorners()
+        if len(ids) > 0 and all_obj_points is not None:
+            detected_obj_points = []
+            detected_img_points = []
+            # match detected corner IDs to object points
+            for i, corner_id in enumerate(ids.flatten()):
+                if corner_id < len(all_obj_points):
+                    detected_obj_points.append(all_obj_points[corner_id])
+                    detected_img_points.append(corners[i].reshape(2))
+            if len(detected_obj_points) >= 7:
+                obj_points_array = np.array(detected_obj_points,
+                                            dtype=np.float32).reshape(-1, 3)
+                img_points_array = np.array(detected_img_points,
+                                            dtype=np.float32).reshape(-1, 2)
+                ret, rvec, tvec = cv2.solvePnP(obj_points_array,
+                                               img_points_array, K, D)
+                if ret:
+                    return rvec, tvec
+        return None, None
