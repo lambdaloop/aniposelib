@@ -22,6 +22,7 @@ from aniposelib.boards import merge_rows, extract_points, \
 from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
 
+# @jit(nopython=True, parallel=True)
 # @torch.compile
 def triangulate_simple(points, camera_mats):
     num_cams = len(camera_mats)
@@ -355,10 +356,10 @@ class Camera(nn.Module):
         return {
             'name': self.get_name(),
             'size': list(self.get_size()),
-            'matrix': self.matrix.detach().numpy().tolist(),
-            'distortions': self.dist.detach().numpy().tolist(),
-            'rotation': self.rvec.detach().numpy().tolist(),
-            'translation': self.tvec.detach().numpy().tolist(),
+            'matrix': self.matrix.detach().cpu().numpy().tolist(),
+            'distortions': self.dist.detach().cpu().numpy().tolist(),
+            'rotation': self.rvec.detach().cpu().numpy().tolist(),
+            'translation': self.tvec.detach().cpu().numpy().tolist(),
         }
 
     def load_dict(self, d):
@@ -828,7 +829,7 @@ class CameraGroup(nn.Module):
         n_points = points.shape[0]
         n_cams = len(self.cameras)
 
-        out = torch.empty((n_cams, n_points, 2), dtype=torch.float64)
+        out = torch.empty((n_cams, n_points, 2), dtype=points.dtype, device=points.device)
         for cnum, cam in enumerate(self.cameras):
             out[cnum] = cam.project(points).reshape(n_points, 2)
 
@@ -916,9 +917,6 @@ class CameraGroup(nn.Module):
                 len(self.cameras), points.shape
             )
 
-        raise NotImplementedError("triangulate_possible not converted to pytorch yet, post an issue on github or email Lili Karashchuk if you need this function")
-
-        
         n_cams, n_points, n_possible, _ = points.shape
 
         cam_nums, point_nums, possible_nums = torch.where(
@@ -1074,11 +1072,16 @@ class CameraGroup(nn.Module):
                 len(self.cameras), p2ds.shape
             )
 
+        if torch.is_tensor(p2ds):
+            p2ds = p2ds.detach().cpu().numpy()
         p2ds_full = p2ds
         extra_full = extra
 
+        device = next(self.parameters()).device
+        
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
+        p2ds = torch.as_tensor(p2ds, device=device)
         error = self.average_error(p2ds, median=True).item()
 
         if verbose:
@@ -1092,6 +1095,7 @@ class CameraGroup(nn.Module):
         for i in range(n_iters):
             p2ds, extra = resample_points(p2ds_full, extra_full,
                                           n_samp=n_samp_full)
+            p2ds = torch.as_tensor(p2ds, device=device)
             p3ds = self.triangulate(p2ds)
             errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
             errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
@@ -1108,8 +1112,9 @@ class CameraGroup(nn.Module):
             good = errors_norm < mu
             extra_good = subset_extra(extra, good)
             p2ds_samp, extra_samp = resample_points(
-                p2ds[:, good], extra_good, n_samp=n_samp_iter)
-
+                p2ds[:, good].detach().cpu().numpy(), extra_good, n_samp=n_samp_iter)
+            p2ds_samp = torch.as_tensor(p2ds_samp, device=device)
+            
             error = np.median(errors_norm)
 
             if error < error_threshold:
@@ -1127,6 +1132,7 @@ class CameraGroup(nn.Module):
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
+        p2ds = torch.as_tensor(p2ds, device=device)
         p3ds = self.triangulate(p2ds)
         errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
         errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
@@ -1190,7 +1196,7 @@ class CameraGroup(nn.Module):
             extra['min_scale'] = torch.amin(objp[objp > 0])
 
         params = self._initialize_params_bundle(p2ds, extra)
-
+        
         if only_extrinsics:
             cam_params = self.get_extrinsics_params()
         else:
@@ -1198,7 +1204,9 @@ class CameraGroup(nn.Module):
 
         all_params = list(cam_params) + list(params.values())
             
-        optimizer = optim.Adam(all_params, lr=1e-3, weight_decay=0, fused=True)
+        optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0, fused=True)
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-2, total_steps=max_nfev,
+                                                  pct_start=0.1)
 
         old_loss = torch.inf
         for i in range(max_nfev):
@@ -1215,6 +1223,7 @@ class CameraGroup(nn.Module):
             old_loss = loss.item()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
         if verbose:
             print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
@@ -1222,12 +1231,12 @@ class CameraGroup(nn.Module):
         error = self.average_error(p2ds)
         return error
 
-    @torch.compile
+    # @torch.compile
     def _error_fun_bundle(self, params, p2ds, extra):
         """Error function for bundle adjustment"""
 
         p3d = params['p3d']
-        valid = torch.isfinite(p2ds)
+        valid = torch.isfinite(p2ds).cpu()
         proj = self.project(p3d)
         loss_reproj = torch.mean(torch.square(proj[valid] - p2ds[valid]))
         total_loss = loss_reproj
@@ -1264,7 +1273,7 @@ class CameraGroup(nn.Module):
         if extra is not None:
             ids = extra['ids_map']
             n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
-            valid = torch.isfinite(p2ds[:, :, 0]).detach().numpy()
+            valid = torch.isfinite(p2ds[:, :, 0]).detach().cpu().numpy()
             
             # initialize to 0
             rvecs = np.zeros((n_boards, 3), dtype='float64')
@@ -1277,7 +1286,7 @@ class CameraGroup(nn.Module):
                     point_id = np.where(ids == board_num)[0][0]
                     cam_ids_possible = np.where(valid[:, point_id])[0]
                     cam_id = np.random.choice(cam_ids_possible)
-                    M_cam = self.cameras[cam_id].get_extrinsics_mat().detach().numpy()
+                    M_cam = self.cameras[cam_id].get_extrinsics_mat().detach().cpu().numpy()
                     M_board_cam = make_M(rvecs_all[cam_id, point_id],
                                          tvecs_all[cam_id, point_id])
                     M_board = np.matmul(inv(M_cam), M_board_cam)
@@ -1416,74 +1425,6 @@ class CameraGroup(nn.Module):
 
         raise NotImplementedError("optim_points_possible not converted to pytorch yet, post an issue on github or email Lili Karashchuk if you need this function")
         
-        n_cams, n_frames, n_joints, n_possible, _ = points.shape
-        constraints = np.array(constraints)
-        constraints_weak = np.array(constraints_weak)
-
-        p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
-
-        p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
-
-        default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
-        scale_smooth_full = scale_smooth * default_smooth
-
-        t1 = time.time()
-
-        x0 = self._initialize_params_triangulation_possible(
-            p3ds_intp, points, constraints=constraints, constraints_weak=constraints_weak)
-
-        print('getting jacobian...')
-        jac = self._jac_sparsity_triangulation_possible(
-            points,
-            constraints=constraints,
-            constraints_weak=constraints_weak,
-            n_deriv_smooth=n_deriv_smooth)
-
-        beta = 5
-
-        print('starting optimization...')
-        opt2 = optimize.least_squares(self._error_fun_triangulation_possible,
-                                      x0=x0, jac_sparsity=jac,
-                                      loss='linear',
-                                      ftol=1e-3,
-                                      verbose=2*verbose,
-                                      args=(points,
-                                            beta,
-                                            constraints,
-                                            constraints_weak,
-                                            scores,
-                                            scale_smooth_full,
-                                            scale_length,
-                                            scale_length_weak,
-                                            reproj_error_threshold,
-                                            reproj_loss,
-                                            n_deriv_smooth))
-        params = opt2.x
-
-        p3ds_new2 = params[:p3ds.size].reshape(p3ds.shape)
-
-        bad = np.isnan(points[:, :, :, :, 0])
-        all_bad = np.all(bad, axis=3)
-
-        n_params_norm = p3ds.size + len(constraints) + len(constraints_weak)
-
-        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
-        alphas[~bad] = params[n_params_norm:]
-
-        alphas_exp = np.exp(beta * alphas)
-        alphas_exp[bad] = 0
-        alphas_sum = np.sum(alphas_exp, axis=3)
-        alphas_sum[all_bad] = 1
-        alphas_norm = alphas_exp / alphas_sum[:, :, :, None]
-        alphas_norm[bad] = np.nan
-
-        t2 = time.time()
-
-        if verbose:
-            print('optimization took {:.2f} seconds'.format(t2 - t1))
-
-        return p3ds_new2, alphas_norm
-
 
     def triangulate_optim(self, points, init_ransac=False, init_progress=False,
                           **kwargs):
@@ -1531,7 +1472,7 @@ class CameraGroup(nn.Module):
 
 
 
-    @torch.compile
+    # @torch.compile
     def _error_fun_triangulation(self, params, p2ds,
                                  constraints=[],
                                  constraints_weak=[],
@@ -1612,52 +1553,7 @@ class CameraGroup(nn.Module):
 
         return total_error
 
-    def _error_fun_triangulation_possible(self, params, p2ds,
-                                          beta=2,
-                                          constraints=[],
-                                          constraints_weak=[],
-                                          *args):
-        # extract alphas from end of params
-        # soft argmax for picking the appropriate points from p2ds
-        # pass the points to error_fun_triangulate_possible for residuals
-        # add errors to keep the alphas in check
-        # return all the errors
-
-        n_cams, n_frames, n_joints, n_possible, _ = p2ds.shape
-
-        n_3d = n_frames*n_joints*3
-        n_constraints = len(constraints)
-        n_constraints_weak = len(constraints_weak)
-        n_params_norm = n_3d+n_constraints+n_constraints_weak
-
-        # load params
-        bad = np.isnan(p2ds[:, :, :, :, 0])
-        all_bad = np.all(bad, axis=3)
-
-        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
-        alphas[~bad] = params[n_params_norm:]
-        params_rest = np.array(params[:n_params_norm])
-
-        # get normalized alphas
-        alphas_exp = np.exp(beta * alphas)
-        alphas_exp[bad] = 0
-        alphas_sum = np.sum(alphas_exp, axis=3)
-        alphas_sum[all_bad] = 1
-        alphas_norm = alphas_exp / alphas_sum[:, :, :, None]
-
-        # extract the 2D points using soft argmax
-        p2ds_test = np.copy(p2ds)
-        p2ds_test[bad] = 0
-        p2ds_adj = np.sum(alphas_norm[:, :, :, :, None] * p2ds_test, axis=3)
-        p2ds_adj[all_bad] = np.nan
-
-        errors = self._error_fun_triangulation(params_rest, p2ds_adj,
-                                               constraints, constraints_weak, *args)
-
-        alphas_test = alphas_norm[~all_bad]
-        errors_alphas = (1 - np.std(alphas_test, axis=1)) * 10
-
-        return np.hstack([errors, errors_alphas])
+ 
 
 
     def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[]):
@@ -1692,156 +1588,6 @@ class CameraGroup(nn.Module):
         }
 
         return params
-
-    def _initialize_params_triangulation_possible(self, p3ds, p2ds, **kwargs):
-        # initialize params using above function
-        # initialize alphas to 1 for first one and 0 for other possible
-
-        n_cams, n_frames, n_joints, n_possible, _ = p2ds.shape
-        good = ~np.isnan(p2ds[:, :, :, :, 0])
-
-        alphas = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='float64')
-        alphas[:, :, :, 0] = 0
-
-        params = self._initialize_params_triangulation(p3ds, **kwargs)
-        params_full = np.hstack([params, alphas[good]])
-
-        return params_full
-
-    def _jac_sparsity_triangulation(self, p2ds,
-                                    constraints=[],
-                                    constraints_weak=[],
-                                    n_deriv_smooth=1):
-        n_cams, n_frames, n_joints, _ = p2ds.shape
-        n_constraints = len(constraints)
-        n_constraints_weak = len(constraints_weak)
-
-        p2ds_flat = p2ds.reshape((n_cams, -1, 2))
-
-        point_indices = np.zeros(p2ds_flat.shape, dtype='int32')
-        for i in range(p2ds_flat.shape[1]):
-            point_indices[:, i] = i
-
-        point_indices_3d = np.arange(n_frames*n_joints)\
-                             .reshape((n_frames, n_joints))
-
-        good = ~np.isnan(p2ds_flat)
-        n_errors_reproj = np.sum(good)
-        n_errors_smooth = (n_frames-n_deriv_smooth) * n_joints * 3
-        n_errors_lengths = n_constraints * n_frames
-        n_errors_lengths_weak = n_constraints_weak * n_frames
-
-        n_errors = n_errors_reproj + n_errors_smooth + \
-            n_errors_lengths + n_errors_lengths_weak
-
-        n_3d = n_frames*n_joints*3
-        n_params = n_3d + n_constraints + n_constraints_weak
-
-        point_indices_good = point_indices[good]
-
-        A_sparse = dok_matrix((n_errors, n_params), dtype='int16')
-
-        # constraints for reprojection errors
-        ix_reproj = np.arange(n_errors_reproj)
-        for k in range(3):
-            A_sparse[ix_reproj, point_indices_good * 3 + k] = 1
-
-        # sparse constraints for smoothness in time
-        frames = np.arange(n_frames-n_deriv_smooth)
-        for j in range(n_joints):
-            for n in range(n_deriv_smooth+1):
-                pa = point_indices_3d[frames, j]
-                pb = point_indices_3d[frames+n, j]
-                for k in range(3):
-                    A_sparse[n_errors_reproj + pa*3 + k, pb*3 + k] = 1
-
-        ## -- strong constraints --
-        # joint lengths should change with joint lengths errors
-        start = n_errors_reproj + n_errors_smooth
-        frames = np.arange(n_frames)
-        for cix, (a, b) in enumerate(constraints):
-            A_sparse[start + cix*n_frames + frames, n_3d+cix] = 1
-
-        # points should change accordingly to match joint lengths too
-        frames = np.arange(n_frames)
-        for cix, (a, b) in enumerate(constraints):
-            pa = point_indices_3d[frames, a]
-            pb = point_indices_3d[frames, b]
-            for k in range(3):
-                A_sparse[start + cix*n_frames + frames, pa*3 + k] = 1
-                A_sparse[start + cix*n_frames + frames, pb*3 + k] = 1
-
-        ## -- weak constraints --
-        # joint lengths should change with joint lengths errors
-        start = n_errors_reproj + n_errors_smooth + n_errors_lengths
-        frames = np.arange(n_frames)
-        for cix, (a, b) in enumerate(constraints_weak):
-            A_sparse[start + cix*n_frames + frames, n_3d + n_constraints + cix] = 1
-
-        # points should change accordingly to match joint lengths too
-        frames = np.arange(n_frames)
-        for cix, (a, b) in enumerate(constraints_weak):
-            pa = point_indices_3d[frames, a]
-            pb = point_indices_3d[frames, b]
-            for k in range(3):
-                A_sparse[start + cix*n_frames + frames, pa*3 + k] = 1
-                A_sparse[start + cix*n_frames + frames, pb*3 + k] = 1
-
-        return A_sparse
-
-    def _jac_sparsity_triangulation_possible(self, p2ds_full, **kwargs):
-        # initialize sparse jacobian using above function
-        # extend to include alphas from parameters
-        ## TODO: this initialization is really slow for some reason
-
-        n_cams, n_frames, n_joints, n_possible, _ = p2ds_full.shape
-        good_full = ~np.isnan(p2ds_full[:, :, :, :, 0])
-        any_good = np.any(good_full, axis=3)
-
-        n_alphas = np.sum(good_full)
-        n_errors_alphas = np.sum(any_good)
-
-        p2ds = p2ds_full[:, :, :, 0]
-        A_sparse = self._jac_sparsity_triangulation(p2ds, **kwargs)
-
-        n_errors, n_params = A_sparse.shape
-
-        B_sparse = dok_matrix((n_errors + n_errors_alphas, n_params + n_alphas), dtype='int16')
-        for r, c in zip(*A_sparse.nonzero()):
-            B_sparse[r, c] = A_sparse[r, c]
-
-        point_indices_2d = np.arange(n_cams*n_frames*n_joints)\
-                             .reshape(n_cams, n_frames, n_joints)
-        point_indices_2d_rep = np.repeat(point_indices_2d[:, :, :, None], 2, axis=3)
-        point_indices_2d_good = point_indices_2d_rep[~np.isnan(p2ds)]
-        point_indices_good = point_indices_2d[any_good]
-
-        alpha_indices = np.zeros((n_cams, n_frames, n_joints, n_possible), dtype='int64')
-        for pnum in range(n_possible):
-            alpha_indices[:, :, :, pnum] = point_indices_2d
-
-        alpha_indices_good = alpha_indices[good_full]
-
-        # alphas should change according to the reprojection error for each corresponding point
-        point_indices_2d_good_find = defaultdict(list)
-        for ix, p in enumerate(point_indices_2d_good):
-            point_indices_2d_good_find[p].append(ix)
-
-        for ix, alpha_index in enumerate(alpha_indices_good):
-            B_sparse[point_indices_2d_good_find[alpha_index],
-                     n_params + ix] = 1
-
-        # alphas should change according to the alpha errors
-        point_indices_good_find = dict()
-        for ix, p in enumerate(point_indices_good):
-            point_indices_good_find[p] = ix
-
-        for ix, alpha_index in enumerate(alpha_indices_good):
-            if alpha_index in point_indices_good_find:
-                err_ix = n_errors + point_indices_good_find[alpha_index]
-                B_sparse[err_ix, n_params + ix] = 1
-
-        return B_sparse
 
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
