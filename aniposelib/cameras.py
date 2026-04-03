@@ -183,13 +183,7 @@ def closest_point_between_rays(r1, r2):
     Find the closest points between two rays.
     
     Parameters:
-    Takes two rays of the form
-    r1 = (a1, d1)
-    r2 = (a2, d2)
-    where
-     (a1, a2): origin points of rays (numpy arrays)
-     (d1, d2): direction vectors of rays (numpy arrays, need not be normalized)
-    
+    Takes two rays (tuple Ray with origin and direction)
     Returns:
     p1: closest point on ray 1
     p2: closest point on ray 2
@@ -825,6 +819,8 @@ class CameraGroup(nn.Module):
     def project(self, points):
         """Given an Nx3 array of points, this returns an CxNx2 array of 2D points,
         where C is the number of cameras"""
+        points = to_tensor(points)
+        
         points = points.reshape(-1, 3)
         n_points = points.shape[0]
         n_cams = len(self.cameras)

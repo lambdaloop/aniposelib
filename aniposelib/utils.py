@@ -56,7 +56,7 @@ def mean_transform_robust(M_list, approx=None, error=0.3):
     else:
         M_list_robust = []
         for M in M_list:
-            rot_error = (M - approx)[:3,:3]
+            rot_error = M[:3,:3] - approx[:3,:3]
             m = np.max(np.abs(rot_error))
             if m < error:
                 M_list_robust.append(M)
