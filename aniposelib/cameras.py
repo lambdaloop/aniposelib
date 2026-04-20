@@ -883,7 +883,8 @@ class CameraGroup(nn.Module):
                 len(self.cameras), points.shape
             )
 
-        points = to_tensor(points)
+        device = next(self.parameters()).device
+        points = to_tensor(points, device=device)
 
         one_point = False
         if len(points.shape) == 2:
@@ -1065,8 +1066,9 @@ class CameraGroup(nn.Module):
         this returns an CxNx2 array of errors.
         Optionally mean=True, this averages the errors and returns array of length N of errors"""
 
-        p3ds = to_tensor(p3ds)
-        p2ds = to_tensor(p2ds)
+        device = next(self.parameters()).device
+        p3ds = to_tensor(p3ds, device=device)
+        p2ds = to_tensor(p2ds, device=device)
         
         one_point = False
         if len(p3ds.shape) == 1 and len(p2ds.shape) == 2:
@@ -1235,12 +1237,14 @@ class CameraGroup(nn.Module):
                 len(self.cameras), p2ds.shape
             )
 
-        p2ds = to_tensor(p2ds)
+        device = next(self.parameters()).device
+        
+        p2ds = to_tensor(p2ds, device=device)
         
         if extra is not None:
             extra = dict(extra)
             extra['ids_map'] = remap_ids(extra['ids'])
-            extra['objp'] = torch.as_tensor(extra['objp'])
+            extra['objp'] = torch.as_tensor(extra['objp'], device=device)
             objp = extra['objp']
             extra['min_scale'] = torch.amin(objp[objp > 0])
 
@@ -1343,8 +1347,8 @@ class CameraGroup(nn.Module):
                     rvecs[board_num] = rvec
                     tvecs[board_num] = tvec
 
-            params['rvecs'] = nn.Parameter(torch.as_tensor(rvecs))
-            params['tvecs'] = nn.Parameter(torch.as_tensor(tvecs))
+            params['rvecs'] = nn.Parameter(torch.as_tensor(rvecs, device=p2ds.device))
+            params['tvecs'] = nn.Parameter(torch.as_tensor(tvecs, device=p2ds.device))
 
         return params
 

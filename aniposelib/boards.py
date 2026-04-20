@@ -500,8 +500,8 @@ class Checkerboard(CalibrationObject):
         n_points = points.size // 2
         points = np.reshape(points, (n_points, 1, 2))
 
-        K = camera.get_camera_matrix().detach().numpy()
-        D = camera.get_distortions().detach().numpy()
+        K = camera.get_camera_matrix().cpu().detach().numpy()
+        D = camera.get_distortions().cpu().detach().numpy()
         obj_points = self.get_object_points()
 
         if points.shape[0] != obj_points.shape[0]:
@@ -691,8 +691,8 @@ class CharucoBoard(CalibrationObject):
         n_corners = corners.size // 2
         corners = np.reshape(corners, (n_corners, 1, 2))
 
-        K = camera.get_camera_matrix().detach().numpy()
-        D = camera.get_distortions().detach().numpy()
+        K = camera.get_camera_matrix().cpu().detach().numpy()
+        D = camera.get_distortions().cpu().detach().numpy()
 
         ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             corners, ids, self.board, K, D, None, None)
