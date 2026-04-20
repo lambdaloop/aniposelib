@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from einops import rearrange, repeat
+
 from aniposelib.boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
 from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
@@ -35,6 +37,46 @@ def triangulate_simple(points, camera_mats):
     u, s, vh = torch.linalg.svd(A, full_matrices=True)
     p3d = vh[-1]
     p3d = p3d[:3] / p3d[3]
+    return p3d
+
+def triangulate_simple_batch(points, camera_mats, weights):
+    '''
+    Inputs:
+        points: [C, N, 2] 2d points to triangulate
+        camera_mats: [C, 4, 4] camera extrinsics
+        weights: [C, N] weight for each camera
+    Outputs:
+        p3d: [N, 3] triangulated 3d point
+    '''
+    C, N, _ = points.shape
+
+    points = rearrange(points, 'c n r -> n c r')
+    
+    # Expand camera_mats to [N, C, 4, 4]
+    cam_mats = repeat(camera_mats, 'c i j -> n c i j', n=N)
+    
+    # Extract x, y coordinates and reshape weights
+    x = points[:, :, 0:1, None]  # [N, C, 1]
+    y = points[:, :, 1:2, None]  # [N, C, 1]
+    w = rearrange(weights, 'c n -> n c 1 1')  # [N, C, 1]
+    
+    # Build equations for each camera
+    # x * mat[2] - mat[0] and y * mat[2] - mat[1]
+    eq_x = w * (x * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 0:1, :])  # [N, C, 1, 4]
+    eq_y = w * (y * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 1:2, :])  # [N, C, 1, 4]
+    
+    # Stack and reshape to [N, C*2, 4]
+    A = rearrange([eq_x, eq_y], 'two n c 1 j -> n (c two) j')
+    
+    # SVD decomposition
+    u, s, vh = torch.linalg.svd(A, full_matrices=True)  # vh: [N, 4, 4]
+    
+    # Take last row of vh for each point
+    p3d_homogeneous = vh[:, -1, :]  # [N, 4]
+    
+    # Convert from homogeneous to 3D coordinates
+    p3d = p3d_homogeneous[:, :3] / p3d_homogeneous[:, 3:4]  # [N, 3]
+    
     return p3d
 
 
@@ -519,7 +561,7 @@ class Camera(nn.Module):
             if self.dist.shape[0] > 4:
                 k3 = self.dist[4]
             else:
-                k3 = torch.tensor(0.0, device=dist.device, dtype=dist.dtype)
+                k3 = torch.tensor(0.0, device=self.dist.device, dtype=self.dist.dtype)
             radial = 1 + k1*r2 + k2*r4 + k3*r6
             dx = 2*p1*x*y + p2*(r2 + 2*x*x)
             dy = p1*(r2 + 2*y*y) + 2*p2*x*y
@@ -831,7 +873,7 @@ class CameraGroup(nn.Module):
 
         return out
 
-    def triangulate(self, points, undistort=True, progress=False, fast=False):
+    def triangulate(self, points, weights=None, batch_size=1000, undistort=True, progress=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
@@ -842,52 +884,63 @@ class CameraGroup(nn.Module):
             )
 
         points = to_tensor(points)
-        
+
         one_point = False
         if len(points.shape) == 2:
             points = points.reshape(-1, 1, 2)
             one_point = True
 
-        if undistort:
-            new_points = torch.empty_like(points)
-            for cnum, cam in enumerate(self.cameras):
-                # must copy in order to satisfy opencv underneath
-                # sub = np.copy(points[cnum])
-                new_points[cnum] = cam.undistort_points(points[cnum])
-            points = new_points
-
         n_cams, n_points, _ = points.shape
 
-
-        # if fast:
-        #     cam_Rt_mats = torch.stack([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
+        if undistort:
+            new_points = torch.empty_like(points)
+            if progress:
+                undistort_iter = trange(0, n_points, batch_size, ncols=70, desc="undistort")
+            else:
+                undistort_iter = range(0, n_points, batch_size)
             
-        #     p3d_allview_withnan = []
-        #     for j1, j2 in itertools.combinations(range(n_cams), 2):
-        #         pts1, pts2 = points[j1], points[j2]
-        #         Rt1, Rt2 = cam_Rt_mats[j1], cam_Rt_mats[j2]
-        #         tri = cv2.triangulatePoints(Rt1, Rt2, pts1.T, pts2.T)
-        #         tri = tri[:3]/tri[3]
-        #         p3d_allview_withnan.append(tri.T)
-        #     p3d_allview_withnan = np.array(p3d_allview_withnan)
-        #     out = np.nanmedian(p3d_allview_withnan, axis=0)
+            for start in undistort_iter:
+                end = min(start + batch_size, n_points)
+                for cnum, cam in enumerate(self.cameras):
+                    new_points[cnum, start:end] = cam.undistort_points(points[cnum, start:end])
+            points = new_points
 
-        # else:
         out = torch.full((n_points, 3), torch.nan,
                          device=points.device, dtype=torch.float64)
 
         cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
 
-        if progress:
-            iterator = trange(n_points, ncols=70)
+        # Initialize weights if not provided
+        if weights is None:
+            weights = torch.ones((n_cams, n_points), dtype=torch.float64, device=points.device)
         else:
-            iterator = range(n_points)
+            weights = to_tensor(weights, device=points.device)
 
-        for ip in iterator:
-            subp = points[:, ip, :]
-            good = ~torch.isnan(subp[:, 0])
-            if torch.sum(good) >= 2:
-                out[ip] = triangulate_simple(subp[good], cam_mats[good])
+        # Mask NaN points and zero their weights
+        valid_mask = ~torch.isnan(points).any(dim=-1)  # [C, N]
+        points = torch.nan_to_num(points, nan=0.0)
+        weights = weights * valid_mask.float()
+
+        # Count how many cameras have valid data per point
+        valid_counts = torch.sum(weights > 0, dim=0)  # [N]
+
+        if progress:
+            iterator = trange(0, n_points, batch_size, ncols=70, desc="triangulate")
+        else:
+            iterator = range(0, n_points, batch_size)
+
+        for start in iterator:
+            end = min(start + batch_size, n_points)
+            batch_indices = torch.arange(start, end, device=points.device)
+
+            # Only process points observed by at least 2 cameras
+            valid_in_batch = valid_counts[batch_indices] >= 2
+            valid_batch_indices = batch_indices[valid_in_batch]
+
+            if valid_batch_indices.numel() > 0:
+                batch_points = points[:, valid_batch_indices]
+                batch_weights = weights[:, valid_batch_indices]
+                out[valid_batch_indices] = triangulate_simple_batch(batch_points, cam_mats, batch_weights)
 
         if one_point:
             out = out[0]
