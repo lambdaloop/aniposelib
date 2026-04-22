@@ -146,33 +146,31 @@ def resample_points_extra(imgp, extra, n_samp=25):
     return newp, extra
 
 def resample_points(imgp, extra=None, n_samp=25):
-    # if extra is not None:
-    #     return resample_points_extra(imgp, extra, n_samp)
-
     n_cams = imgp.shape[0]
+    n_points = imgp.shape[1]
     good = ~np.isnan(imgp[:, :, 0])
-    ixs = np.arange(imgp.shape[1])
+    num_cams = np.sum(good, axis=0)
 
-    num_cams = np.sum(~np.isnan(imgp[:, :, 0]), axis=0)
+    valid_mask = num_cams >= 2
+    valid_ixs = np.where(valid_mask)[0]
 
-    include = set()
+    if len(valid_ixs) == 0:
+        return imgp, extra
 
-    for i in range(n_cams):
-        for j in range(i+1, n_cams):
-            subset = good[i] & good[j]
-            n_good = np.sum(subset)
-            if n_good > 0:
-                ## pick points, prioritizing points seen by more cameras
-                arr = np.copy(num_cams[subset]).astype('float64')
-                arr += np.random.random(size=arr.shape)
-                picked_ix = np.argsort(-arr)[:n_samp]
-                picked = ixs[subset][picked_ix]
-                include.update(picked)
+    target = int(n_samp * 2.5)
 
-    final_ixs = sorted(include)
+    if len(valid_ixs) <= target:
+        final_ixs = valid_ixs
+    else:
+        num_cams_valid = num_cams[valid_ixs]
+        weights = num_cams_valid.astype(float) ** 3
+        weights /= weights.sum()
+        chosen = np.random.choice(len(valid_ixs), size=target, replace=False, p=weights)
+        final_ixs = np.sort(valid_ixs[chosen])
+    
     newp = imgp[:, final_ixs]
-    extra = subset_extra(extra, final_ixs)
-    return newp, extra
+    new_extra = subset_extra(extra, final_ixs)
+    return newp, new_extra
 
 def medfilt_data(values, size=15):
     padsize = size+5
@@ -316,12 +314,13 @@ def rodrigues(rvec):
     # Normalized axis
     k = rvec / theta
     
-    # Skew-symmetric matrix
-    K = torch.tensor([
-        [0, -k[2], k[1]],
-        [k[2], 0, -k[0]],
-        [-k[1], k[0], 0]
-    ], dtype=rvec.dtype, device=rvec.device)
+    # Skew-symmetric matrix (use stack/cat to preserve autograd)
+    zero = torch.zeros(1, dtype=rvec.dtype, device=rvec.device)
+    K = torch.stack([
+        torch.cat([zero, -k[2:3], k[1:2]]),
+        torch.cat([k[2:3], zero, -k[0:1]]),
+        torch.cat([-k[1:2], k[0:1], zero])
+    ])
     
     # Rodrigues formula: R = I + sin(theta)*K + (1-cos(theta))*K^2
     I = torch.eye(3, dtype=rvec.dtype, device=rvec.device)
@@ -553,7 +552,7 @@ class Camera(nn.Module):
         x = (t_points[:, 0] - cx) / fx
         y = (t_points[:, 1] - cy) / fy
         x0, y0 = x.clone(), y.clone()
-        for _ in range(5):
+        for _ in range(15):
             r2 = x*x + y*y
             r4 = r2*r2
             r6 = r4*r2
@@ -1104,10 +1103,10 @@ class CameraGroup(nn.Module):
 
 
     def bundle_adjust_iter(self, p2ds, extra=None,
-                           n_iters=6, start_mu=15, end_mu=1,
-                           max_nfev=1000, ftol=1e-4,
-                           n_samp_iter=200, n_samp_full=1000,
-                           error_threshold=0.3, only_extrinsics=False,
+                           n_iters=8, start_mu=12, end_mu=0.06,
+                           max_nfev=850, ftol=1e-8,
+                           n_samp_iter=450, n_samp_full=1000,
+                           error_threshold=0.7, only_extrinsics=False,
                            verbose=False):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -1129,108 +1128,175 @@ class CameraGroup(nn.Module):
         extra_full = extra
 
         device = next(self.parameters()).device
-        
+
         p2ds, extra = resample_points(p2ds_full, extra_full,
                                       n_samp=n_samp_full)
-        p2ds = torch.as_tensor(p2ds, device=device)
-        error = self.average_error(p2ds, median=True).item()
+        p2ds_t = torch.as_tensor(p2ds, device=device)
+        error = self.average_error(p2ds_t, median=True).item()
 
         if verbose:
-            print('error: ', error)
+            print('initial error: ', error)
 
-        mus = np.exp(np.linspace(np.log(start_mu), np.log(end_mu), num=n_iters))
+        adaptive_start_mu = max(start_mu, error * 1.5)
+        mus = np.exp(np.linspace(np.log(adaptive_start_mu), np.log(end_mu), num=n_iters))
 
         if verbose:
             print('n_samples: {}'.format(n_samp_iter))
 
+        best_error = error
+        best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
+
+        f_scales = np.exp(np.linspace(np.log(8.0), np.log(0.5), num=n_iters))
+
+        n_ext_only = 4 if error > 50 else 2
+
         for i in range(n_iters):
             p2ds, extra = resample_points(p2ds_full, extra_full,
                                           n_samp=n_samp_full)
-            p2ds = torch.as_tensor(p2ds, device=device)
-            p3ds = self.triangulate(p2ds)
-            errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
-            errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
+            p2ds_t = torch.as_tensor(p2ds, device=device)
+            p3ds = self.triangulate(p2ds_t)
+            errors_norm = self.reprojection_error(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
 
-            error_dict = get_error_dict(errors_full)
-            max_error = 0
-            min_error = 0
-            for k, v in error_dict.items():
-                num, percents = v
-                max_error = max(percents[-1], max_error)
-                min_error = max(percents[0], min_error)
-            mu = max(min(max_error, mus[i]), min_error)
+            finite_errors = errors_norm[np.isfinite(errors_norm)]
+            if len(finite_errors) > 0:
+                median_err = np.median(finite_errors)
+                p75 = np.percentile(finite_errors, 75)
+                p25 = np.percentile(finite_errors, 25)
+                iqr = p75 - p25
+                scheduled_mu = mus[i]
+                data_mu = median_err + 0.7 * iqr
+                mu = max(scheduled_mu, min(data_mu, np.percentile(finite_errors, 72)))
+                mu = max(mu, end_mu)
+            else:
+                mu = mus[i]
 
             good = errors_norm < mu
+            n_good = np.sum(good)
+
+            if n_good < 10:
+                if len(finite_errors) > 0:
+                    mu = np.percentile(finite_errors, 95)
+                else:
+                    mu = mus[i]
+                good = errors_norm < mu
+
             extra_good = subset_extra(extra, good)
             p2ds_samp, extra_samp = resample_points(
-                p2ds[:, good].detach().cpu().numpy(), extra_good, n_samp=n_samp_iter)
+                p2ds[:, good], extra_good, n_samp=n_samp_iter)
             p2ds_samp = torch.as_tensor(p2ds_samp, device=device)
-            
-            error = np.median(errors_norm)
+
+            error = np.median(finite_errors) if len(finite_errors) > 0 else error
 
             if error < error_threshold:
                 break
 
             if verbose:
-                pprint(error_dict)
-                print('error: {:.2f}, mu: {:.1f}, ratio: {:.3f}'.format(error, mu, np.mean(good)))
+                errors_full = self.reprojection_error(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
+                print('iter {}: error: {:.2f}, mu: {:.1f}, ratio: {:.3f}, f_scale: {:.1f}'.format(
+                    i, error, mu, np.mean(good), f_scales[i]))
+
+            progress_frac = (i + 1) / n_iters
+            if progress_frac < 0.2:
+                iter_nfev = max(180, max_nfev // 4)
+            elif progress_frac < 0.4:
+                iter_nfev = max(300, int(max_nfev * 0.5))
+            else:
+                iter_nfev = max(450, max_nfev)
+
+            iter_only_ext = only_extrinsics or (i < n_ext_only)
 
             self.bundle_adjust(p2ds_samp, extra_samp,
-                               loss='linear', ftol=ftol,
-                               max_nfev=max_nfev, only_extrinsics=only_extrinsics,
-                               verbose=verbose)
+                               loss='cauchy', ftol=ftol,
+                               max_nfev=iter_nfev, only_extrinsics=iter_only_ext,
+                               verbose=verbose, f_scale=f_scales[i])
 
+            # Track best state
+            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+            cur_p2ds_t = torch.as_tensor(cur_p2ds, device=device)
+            cur_error = self.average_error(cur_p2ds_t, median=True).item()
+            if cur_error < best_error:
+                best_error = cur_error
+                best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
 
-        p2ds, extra = resample_points(p2ds_full, extra_full,
-                                      n_samp=n_samp_full)
-        p2ds = torch.as_tensor(p2ds, device=device)
-        p3ds = self.triangulate(p2ds)
-        errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
-        errors_norm = self.reprojection_error(p3ds, p2ds, mean=True).detach().cpu().numpy()
-        error_dict = get_error_dict(errors_full)
+        # Restore best state before final passes
+        self.load_state_dict(best_cam_state)
+
+        # Final bundle adjustment with cleaned points
+        for final_pass in range(3):
+            p2ds, extra = resample_points(p2ds_full, extra_full,
+                                          n_samp=n_samp_full)
+            p2ds_t = torch.as_tensor(p2ds, device=device)
+            p3ds = self.triangulate(p2ds_t)
+            errors_norm = self.reprojection_error(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
+
+            if verbose:
+                errors_full = self.reprojection_error(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
+
+            finite_errors = errors_norm[np.isfinite(errors_norm)]
+            if len(finite_errors) > 0:
+                median_err = np.median(finite_errors)
+                p75 = np.percentile(finite_errors, 75)
+                p25 = np.percentile(finite_errors, 25)
+                iqr = p75 - p25
+                mu = max(median_err + max(0.3 - 0.08 * final_pass, 0.06) * iqr, end_mu)
+            else:
+                mu = end_mu
+
+            good = errors_norm < mu
+            extra_good = subset_extra(extra, good)
+            final_f_scale = max(0.8 - 0.15 * final_pass, 0.3)
+            if np.sum(good) >= 10:
+                self.bundle_adjust(p2ds_t[:, good], extra_good,
+                                   loss='cauchy',
+                                   ftol=ftol * 0.1, max_nfev=max(700, max_nfev),
+                                   only_extrinsics=only_extrinsics,
+                                   verbose=verbose, f_scale=final_f_scale)
+
+            # Track best after each final pass
+            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+            cur_p2ds_t = torch.as_tensor(cur_p2ds, device=device)
+            cur_error = self.average_error(cur_p2ds_t, median=True).item()
+            if cur_error < best_error:
+                best_error = cur_error
+                best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
+
+        # Check if final adjustment improved
+        p2ds_check, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+        p2ds_check_t = torch.as_tensor(p2ds_check, device=device)
+        final_error = self.average_error(p2ds_check_t, median=True).item()
+
+        if final_error > best_error:
+            self.load_state_dict(best_cam_state)
+            error = best_error
+            if verbose:
+                print('restored best state with error: ', best_error)
+        else:
+            error = final_error
+
         if verbose:
+            p2ds_t2 = torch.as_tensor(
+                resample_points(p2ds_full, extra_full, n_samp=n_samp_full)[0],
+                device=device)
+            p3ds = self.triangulate(p2ds_t2)
+            errors_full = self.reprojection_error(p3ds, p2ds_t2, mean=False).detach().cpu().numpy()
+            error_dict = get_error_dict(errors_full)
             pprint(error_dict)
-
-        max_error = 0
-        min_error = 0
-        for k, v in error_dict.items():
-            num, percents = v
-            max_error = max(percents[-1], max_error)
-            min_error = max(percents[0], min_error)
-        mu = max(max(max_error, end_mu), min_error)
-
-        good = errors_norm < mu
-        extra_good = subset_extra(extra, good)
-        self.bundle_adjust(p2ds[:, good], extra_good,
-                           loss='linear',
-                           ftol=ftol, max_nfev=max(200, max_nfev),
-                           only_extrinsics=only_extrinsics,
-                           verbose=verbose)
-
-        error = self.average_error(p2ds, median=True).item()
-
-        p3ds = self.triangulate(p2ds)
-        errors_full = self.reprojection_error(p3ds, p2ds, mean=False).detach().cpu().numpy()
-        error_dict = get_error_dict(errors_full)
-        if verbose:
-            pprint(error_dict)
-
-        if verbose:
-            print('error: ', error)
+            print('final error: ', error)
 
         return error
 
     def bundle_adjust(self, p2ds, extra=None,
-                      loss='linear',
+                      loss='huber',
                       ftol=1e-4,
-                      max_nfev=1000,
-                      lr=1e-3,
+                      max_nfev=500,
+                      lr=8.0e-4,
                       only_extrinsics=False,
-                      verbose=True):
+                      verbose=True,
+                      f_scale=None):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustment to fine-tune the parameters of the cameras"""
-
+        
         assert p2ds.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
@@ -1251,49 +1317,107 @@ class CameraGroup(nn.Module):
         params = self._initialize_params_bundle(p2ds, extra)
         
         if only_extrinsics:
-            cam_params = self.get_extrinsics_params()
+            cam_params = list(self.get_extrinsics_params())
         else:
-            cam_params = self.parameters()
+            cam_params = list(self.parameters())
 
-        all_params = list(cam_params) + list(params.values())
-            
-        optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0, fused=True)
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-2, total_steps=max_nfev,
-                                                  pct_start=0.1)
+        param_groups = [
+            {'params': cam_params, 'lr': lr},
+            {'params': [params['p3d']], 'lr': lr * 65.0},
+        ]
+        if 'rvecs' in params:
+            param_groups.append({'params': [params['rvecs'], params['tvecs']], 'lr': lr * 30.0})
+
+        all_params = cam_params + list(params.values())
+
+        optimizer = optim.Adam(param_groups, weight_decay=0, amsgrad=True)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[lr * 65.0, lr * 260.0] + ([lr * 130.0] if 'rvecs' in params else []),
+            total_steps=max_nfev,
+            pct_start=0.18,
+            anneal_strategy='cos',
+            final_div_factor=5000.0
+        )
+
+        best_loss = torch.inf
+        best_state = None
+        best_cam_state = None
+        patience_counter = 0
+        patience = 150
+        min_iters = 20
 
         old_loss = torch.inf
         for i in range(max_nfev):
             optimizer.zero_grad()
-            loss = self._error_fun_bundle(params, p2ds, extra)
+            loss_val = self._error_fun_bundle(params, p2ds, extra, loss=loss, f_scale=f_scale)
 
-            if verbose and i % 20 == 0:
-                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
-            if i > 100 and old_loss - loss < ftol * loss:
+            current_loss = loss_val.item()
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_state = {k: v.data.clone() for k, v in params.items()}
+                best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            delta = old_loss - current_loss
+            if verbose and i % 50 == 0:
+                print("iter: {} \t loss: {:.4f}\t delta: {:.5f}".format(i, current_loss, delta))
+            
+            if i > min_iters and patience_counter > patience:
                 if verbose:
-                    print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
-                    print("termination condition reached (delta loss < ftol * loss)")
+                    print("iter: {} \t loss: {:.4f}\t early stop (patience)".format(i, current_loss))
                 break
-            old_loss = loss.item()
-            loss.backward()
+            if i > min_iters and abs(delta) < ftol * 0.01 and old_loss != torch.inf:
+                if verbose:
+                    print("iter: {} \t loss: {:.4f}\t early stop (ftol)".format(i, current_loss))
+                break
+            old_loss = current_loss
+            loss_val.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
             optimizer.step()
             scheduler.step()
 
+        # Restore best parameters
+        if best_state is not None:
+            for k, v in params.items():
+                v.data.copy_(best_state[k])
+            self.load_state_dict(best_cam_state)
+
         if verbose:
-            print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
+            print("iter: {} \t loss: {:.4f} (best: {:.4f})".format(i, current_loss, best_loss))
             
         error = self.average_error(p2ds)
         return error
 
-    # @torch.compile
-    def _error_fun_bundle(self, params, p2ds, extra):
+    def _error_fun_bundle(self, params, p2ds, extra, loss='linear', f_scale=None):
         """Error function for bundle adjustment"""
-
         p3d = params['p3d']
-        valid = torch.isfinite(p2ds).cpu()
+        valid = torch.isfinite(p2ds)
         proj = self.project(p3d)
-        loss_reproj = torch.mean(torch.square(proj[valid] - p2ds[valid]))
-        total_loss = loss_reproj
+        diff = proj - p2ds
+        diff = torch.where(valid, diff, torch.zeros_like(diff))
         
+        n_valid = valid[..., 0].sum().clamp(min=1)
+        
+        if loss == 'huber':
+            delta = 1.0
+            abs_diff = torch.abs(diff)
+            loss_reproj = torch.where(
+                abs_diff < delta,
+                0.5 * diff**2,
+                delta * (abs_diff - 0.5 * delta)
+            )
+        elif loss == 'cauchy':
+            delta = f_scale if f_scale is not None else 1.5
+            loss_reproj = delta**2 * torch.log(1 + (diff / delta)**2)
+        else:
+            loss_reproj = diff**2
+
+        loss_reproj = torch.sum(loss_reproj) / n_valid
+        total_loss = loss_reproj
+
         if extra is not None:
             ids = extra['ids_map']
             expected = transform_points(extra['objp'],
@@ -1321,8 +1445,6 @@ class CameraGroup(nn.Module):
             'p3d': nn.Parameter(p3ds)
         }
 
-
-        
         if extra is not None:
             ids = extra['ids_map']
             n_boards = int(np.max(ids[~np.isnan(ids)])) + 1
@@ -1351,6 +1473,7 @@ class CameraGroup(nn.Module):
             params['tvecs'] = nn.Parameter(torch.as_tensor(tvecs, device=p2ds.device))
 
         return params
+
 
     def optim_points(self, points, p3ds,
                      constraints=[],
@@ -1713,8 +1836,8 @@ class CameraGroup(nn.Module):
 
         if init_extrinsics:
             rtvecs = extract_rtvecs(merged)
-            if verbose:
-                pprint(get_connections(rtvecs, self.get_names()))
+            # if verbose:
+            #     pprint(get_connections(rtvecs, self.get_names()))
             rvecs, tvecs = get_initial_extrinsics(rtvecs, self.get_names())
             self.set_rotations(rvecs)
             self.set_translations(tvecs)
