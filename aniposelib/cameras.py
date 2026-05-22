@@ -953,7 +953,7 @@ class CameraGroup(nn.Module):
 
         return out
 
-    def triangulate_possible(self, points, undistort=True, min_cams=2, progress=False):
+    def triangulate_possible(self, points, undistort=True, min_cams=2, progress=False, batch_size=1000):
         """Given an CxNxPx2 array, returns (out, picked_vals, points_2d, errors) by
         triangulating all valid camera-subset/candidate combinations and picking the
         one with lowest mean reprojection error per point.
@@ -977,7 +977,7 @@ class CameraGroup(nn.Module):
         obs_mask = ~torch.isnan(points_raw[..., 0])
 
         # (b) Up-front undistortion (once)
-        points_undist = self._undistort_points_batch(points_raw) if undistort else points_raw
+        points_undist = self._undistort_points_batch(points_raw, batch_size=batch_size, progress=progress) if undistort else points_raw
 
         # (c) Per-point enumeration — Python, but only over small option lists
         # flat_* arrays: one entry per (record, camera-in-subset) pair
@@ -1041,17 +1041,25 @@ class CameraGroup(nn.Module):
         batch_points_raw[flat_c, flat_m] = points_raw[flat_c, flat_p, flat_q].to(torch.float64)
         batch_weights[flat_c, flat_m] = 1.0
 
-        # (d) Single batched SVD over all (point, subset) candidates
+        # (d) Batched SVD + reprojection — same batch_size chunking as triangulate
         cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
-        p3ds_batched = triangulate_simple_batch(batch_points_undist, cam_mats, batch_weights)  # (M, 3)
+        p3ds_batched = torch.full((M, 3), torch.nan, dtype=torch.float64, device=device)
+        err = torch.zeros(M, dtype=torch.float64, device=device)
 
-        # (e) Batched reprojection error — matches reprojection_error(..., mean=True) semantics
-        proj = self.project(p3ds_batched)  # (C, M, 2)
-        err_norm = torch.linalg.norm(
-            proj.to(torch.float64) - batch_points_raw, dim=-1)  # (C, M)
-        err_norm = err_norm * batch_weights  # zero out non-subset cameras
-        denom = batch_weights.sum(dim=0)   # (M,) = subset size
-        err = err_norm.sum(dim=0) / denom  # (M,) mean over subset cameras
+        tri_iter = trange(0, M, batch_size, ncols=70, desc="triangulate_possible") \
+            if progress else range(0, M, batch_size)
+        for start in tri_iter:
+            end = min(start + batch_size, M)
+            p3ds_batch = triangulate_simple_batch(
+                batch_points_undist[:, start:end], cam_mats, batch_weights[:, start:end])
+            p3ds_batched[start:end] = p3ds_batch
+
+            proj = self.project(p3ds_batch)  # (C, batch, 2)
+            batch_w = batch_weights[:, start:end]
+            err_norm = torch.linalg.norm(
+                proj.to(torch.float64) - batch_points_raw[:, start:end], dim=-1)
+            err_norm = err_norm * batch_w
+            err[start:end] = err_norm.sum(dim=0) / batch_w.sum(dim=0)
 
         # (f) Per-point argmin — O(M) total via pre-built ranges
         best_m = torch.full((n_points,), -1, dtype=torch.long, device=device)
