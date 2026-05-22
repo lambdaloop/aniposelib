@@ -979,43 +979,58 @@ class CameraGroup(nn.Module):
         # (b) Up-front undistortion (once)
         points_undist = self._undistort_points_batch(points_raw, batch_size=batch_size, progress=progress) if undistort else points_raw
 
-        # (c) Per-point enumeration — Python, but only over small option lists
-        # flat_* arrays: one entry per (record, camera-in-subset) pair
-        batch_point_idx_list = []  # one int per record
-        flat_m_list = []
-        flat_c_list = []
-        flat_p_list = []
-        flat_q_list = []
+        # (c) Per-point enumeration — vectorized via numpy, no GPU syncs in hot loop
+        obs_mask_np = obs_mask.cpu().numpy()  # (C, N, P) bool — one transfer, then CPU-only
+
+        flat_c_chunks: list = []
+        flat_q_chunks: list = []
+        flat_m_chunks: list = []
+        flat_p_chunks: list = []
         point_to_m_range = {}  # p -> (start_m, end_m) into the records
 
         m = 0
         iterator = trange(n_points, ncols=70) if progress else range(n_points)
         for p in iterator:
-            obs_cams_p = [c for c in range(n_cams) if obs_mask[c, p].any().item()]
-            n_obs = len(obs_cams_p)
+            obs_cams_p = np.flatnonzero(obs_mask_np[:, p].any(axis=-1))  # (n_obs,)
+            n_obs = obs_cams_p.size
             if n_obs < min_cams:
                 continue
 
-            options_per_cam = []
-            for c in obs_cams_p:
-                qs = obs_mask[c, p].nonzero(as_tuple=True)[0].tolist()
-                options_per_cam.append([(c, q) for q in qs] + [None])
+            qs_per_cam = [np.flatnonzero(obs_mask_np[c, p]) for c in obs_cams_p]
+            P_per_cam = np.fromiter((qs.size for qs in qs_per_cam), dtype=np.int64, count=n_obs)
+            # Each cam has P_c real options + 1 sentinel ("drop this camera").
+            shape = tuple((P_per_cam + 1).tolist())
 
-            m_start = m
-            for combo in itertools.product(*options_per_cam):
-                picked = [x for x in combo if x is not None]
-                if len(picked) < min_cams or len(picked) == n_obs:
-                    continue
-                batch_point_idx_list.append(p)
-                for c, q in picked:
-                    flat_m_list.append(m)
-                    flat_c_list.append(c)
-                    flat_p_list.append(p)
-                    flat_q_list.append(q)
-                m += 1
+            # Enumerate all (P+1)^k combos without Python loops.
+            idx_matrix = np.indices(shape).reshape(n_obs, -1)  # (n_obs, total_combos)
+            is_kept = idx_matrix < P_per_cam[:, None]           # True = real detection
+            n_picked = is_kept.sum(axis=0)
+            keep_combo = (n_picked >= min_cams) & (n_picked < n_obs)
 
-            if m > m_start:
-                point_to_m_range[p] = (m_start, m)
+            n_kept = int(keep_combo.sum())
+            if n_kept == 0:
+                continue
+
+            idx_k     = idx_matrix[:, keep_combo]  # (n_obs, n_kept)
+            is_kept_k = is_kept[:, keep_combo]      # (n_obs, n_kept)
+
+            # Map option indices → actual q values via per-cam lookup (small loop over n_obs).
+            q_2d = np.zeros((n_obs, n_kept), dtype=np.int64)
+            for i, qs in enumerate(qs_per_cam):
+                v = is_kept_k[i]
+                q_2d[i, v] = qs[idx_k[i, v]]
+
+            cam_2d = np.broadcast_to(obs_cams_p[:, None], (n_obs, n_kept))
+            m_2d   = np.broadcast_to(np.arange(m, m + n_kept, dtype=np.int64)[None, :], (n_obs, n_kept))
+
+            mask = is_kept_k.ravel()
+            flat_c_chunks.append(cam_2d.ravel()[mask].astype(np.int64, copy=False))
+            flat_q_chunks.append(q_2d.ravel()[mask])
+            flat_m_chunks.append(m_2d.ravel()[mask])
+            flat_p_chunks.append(np.full(int(mask.sum()), p, dtype=np.int64))
+
+            point_to_m_range[p] = (m, m + n_kept)
+            m += n_kept
 
         M = m
 
@@ -1027,10 +1042,10 @@ class CameraGroup(nn.Module):
         if M == 0:
             return out, picked_vals, points_2d, errors_out
 
-        flat_m = torch.tensor(flat_m_list, dtype=torch.long, device=device)
-        flat_c = torch.tensor(flat_c_list, dtype=torch.long, device=device)
-        flat_p = torch.tensor(flat_p_list, dtype=torch.long, device=device)
-        flat_q = torch.tensor(flat_q_list, dtype=torch.long, device=device)
+        flat_c = torch.from_numpy(np.concatenate(flat_c_chunks)).to(device=device)
+        flat_q = torch.from_numpy(np.concatenate(flat_q_chunks)).to(device=device)
+        flat_m = torch.from_numpy(np.concatenate(flat_m_chunks)).to(device=device)
+        flat_p = torch.from_numpy(np.concatenate(flat_p_chunks)).to(device=device)
 
         # Build batched input tensors: (C, M, 2) and (C, M) weights
         batch_points_undist = torch.zeros((n_cams, M, 2), dtype=torch.float64, device=device)
