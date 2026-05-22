@@ -872,6 +872,22 @@ class CameraGroup(nn.Module):
 
         return out
 
+    def _undistort_points_batch(self, points, batch_size=1000, progress=False, desc="undistort"):
+        """Undistort per-camera. points: (C, ..., 2) torch tensor. Returns same shape.
+        NaN passes through (cam.undistort_points is arithmetic-only)."""
+        orig_shape = points.shape
+        C = orig_shape[0]
+        K = points[0].numel() // 2
+        points_flat = points.reshape(C, K, 2)
+        new_points = torch.empty_like(points_flat)
+        undistort_iter = trange(0, K, batch_size, ncols=70, desc=desc) if progress \
+            else range(0, K, batch_size)
+        for start in undistort_iter:
+            end = min(start + batch_size, K)
+            for cnum, cam in enumerate(self.cameras):
+                new_points[cnum, start:end] = cam.undistort_points(points_flat[cnum, start:end])
+        return new_points.reshape(orig_shape)
+
     def triangulate(self, points, weights=None, batch_size=1000, undistort=True, progress=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
@@ -893,17 +909,7 @@ class CameraGroup(nn.Module):
         n_cams, n_points, _ = points.shape
 
         if undistort:
-            new_points = torch.empty_like(points)
-            if progress:
-                undistort_iter = trange(0, n_points, batch_size, ncols=70, desc="undistort")
-            else:
-                undistort_iter = range(0, n_points, batch_size)
-            
-            for start in undistort_iter:
-                end = min(start + batch_size, n_points)
-                for cnum, cam in enumerate(self.cameras):
-                    new_points[cnum, start:end] = cam.undistort_points(points[cnum, start:end])
-            points = new_points
+            points = self._undistort_points_batch(points, batch_size=batch_size, progress=progress)
 
         out = torch.full((n_points, 3), torch.nan,
                          device=points.device, dtype=torch.float64)
@@ -947,97 +953,127 @@ class CameraGroup(nn.Module):
 
         return out
 
-    def triangulate_possible(self, points, undistort=True,
-                             min_cams=2, progress=False, threshold=0.5):
-        """Given an CxNxPx2 array, this returns an Nx3 array of points
-        by triangulating all possible points and picking the ones with
-        best reprojection error
-        where:
-        C: number of cameras
-        N: number of points
-        P: number of possible options per point
-        """
-        points = to_tensor(points)
-        device = points.device
+    def triangulate_possible(self, points, undistort=True, min_cams=2, progress=False):
+        """Given an CxNxPx2 array, returns (out, picked_vals, points_2d, errors) by
+        triangulating all valid camera-subset/candidate combinations and picking the
+        one with lowest mean reprojection error per point.
 
-        assert points.shape[0] == len(self.cameras), \
+        C: number of cameras, N: number of points, P: candidate detections per camera.
+        All subset candidates are evaluated in a single batched SVD; the legacy
+        per-subset early-exit threshold is not available in the batched version.
+        """
+        device = next(self.parameters()).device
+        points_raw = to_tensor(points, device=device)
+
+        assert points_raw.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
-                len(self.cameras), points.shape
+                len(self.cameras), points_raw.shape
             )
 
-        n_cams, n_points, n_possible, _ = points.shape
+        n_cams, n_points, n_possible, _ = points_raw.shape
 
-        cam_nums, point_nums, possible_nums = torch.where(
-            ~torch.isnan(points[:, :, :, 0]))
+        # (a) Observation mask: (C, N, P) bool
+        obs_mask = ~torch.isnan(points_raw[..., 0])
 
-        
-        all_iters = defaultdict(dict)
+        # (b) Up-front undistortion (once)
+        points_undist = self._undistort_points_batch(points_raw) if undistort else points_raw
 
-        for cam_num, point_num, possible_num in zip(cam_nums.tolist(),
-                                                    point_nums.tolist(),
-                                                    possible_nums.tolist()):
-            if cam_num not in all_iters[point_num]:
-                all_iters[point_num][cam_num] = []
-            all_iters[point_num][cam_num].append((cam_num, possible_num))
+        # (c) Per-point enumeration — Python, but only over small option lists
+        # flat_* arrays: one entry per (record, camera-in-subset) pair
+        batch_point_idx_list = []  # one int per record
+        flat_m_list = []
+        flat_c_list = []
+        flat_p_list = []
+        flat_q_list = []
+        point_to_m_range = {}  # p -> (start_m, end_m) into the records
 
-        for point_num in all_iters.keys():
-            for cam_num in all_iters[point_num].keys():
-                all_iters[point_num][cam_num].append(None)
+        m = 0
+        iterator = trange(n_points, ncols=70) if progress else range(n_points)
+        for p in iterator:
+            obs_cams_p = [c for c in range(n_cams) if obs_mask[c, p].any().item()]
+            n_obs = len(obs_cams_p)
+            if n_obs < min_cams:
+                continue
 
-                
+            options_per_cam = []
+            for c in obs_cams_p:
+                qs = obs_mask[c, p].nonzero(as_tuple=True)[0].tolist()
+                options_per_cam.append([(c, q) for q in qs] + [None])
+
+            m_start = m
+            for combo in itertools.product(*options_per_cam):
+                picked = [x for x in combo if x is not None]
+                if len(picked) < min_cams or len(picked) == n_obs:
+                    continue
+                batch_point_idx_list.append(p)
+                for c, q in picked:
+                    flat_m_list.append(m)
+                    flat_c_list.append(c)
+                    flat_p_list.append(p)
+                    flat_q_list.append(q)
+                m += 1
+
+            if m > m_start:
+                point_to_m_range[p] = (m_start, m)
+
+        M = m
+
         out = torch.full((n_points, 3), torch.nan, dtype=torch.float64, device=device)
         picked_vals = torch.zeros((n_cams, n_points, n_possible), dtype=torch.bool, device=device)
-        errors = torch.zeros(n_points, dtype=torch.float64, device=device)
+        errors_out = torch.zeros(n_points, dtype=torch.float64, device=device)
         points_2d = torch.full((n_cams, n_points, 2), torch.nan, dtype=torch.float64, device=device)
 
-        if progress:
-            iterator = trange(n_points, ncols=70)
-        else:
-            iterator = range(n_points)
+        if M == 0:
+            return out, picked_vals, points_2d, errors_out
 
-        for point_ix in iterator:
-            best_point = None
-            best_error = 200
+        flat_m = torch.tensor(flat_m_list, dtype=torch.long, device=device)
+        flat_c = torch.tensor(flat_c_list, dtype=torch.long, device=device)
+        flat_p = torch.tensor(flat_p_list, dtype=torch.long, device=device)
+        flat_q = torch.tensor(flat_q_list, dtype=torch.long, device=device)
 
-            n_cams_max = len(all_iters[point_ix])
-            
-            for picked in itertools.product(*all_iters[point_ix].values()):
-                picked = [p for p in picked if p is not None]
-                if len(picked) < min_cams or len(picked) == n_cams_max:
-                    continue
+        # Build batched input tensors: (C, M, 2) and (C, M) weights
+        batch_points_undist = torch.zeros((n_cams, M, 2), dtype=torch.float64, device=device)
+        batch_points_raw = torch.zeros((n_cams, M, 2), dtype=torch.float64, device=device)
+        batch_weights = torch.zeros((n_cams, M), dtype=torch.float64, device=device)
 
-                cnums = [p[0] for p in picked]
-                xnums = [p[1] for p in picked]
+        batch_points_undist[flat_c, flat_m] = points_undist[flat_c, flat_p, flat_q].to(torch.float64)
+        batch_points_raw[flat_c, flat_m] = points_raw[flat_c, flat_p, flat_q].to(torch.float64)
+        batch_weights[flat_c, flat_m] = 1.0
 
-                pts = points[cnums, point_ix, xnums]
-                cc = self.subset_cameras(cnums)
-                
-                p3d = cc.triangulate(pts, undistort=undistort)
-                err = cc.reprojection_error(p3d, pts, mean=True)
+        # (d) Single batched SVD over all (point, subset) candidates
+        cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
+        p3ds_batched = triangulate_simple_batch(batch_points_undist, cam_mats, batch_weights)  # (M, 3)
 
-                if err < best_error:
-                    best_point = {
-                        'error': err,
-                        'point': p3d[:3],
-                        'points': pts,
-                        'picked': picked,
-                        'joint_ix': point_ix
-                    }
-                    best_error = err
-                    if best_error < threshold:
-                        break
+        # (e) Batched reprojection error — matches reprojection_error(..., mean=True) semantics
+        proj = self.project(p3ds_batched)  # (C, M, 2)
+        err_norm = torch.linalg.norm(
+            proj.to(torch.float64) - batch_points_raw, dim=-1)  # (C, M)
+        err_norm = err_norm * batch_weights  # zero out non-subset cameras
+        denom = batch_weights.sum(dim=0)   # (M,) = subset size
+        err = err_norm.sum(dim=0) / denom  # (M,) mean over subset cameras
 
-            if best_point is not None:
-                out[point_ix] = best_point['point']
-                picked = best_point['picked']
-                cnums = [p[0] for p in picked]
-                xnums = [p[1] for p in picked]
-                picked_vals[cnums, point_ix, xnums] = True
-                errors[point_ix] = best_point['error']
-                points_2d[cnums, point_ix] = best_point['points']
+        # (f) Per-point argmin — O(M) total via pre-built ranges
+        best_m = torch.full((n_points,), -1, dtype=torch.long, device=device)
+        best_err = torch.full((n_points,), float('inf'), dtype=torch.float64, device=device)
+        for p, (start, end) in point_to_m_range.items():
+            j_local = err[start:end].argmin().item()
+            j = start + j_local
+            best_m[p] = j
+            best_err[p] = err[j]
 
-        return out, picked_vals, points_2d, errors
+        # (g) Assemble outputs
+        has_winner = best_m >= 0
+        out[has_winner] = p3ds_batched[best_m[has_winner]]
+        errors_out[has_winner] = best_err[has_winner]
+
+        winner_mask = torch.zeros(M, dtype=torch.bool, device=device)
+        winner_mask[best_m[has_winner]] = True
+        sel = winner_mask[flat_m]
+        picked_vals[flat_c[sel], flat_p[sel], flat_q[sel]] = True
+        points_2d[flat_c[sel], flat_p[sel]] = points_raw[flat_c[sel], flat_p[sel], flat_q[sel]].to(torch.float64)
+
+        return out, picked_vals, points_2d, errors_out
 
     def triangulate_ransac(self, points, undistort=True, min_cams=2, progress=False):
         """Given an CxNx2 array, this returns an Nx3 array of points,
