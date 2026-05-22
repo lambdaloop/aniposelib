@@ -69,7 +69,7 @@ def triangulate_simple_batch(points, camera_mats, weights):
     A = rearrange([eq_x, eq_y], 'two n c 1 j -> n (c two) j')
     
     # SVD decomposition
-    u, s, vh = torch.linalg.svd(A, full_matrices=True)  # vh: [N, 4, 4]
+    u, s, vh = torch.linalg.svd(A, full_matrices=False)  # vh: [N, 4, 4]; only vh used downstream
     
     # Take last row of vh for each point
     p3d_homogeneous = vh[:, -1, :]  # [N, 4]
@@ -959,142 +959,138 @@ class CameraGroup(nn.Module):
         one with lowest mean reprojection error per point.
 
         C: number of cameras, N: number of points, P: candidate detections per camera.
-        All subset candidates are evaluated in a single batched SVD; the legacy
-        per-subset early-exit threshold is not available in the batched version.
+        batch_size controls the outer loop: points are processed in chunks of batch_size,
+        so peak GPU working set is O(batch_size) rather than O(N). For large P (e.g. P=2
+        with C=9 cameras), use a smaller batch_size (e.g. 25) to stay memory-bounded.
         """
         device = next(self.parameters()).device
-        points_raw = to_tensor(points, device=device)
+        points_raw_cpu = to_tensor(points, device='cpu')  # master stays on CPU
 
-        assert points_raw.shape[0] == len(self.cameras), \
+        assert points_raw_cpu.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
-                len(self.cameras), points_raw.shape
+                len(self.cameras), points_raw_cpu.shape
             )
 
-        n_cams, n_points, n_possible, _ = points_raw.shape
+        n_cams, n_points, n_possible, _ = points_raw_cpu.shape
 
-        # (a) Observation mask: (C, N, P) bool
-        obs_mask = ~torch.isnan(points_raw[..., 0])
+        # Output tensors — O(N), small for typical N
+        out         = torch.full((n_points, 3),                    torch.nan, dtype=torch.float64, device=device)
+        picked_vals = torch.zeros((n_cams, n_points, n_possible),             dtype=torch.bool,    device=device)
+        errors_out  = torch.zeros(n_points,                                   dtype=torch.float64, device=device)
+        points_2d   = torch.full((n_cams, n_points, 2),            torch.nan, dtype=torch.float64, device=device)
 
-        # (b) Up-front undistortion (once)
-        points_undist = self._undistort_points_batch(points_raw, batch_size=batch_size, progress=progress) if undistort else points_raw
-
-        # (c) Per-point enumeration — vectorized via numpy, no GPU syncs in hot loop
-        obs_mask_np = obs_mask.cpu().numpy()  # (C, N, P) bool — one transfer, then CPU-only
-
-        flat_c_chunks: list = []
-        flat_q_chunks: list = []
-        flat_m_chunks: list = []
-        flat_p_chunks: list = []
-        point_to_m_range = {}  # p -> (start_m, end_m) into the records
-
-        m = 0
-        iterator = trange(n_points, ncols=70) if progress else range(n_points)
-        for p in iterator:
-            obs_cams_p = np.flatnonzero(obs_mask_np[:, p].any(axis=-1))  # (n_obs,)
-            n_obs = obs_cams_p.size
-            if n_obs < min_cams:
-                continue
-
-            qs_per_cam = [np.flatnonzero(obs_mask_np[c, p]) for c in obs_cams_p]
-            P_per_cam = np.fromiter((qs.size for qs in qs_per_cam), dtype=np.int64, count=n_obs)
-            # Each cam has P_c real options + 1 sentinel ("drop this camera").
-            shape = tuple((P_per_cam + 1).tolist())
-
-            # Enumerate all (P+1)^k combos without Python loops.
-            idx_matrix = np.indices(shape).reshape(n_obs, -1)  # (n_obs, total_combos)
-            is_kept = idx_matrix < P_per_cam[:, None]           # True = real detection
-            n_picked = is_kept.sum(axis=0)
-            keep_combo = (n_picked >= min_cams) & (n_picked < n_obs)
-
-            n_kept = int(keep_combo.sum())
-            if n_kept == 0:
-                continue
-
-            idx_k     = idx_matrix[:, keep_combo]  # (n_obs, n_kept)
-            is_kept_k = is_kept[:, keep_combo]      # (n_obs, n_kept)
-
-            # Map option indices → actual q values via per-cam lookup (small loop over n_obs).
-            q_2d = np.zeros((n_obs, n_kept), dtype=np.int64)
-            for i, qs in enumerate(qs_per_cam):
-                v = is_kept_k[i]
-                q_2d[i, v] = qs[idx_k[i, v]]
-
-            cam_2d = np.broadcast_to(obs_cams_p[:, None], (n_obs, n_kept))
-            m_2d   = np.broadcast_to(np.arange(m, m + n_kept, dtype=np.int64)[None, :], (n_obs, n_kept))
-
-            mask = is_kept_k.ravel()
-            flat_c_chunks.append(cam_2d.ravel()[mask].astype(np.int64, copy=False))
-            flat_q_chunks.append(q_2d.ravel()[mask])
-            flat_m_chunks.append(m_2d.ravel()[mask])
-            flat_p_chunks.append(np.full(int(mask.sum()), p, dtype=np.int64))
-
-            point_to_m_range[p] = (m, m + n_kept)
-            m += n_kept
-
-        M = m
-
-        out = torch.full((n_points, 3), torch.nan, dtype=torch.float64, device=device)
-        picked_vals = torch.zeros((n_cams, n_points, n_possible), dtype=torch.bool, device=device)
-        errors_out = torch.zeros(n_points, dtype=torch.float64, device=device)
-        points_2d = torch.full((n_cams, n_points, 2), torch.nan, dtype=torch.float64, device=device)
-
-        if M == 0:
-            return out, picked_vals, points_2d, errors_out
-
-        flat_c = torch.from_numpy(np.concatenate(flat_c_chunks)).to(device=device)
-        flat_q = torch.from_numpy(np.concatenate(flat_q_chunks)).to(device=device)
-        flat_m = torch.from_numpy(np.concatenate(flat_m_chunks)).to(device=device)
-        flat_p = torch.from_numpy(np.concatenate(flat_p_chunks)).to(device=device)
-
-        # Build batched input tensors: (C, M, 2) and (C, M) weights
-        batch_points_undist = torch.zeros((n_cams, M, 2), dtype=torch.float64, device=device)
-        batch_points_raw = torch.zeros((n_cams, M, 2), dtype=torch.float64, device=device)
-        batch_weights = torch.zeros((n_cams, M), dtype=torch.float64, device=device)
-
-        batch_points_undist[flat_c, flat_m] = points_undist[flat_c, flat_p, flat_q].to(torch.float64)
-        batch_points_raw[flat_c, flat_m] = points_raw[flat_c, flat_p, flat_q].to(torch.float64)
-        batch_weights[flat_c, flat_m] = 1.0
-
-        # (d) Batched SVD + reprojection — same batch_size chunking as triangulate
         cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
-        p3ds_batched = torch.full((M, 3), torch.nan, dtype=torch.float64, device=device)
-        err = torch.zeros(M, dtype=torch.float64, device=device)
 
-        tri_iter = trange(0, M, batch_size, ncols=70, desc="triangulate_possible") \
-            if progress else range(0, M, batch_size)
-        for start in tri_iter:
-            end = min(start + batch_size, M)
-            p3ds_batch = triangulate_simple_batch(
-                batch_points_undist[:, start:end], cam_mats, batch_weights[:, start:end])
-            p3ds_batched[start:end] = p3ds_batch
+        # Observation mask kept on CPU — (C, N, P) bool, one allocation for all chunks
+        obs_mask_np_full = ~np.isnan(points_raw_cpu[..., 0].numpy())
 
-            proj = self.project(p3ds_batch)  # (C, batch, 2)
-            batch_w = batch_weights[:, start:end]
-            err_norm = torch.linalg.norm(
-                proj.to(torch.float64) - batch_points_raw[:, start:end], dim=-1)
-            err_norm = err_norm * batch_w
-            err[start:end] = err_norm.sum(dim=0) / batch_w.sum(dim=0)
+        chunk_iter = trange(0, n_points, batch_size, ncols=70, desc="triangulate_possible") \
+            if progress else range(0, n_points, batch_size)
 
-        # (f) Per-point argmin — O(M) total via pre-built ranges
-        best_m = torch.full((n_points,), -1, dtype=torch.long, device=device)
-        best_err = torch.full((n_points,), float('inf'), dtype=torch.float64, device=device)
-        for p, (start, end) in point_to_m_range.items():
-            j_local = err[start:end].argmin().item()
-            j = start + j_local
-            best_m[p] = j
-            best_err[p] = err[j]
+        for p0 in chunk_iter:
+            p1 = min(p0 + batch_size, n_points)
+            chunk_size = p1 - p0
 
-        # (g) Assemble outputs
-        has_winner = best_m >= 0
-        out[has_winner] = p3ds_batched[best_m[has_winner]]
-        errors_out[has_winner] = best_err[has_winner]
+            # Upload chunk to GPU
+            points_raw_chunk = points_raw_cpu[:, p0:p1].to(device)  # (C, chunk, P, 2)
 
-        winner_mask = torch.zeros(M, dtype=torch.bool, device=device)
-        winner_mask[best_m[has_winner]] = True
-        sel = winner_mask[flat_m]
-        picked_vals[flat_c[sel], flat_p[sel], flat_q[sel]] = True
-        points_2d[flat_c[sel], flat_p[sel]] = points_raw[flat_c[sel], flat_p[sel], flat_q[sel]].to(torch.float64)
+            if undistort:
+                points_undist_chunk = self._undistort_points_batch(points_raw_chunk, batch_size=batch_size)
+            else:
+                points_undist_chunk = points_raw_chunk
+
+            # Enumerate combos for this chunk — CPU numpy, no GPU involvement
+            obs_mask_chunk = obs_mask_np_full[:, p0:p1]  # (C, chunk, P)
+
+            flat_c_chunks: list = []
+            flat_q_chunks: list = []
+            flat_m_chunks: list = []
+            flat_p_chunks: list = []  # chunk-local point indices [0, chunk_size)
+            point_to_m_range: dict = {}  # chunk-local p_local -> (start_m, end_m)
+
+            m = 0
+            for p_local in range(chunk_size):
+                obs_cams_p = np.flatnonzero(obs_mask_chunk[:, p_local].any(axis=-1))
+                n_obs = obs_cams_p.size
+                if n_obs < min_cams:
+                    continue
+
+                qs_per_cam = [np.flatnonzero(obs_mask_chunk[c, p_local]) for c in obs_cams_p]
+                P_per_cam = np.fromiter((qs.size for qs in qs_per_cam), dtype=np.int64, count=n_obs)
+                shape = tuple((P_per_cam + 1).tolist())
+
+                idx_matrix = np.indices(shape).reshape(n_obs, -1)
+                is_kept    = idx_matrix < P_per_cam[:, None]
+                n_picked   = is_kept.sum(axis=0)
+                keep_combo = (n_picked >= min_cams) & (n_picked < n_obs)
+
+                n_kept = int(keep_combo.sum())
+                if n_kept == 0:
+                    continue
+
+                idx_k     = idx_matrix[:, keep_combo]
+                is_kept_k = is_kept[:, keep_combo]
+
+                q_2d = np.zeros((n_obs, n_kept), dtype=np.int64)
+                for i, qs in enumerate(qs_per_cam):
+                    v = is_kept_k[i]
+                    q_2d[i, v] = qs[idx_k[i, v]]
+
+                cam_2d = np.broadcast_to(obs_cams_p[:, None], (n_obs, n_kept))
+                m_2d   = np.broadcast_to(np.arange(m, m + n_kept, dtype=np.int64)[None, :], (n_obs, n_kept))
+
+                mask = is_kept_k.ravel()
+                flat_c_chunks.append(cam_2d.ravel()[mask].astype(np.int64, copy=False))
+                flat_q_chunks.append(q_2d.ravel()[mask])
+                flat_m_chunks.append(m_2d.ravel()[mask])
+                flat_p_chunks.append(np.full(int(mask.sum()), p_local, dtype=np.int64))
+
+                point_to_m_range[p_local] = (m, m + n_kept)
+                m += n_kept
+
+            M_chunk = m
+            if M_chunk == 0:
+                continue
+
+            flat_c = torch.from_numpy(np.concatenate(flat_c_chunks)).to(device=device)
+            flat_q = torch.from_numpy(np.concatenate(flat_q_chunks)).to(device=device)
+            flat_m = torch.from_numpy(np.concatenate(flat_m_chunks)).to(device=device)
+            flat_p = torch.from_numpy(np.concatenate(flat_p_chunks)).to(device=device)
+
+            # Build (C, M_chunk, 2) and (C, M_chunk) buffers — bounded by chunk, not N
+            batch_points_undist = torch.zeros((n_cams, M_chunk, 2), dtype=torch.float64, device=device)
+            batch_points_raw    = torch.zeros((n_cams, M_chunk, 2), dtype=torch.float64, device=device)
+            batch_weights       = torch.zeros((n_cams, M_chunk),    dtype=torch.float64, device=device)
+
+            # flat_p is chunk-local: indexes into points_raw_chunk[:, 0:chunk_size, ...]
+            batch_points_undist[flat_c, flat_m] = points_undist_chunk[flat_c, flat_p, flat_q].to(torch.float64)
+            batch_points_raw   [flat_c, flat_m] = points_raw_chunk   [flat_c, flat_p, flat_q].to(torch.float64)
+            batch_weights      [flat_c, flat_m] = 1.0
+
+            # One SVD over all M_chunk records; full_matrices=False keeps u bounded
+            p3ds_batched = triangulate_simple_batch(batch_points_undist, cam_mats, batch_weights)
+
+            proj     = self.project(p3ds_batched)  # (C, M_chunk, 2)
+            err_norm = torch.linalg.norm(proj.to(torch.float64) - batch_points_raw, dim=-1)
+            err      = (err_norm * batch_weights).sum(dim=0) / batch_weights.sum(dim=0)
+
+            # Per-point argmin — write into global output tensors using p0 offset
+            winner_mask = torch.zeros(M_chunk, dtype=torch.bool, device=device)
+            for p_local, (m_s, m_e) in point_to_m_range.items():
+                j = m_s + int(err[m_s:m_e].argmin().item())
+                p_global = p0 + p_local
+                out[p_global]        = p3ds_batched[j]
+                errors_out[p_global] = err[j]
+                winner_mask[j]       = True
+
+            # Scatter picked_vals / points_2d; flat_p is chunk-local for gather,
+            # flat_p + p0 is global for output scatter
+            sel          = winner_mask[flat_m]
+            p_global_idx = flat_p[sel] + p0
+            picked_vals[flat_c[sel], p_global_idx, flat_q[sel]] = True
+            points_2d  [flat_c[sel], p_global_idx] = \
+                points_raw_chunk[flat_c[sel], flat_p[sel], flat_q[sel]].to(torch.float64)
 
         return out, picked_vals, points_2d, errors_out
 
