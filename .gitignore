@@ -91,6 +91,9 @@ celerybeat-schedule
 venv/
 ENV/
 
+# pixi
+.pixi/
+
 # Spyder project settings
 .spyderproject
 .spyproject
