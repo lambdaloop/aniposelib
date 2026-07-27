@@ -991,6 +991,39 @@ class FisheyeCamera(Camera):
         return new_cam.to(self.matrix.device)
 
 
+def init_camera_intrinsics(camera, objp, imgp, size):
+    """Seed a camera's intrinsics from board detections, per projection model.
+
+    The pinhole path gets a camera matrix from cv2.initCameraMatrix2D and starts
+    from zero distortion. There is no fisheye equivalent of that, so the fisheye
+    path runs a full cv2.fisheye.calibrate, which also gives usable k1..k4 --
+    starting a fisheye camera at zero distortion throws away the equidistant
+    term the model exists to capture.
+    """
+    if camera.fisheye:
+        # cv2.fisheye.calibrate is picky: it wants (1, N, 3) / (1, N, 2) float64
+        obj64 = [np.asarray(o, dtype='float64').reshape(1, -1, 3) for o in objp]
+        img64 = [np.asarray(i, dtype='float64').reshape(1, -1, 2) for i in imgp]
+        K = np.eye(3)
+        D = np.zeros((4, 1))
+        try:
+            cv2.fisheye.calibrate(
+                obj64, img64, tuple(size), K, D,
+                flags=(cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                       | cv2.fisheye.CALIB_FIX_SKEW))
+            camera.set_camera_matrix(K.copy())
+            camera.set_distortions(D.ravel().copy())
+            return
+        except cv2.error:
+            # degenerate views, fall through to the pinhole seed
+            print("W: fisheye intrinsics failed for camera {}, "
+                  "falling back to a pinhole seed".format(camera.get_name()))
+
+    matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
+    camera.set_camera_matrix(matrix.copy())
+    camera.zero_distortions()
+
+
 class CameraGroup(nn.Module):
     def __init__(self, cameras, metadata={}):
         super().__init__()
@@ -2060,9 +2093,7 @@ class CameraGroup(nn.Module):
                 objp, imgp = board.get_all_calibration_points(rows)
                 mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 9]
                 objp, imgp = zip(*mixed)
-                matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
-                camera.set_camera_matrix(matrix.copy())
-                camera.zero_distortions()
+                init_camera_intrinsics(camera, objp, imgp, size)
 
         for i, (row, cam) in enumerate(zip(all_rows, self.cameras)):
             all_rows[i] = board.estimate_pose_rows(cam, row)

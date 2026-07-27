@@ -23,6 +23,31 @@ def get_video_params(fname):
     return params
 
 
+def pnp_inputs(camera, points):
+    """Massage (points, K, D, pix_scale) into what the pinhole cv2 PnP solvers expect.
+
+    A fisheye camera's coefficients are k1..k4 of the equidistant model, which
+    cv2.solvePnP and friends would read as the pinhole k1, k2, p1, p2. So
+    undistort with the right model first and hand cv2 normalized points with
+    identity intrinsics and no distortion instead.
+
+    pix_scale converts a threshold in pixels to the units of the returned
+    points, which is 1 for the pinhole path and 1/f for the normalized one.
+
+    Pixels outside the invertible domain of the fisheye model come back as NaN;
+    callers are expected to drop those rows.
+    """
+    K = camera.get_camera_matrix().cpu().detach().numpy()
+
+    if getattr(camera, 'fisheye', False):
+        undistorted = camera.undistort_points(points)
+        undistorted = undistorted.detach().cpu().numpy().reshape(points.shape)
+        focal = 0.5 * (K[0, 0] + K[1, 1])
+        return undistorted, np.eye(3), np.zeros(5), 1.0 / focal
+
+    return points, K, camera.get_distortions().cpu().detach().numpy(), 1.0
+
+
 def fix_rvec(rvec, tvec):
     # https://github.com/opencv/opencv/issues/8813
     T = tvec.ravel()[0]
@@ -500,12 +525,19 @@ class Checkerboard(CalibrationObject):
         n_points = points.size // 2
         points = np.reshape(points, (n_points, 1, 2))
 
-        K = camera.get_camera_matrix().cpu().detach().numpy()
-        D = camera.get_distortions().cpu().detach().numpy()
         obj_points = self.get_object_points()
 
         if points.shape[0] != obj_points.shape[0]:
             return None, None
+
+        points, K, D, pix_scale = pnp_inputs(camera, points)
+
+        # a fisheye undistort returns NaN outside its invertible domain
+        good = np.all(np.isfinite(points), axis=(1, 2))
+        if np.sum(good) < 7:
+            return None, None
+        points = points[good]
+        obj_points = obj_points[good]
 
         try:
             retval, rvec, tvec, inliers = cv2.solvePnPRansac(obj_points,
@@ -513,7 +545,7 @@ class Checkerboard(CalibrationObject):
                                                              K,
                                                              D,
                                                              confidence=0.9,
-                                                             reprojectionError=30)
+                                                             reprojectionError=30 * pix_scale)
             return rvec, tvec
 
         except:
@@ -621,11 +653,14 @@ class CharucoBoard(CalibrationObject):
         if ids is None:
             return [], []
 
-        if camera is None:
+        if camera is None or camera.fisheye:
+            # refineDetectedMarkers has no fisheye variant, and handing it the
+            # equidistant coefficients would have it undistort with the wrong
+            # model. Refinement is optional, so skip the intrinsics instead.
             K = D = None
         else:
-            K = camera.get_camera_matrix()
-            D = camera.get_distortions()
+            K = camera.get_camera_matrix().cpu().detach().numpy()
+            D = camera.get_distortions().cpu().detach().numpy()
 
         if refine:
             detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
@@ -691,8 +726,14 @@ class CharucoBoard(CalibrationObject):
         n_corners = corners.size // 2
         corners = np.reshape(corners, (n_corners, 1, 2))
 
-        K = camera.get_camera_matrix().cpu().detach().numpy()
-        D = camera.get_distortions().cpu().detach().numpy()
+        corners, K, D, _ = pnp_inputs(camera, corners)
+
+        # a fisheye undistort returns NaN outside its invertible domain
+        good = np.all(np.isfinite(corners), axis=(1, 2))
+        if np.sum(good) < 7:
+            return None, None
+        corners = corners[good]
+        ids = np.asarray(ids).reshape(-1, 1)[good]
 
         ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             corners, ids, self.board, K, D, None, None)
