@@ -441,29 +441,91 @@ class Camera(nn.Module):
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
                  name=None,
-                 extra_dist=False):
+                 *,
+                 n_dist=2):
         super().__init__()
 
         self.register_parameter('matrix', nn.Parameter(to_tensor(matrix)))
-        self.register_parameter('dist', nn.Parameter(to_tensor(dist)))
+        self.register_parameter('dist', nn.Parameter(to_tensor(dist).view(-1)))
         self.register_parameter('rvec', nn.Parameter(to_tensor(rvec).view(-1)))
         self.register_parameter('tvec', nn.Parameter(to_tensor(tvec).view(-1)))
-        
+
         # self.set_camera_matrix(matrix)
         # self.set_distortions(dist)
         # self.set_rotation(rvec)
         # self.set_translation(tvec)
-        
+
         self.set_size(size)
         self.set_name(name)
-        if extra_dist:
-            # It used to pick how many distortion terms get_params packed. The
-            # torch path optimizes the dist parameter directly, so nothing reads
-            # it any more.
+
+        # clamp rather than raise here, so a camera built with a short dist and
+        # the default n_dist is not an error; set_n_dist validates strictly
+        self.n_dist = min(int(n_dist), self.dist.shape[0])
+        self._install_dist_mask()
+
+    def _install_dist_mask(self):
+        self.dist.register_hook(self._mask_dist_grad)
+
+    def _mask_dist_grad(self, grad):
+        """Zero the gradient of the distortion coefficients beyond n_dist.
+
+        Running as a hook means the mask applies during backward, before
+        clip_grad_norm_, so frozen coefficients also stop contributing to the
+        gradient norm. Adam then leaves them exactly untouched -- which relies
+        on weight_decay being 0 in bundle_adjust.
+        """
+        n = self.n_dist
+        if n is None or n >= grad.shape[0]:
+            return grad
+        # build the mask from grad at call time, so it survives a
+        # set_distortions() that changes the length of the vector
+        keep = torch.arange(grad.shape[0], device=grad.device) < n
+        return grad * keep.to(grad.dtype)
+
+    def __setstate__(self, state):
+        # Parameter.__deepcopy__ and __reduce_ex__ do not carry backward hooks,
+        # so a deepcopied or unpickled camera would keep n_dist while silently
+        # losing the freezing it stands for. Put the hook back.
+        super().__setstate__(state)
+        self._install_dist_mask()
+
+    def get_n_dist(self):
+        return self.n_dist
+
+    def set_n_dist(self, n_dist):
+        """Set how many distortion coefficients bundle_adjust may move.
+
+        The first n_dist entries of dist are free and the rest keep whatever
+        value they currently hold, so seeding known-good distortions and
+        freezing them works. The layout is [k1, k2, p1, p2, k3] for pinhole and
+        [k1, k2, k3, k4] for fisheye, so 2 means radial only, and 4 is the
+        meaningful step up from it for a pinhole camera.
+
+        This does not freeze the camera matrix: fx, fy, cx, cy are still free in
+        a full bundle adjust. Use only_extrinsics=True for that.
+
+        n_dist never grows on its own, so a later set_distortions() with a
+        longer vector leaves the extra coefficients frozen.
+        """
+        if isinstance(n_dist, bool):
+            raise TypeError("n_dist must be an int, got a bool")
+
+        n_dist = int(n_dist)
+        n_max = self.dist.shape[0]
+        if not 0 <= n_dist <= n_max:
+            raise ValueError(
+                "n_dist must be between 0 and {} for this camera, got {}".format(
+                    n_max, n_dist))
+
+        if n_dist == 3 and n_max == 5:
+            # p1 without p2 pins the decentering axis vertical, which is almost
+            # always a typo for 4
             warnings.warn(
-                'extra_dist is ignored on the torch path; the full distortion '
-                'vector is optimized', DeprecationWarning, stacklevel=2)
-        self.extra_dist = extra_dist
+                'n_dist=3 frees p1 but not p2, which is rarely what you want; '
+                'use 2 for radial only or 4 to include tangential',
+                stacklevel=2)
+
+        self.n_dist = n_dist
 
     def get_dict(self):
         return {
@@ -473,6 +535,7 @@ class Camera(nn.Module):
             'distortions': self.dist.detach().cpu().numpy().tolist(),
             'rotation': self.rvec.detach().cpu().numpy().tolist(),
             'translation': self.tvec.detach().cpu().numpy().tolist(),
+            'n_dist': int(self.n_dist),
         }
 
     def load_dict(self, d):
@@ -482,6 +545,10 @@ class Camera(nn.Module):
         self.set_distortions(d['distortions'])
         self.set_name(d['name'])
         self.set_size(d['size'])
+        # after set_distortions, so its clamp does not eat the loaded value.
+        # A calibration written before n_dist existed gets the default.
+        if 'n_dist' in d:
+            self.set_n_dist(min(int(d['n_dist']), self.dist.shape[0]))
 
     def from_dict(d):
         cam = Camera()
@@ -517,6 +584,9 @@ class Camera(nn.Module):
     def set_distortions(self, dist):
         # self.dist = np.array(dist, dtype='float64').ravel()
         self.dist.data = to_tensor(dist, device=self.dist.device).view(-1)
+        # a shorter vector has to pull n_dist down with it; a longer one does
+        # not push it up, since freeing coefficients should be deliberate
+        self.n_dist = min(self.n_dist, self.dist.shape[0])
 
     def zero_distortions(self):
         # self.dist = self.dist * 0
@@ -569,36 +639,6 @@ class Camera(nn.Module):
         # new_matrix = matrix * scale
         # new_matrix[2, 2] = 1
         # self.set_camera_matrix(new_matrix)
-
-    # def get_params(self, only_extrinsics=False):
-    #     if only_extrinsics:
-    #         params = np.zeros(6, dtype='float64')
-    #     else:
-    #         params = np.zeros(8 + self.extra_dist, dtype='float64')
-    #     params[0:3] = self.get_rotation()
-    #     params[3:6] = self.get_translation()
-    #     if only_extrinsics:
-    #         return params
-    #     params[6] = self.get_focal_length()
-    #     dist = self.get_distortions()
-    #     params[7] = dist[0]
-    #     if self.extra_dist:
-    #         params[8] = dist[1]
-    #     return params
-
-    # def set_params(self, params, only_extrinsics=False):
-    #     self.set_rotation(params[0:3])
-    #     self.set_translation(params[3:6])
-    #     if only_extrinsics:
-    #         return
-
-    #     self.set_focal_length(params[6])
-
-    #     dist = np.zeros(5, dtype='float64')
-    #     dist[0] = params[7]
-    #     if self.extra_dist:
-    #         dist[1] = params[8]
-    #     self.set_distortions(dist)
 
     def distort_points(self, points):
         # shape = points.shape
@@ -662,21 +702,16 @@ class Camera(nn.Module):
         return p2d - proj
 
     def copy(self):
-        new_cam = Camera(name=self.name, size=self.size, extra_dist=self.extra_dist)
+        # type(self) so subclasses copy as themselves, and an explicit dist of
+        # the right length because load_state_dict is strict about shapes -- the
+        # default would break any camera whose dist is not 5 long.
+        new_cam = type(self)(name=self.name, size=self.size,
+                             dist=np.zeros(self.dist.shape[0]),
+                             n_dist=self.n_dist)
         new_cam.load_state_dict(self.state_dict())
         # load_state_dict copies values in place and does not change device, so a
         # copy of a cuda camera would otherwise come back on CPU. Preserve device.
         return new_cam.to(self.matrix.device)
-
-    # def copy(self):
-    #     return \
-    #         Camera(matrix=self.get_camera_matrix().copy(),
-    #                dist=self.get_distortions().copy(),
-    #                size=self.get_size(),
-    #                rvec=self.get_rotation().copy(),
-    #                tvec=self.get_translation().copy(),
-    #                name=self.get_name(),
-    #                extra_dist=self.extra_dist)
 
     def is_point_visible(self, p3d, margin=0):
         """
@@ -832,10 +867,11 @@ class FisheyeCamera(Camera):
                  rvec=np.zeros(3),
                  tvec=np.zeros(3),
                  name=None,
-                 extra_dist=False):
+                 *,
+                 n_dist=2):
         super().__init__(matrix=matrix, dist=dist, size=size,
                          rvec=rvec, tvec=tvec, name=name,
-                         extra_dist=extra_dist)
+                         n_dist=n_dist)
 
     def from_dict(d):
         cam = FisheyeCamera()
@@ -984,11 +1020,10 @@ class FisheyeCamera(Camera):
 
         return torch.stack(rows, dim=1)
 
-    def copy(self):
-        new_cam = FisheyeCamera(name=self.name, size=self.size,
-                                extra_dist=self.extra_dist)
-        new_cam.load_state_dict(self.state_dict())
-        return new_cam.to(self.matrix.device)
+
+# cv2.fisheye has no CALIB_FIX_K0, the flags start at k1
+_FISHEYE_FIX_K = [cv2.fisheye.CALIB_FIX_K1, cv2.fisheye.CALIB_FIX_K2,
+                  cv2.fisheye.CALIB_FIX_K3, cv2.fisheye.CALIB_FIX_K4]
 
 
 def init_camera_intrinsics(camera, objp, imgp, size):
@@ -999,20 +1034,37 @@ def init_camera_intrinsics(camera, objp, imgp, size):
     path runs a full cv2.fisheye.calibrate, which also gives usable k1..k4 --
     starting a fisheye camera at zero distortion throws away the equidistant
     term the model exists to capture.
+
+    Only the first n_dist coefficients are seeded; the rest keep the values they
+    already had. Note that with n_dist=0 the fisheye fit is done with every
+    coefficient pinned to zero, which will not reproduce a camera whose frozen
+    coefficients are non-zero -- pass init_intrinsics=False for that.
     """
+    n_dist = camera.get_n_dist()
+    # cv2 overwrites the coefficients it is told to fix with 0 rather than
+    # holding them where they were, so keep a copy to restore afterwards
+    old_dist = camera.get_distortions().detach().cpu().numpy().copy()
+
+    def restore_frozen(new_dist):
+        new_dist = np.asarray(new_dist, dtype='float64').ravel()
+        keep = min(len(new_dist), len(old_dist))
+        new_dist[n_dist:keep] = old_dist[n_dist:keep]
+        return new_dist
+
     if camera.fisheye:
         # cv2.fisheye.calibrate is picky: it wants (1, N, 3) / (1, N, 2) float64
         obj64 = [np.asarray(o, dtype='float64').reshape(1, -1, 3) for o in objp]
         img64 = [np.asarray(i, dtype='float64').reshape(1, -1, 2) for i in imgp]
         K = np.eye(3)
         D = np.zeros((4, 1))
+        flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                 | cv2.fisheye.CALIB_FIX_SKEW)
+        for fix in _FISHEYE_FIX_K[n_dist:]:
+            flags |= fix
         try:
-            cv2.fisheye.calibrate(
-                obj64, img64, tuple(size), K, D,
-                flags=(cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
-                       | cv2.fisheye.CALIB_FIX_SKEW))
+            cv2.fisheye.calibrate(obj64, img64, tuple(size), K, D, flags=flags)
             camera.set_camera_matrix(K.copy())
-            camera.set_distortions(D.ravel().copy())
+            camera.set_distortions(restore_frozen(D))
             return
         except cv2.error:
             # degenerate views, fall through to the pinhole seed
@@ -1021,7 +1073,9 @@ def init_camera_intrinsics(camera, objp, imgp, size):
 
     matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
     camera.set_camera_matrix(matrix.copy())
-    camera.zero_distortions()
+    # initCameraMatrix2D estimates no distortion, so the free coefficients start
+    # at zero; the frozen ones stay where they were
+    camera.set_distortions(restore_frozen(np.zeros_like(old_dist)))
 
 
 class CameraGroup(nn.Module):
@@ -1575,6 +1629,9 @@ class CameraGroup(nn.Module):
 
         all_params = cam_params + list(params.values())
 
+        # weight_decay=0 is load-bearing for Camera.n_dist: a frozen distortion
+        # coefficient gets a zero gradient, and Adam then leaves it exactly
+        # alone, but any weight decay would shrink it every step regardless.
         optimizer = optim.Adam(param_groups, weight_decay=0, amsgrad=True)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -2069,6 +2126,15 @@ class CameraGroup(nn.Module):
         for cam, name in zip(self.cameras, names):
             cam.set_name(name)
 
+    def set_n_dist(self, n_dist):
+        """Set how many distortion coefficients bundle_adjust may move, on
+        every camera. See Camera.set_n_dist."""
+        for cam in self.cameras:
+            cam.set_n_dist(n_dist)
+
+    def get_n_dists(self):
+        return [cam.get_n_dist() for cam in self.cameras]
+
     def average_error(self, p2ds, median=False):
         p3ds = self.triangulate(p2ds)
         errors = self.reprojection_error(p3ds, p2ds, mean=True)
@@ -2183,13 +2249,13 @@ class CameraGroup(nn.Module):
             cameras.append(cam)
         return CameraGroup(cameras)
 
-    def from_names(names, fisheye=False):
+    def from_names(names, fisheye=False, n_dist=2):
         cameras = []
         for name in names:
             if fisheye:
-                cam = FisheyeCamera(name=name)
+                cam = FisheyeCamera(name=name, n_dist=n_dist)
             else:
-                cam = Camera(name=name)
+                cam = Camera(name=name, n_dist=n_dist)
             cameras.append(cam)
         return CameraGroup(cameras)
 
