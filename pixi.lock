@@ -679,7 +679,7 @@ packages:
 - pypi: ./
   name: aniposelib
   requires_dist:
-  - opencv-contrib-python>=4.7.0.68
+  - opencv-contrib-python>=4.7.0.68,<5
   - numba
   - pandas
   - numpy

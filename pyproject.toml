@@ -19,7 +19,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Recognition"
 ]
 dependencies = [
-    "opencv-contrib-python>=4.7.0.68",
+    # OpenCV 5 moved the cv2.fisheye.CALIB_* flags to the top-level cv2 namespace,
+    # which breaks the fisheye intrinsics path in cameras.py at import time.
+    "opencv-contrib-python>=4.7.0.68,<5",
     "numba",
     "pandas",
     "numpy",
