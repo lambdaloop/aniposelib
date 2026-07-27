@@ -423,6 +423,9 @@ def make_M_torch(rvec, tvec):
 
 
 class Camera(nn.Module):
+    # lets boards.py dispatch on the projection model without importing this module
+    fisheye = False
+
     def __init__(self,
                  matrix=np.eye(3),
                  dist=np.zeros(5),
@@ -799,6 +802,14 @@ class Camera(nn.Module):
 
 
 class FisheyeCamera(Camera):
+    """OpenCV fisheye (equidistant) camera, differentiable end to end.
+
+    Distortions are k1..k4 of the equidistant model, so the vector is 4 long
+    rather than the 5 of the Brown-Conrady pinhole model.
+    """
+
+    fisheye = True
+
     def __init__(self,
                  matrix=np.eye(3),
                  dist=np.zeros(4),
@@ -807,13 +818,9 @@ class FisheyeCamera(Camera):
                  tvec=np.zeros(3),
                  name=None,
                  extra_dist=False):
-        self.set_camera_matrix(matrix)
-        self.set_distortions(dist)
-        self.set_size(size)
-        self.set_rotation(rvec)
-        self.set_translation(tvec)
-        self.set_name(name)
-        self.extra_dist = extra_dist
+        super().__init__(matrix=matrix, dist=dist, size=size,
+                         rvec=rvec, tvec=tvec, name=name,
+                         extra_dist=extra_dist)
 
     def from_dict(d):
         cam = FisheyeCamera()
@@ -825,76 +832,149 @@ class FisheyeCamera(Camera):
         d['fisheye'] = True
         return d
 
+    def project(self, points):
+        points = to_tensor(points, device=self.matrix.device).reshape(-1, 3)
+        return project_points_fisheye(points, self.get_extrinsics_mat(),
+                                      self.matrix, self.dist)
+
     def distort_points(self, points):
-        shape = points.shape
-        points = points.reshape(-1, 1, 2)
-        new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
-        out, _ = cv2.fisheye.projectPoints(new_points,
-                                           np.zeros(3), np.zeros(3),
-                                           self.matrix.astype('float64'),
-                                           self.dist.astype('float64'))
-        return out.reshape(shape)
+        points = to_homogeneous(
+            to_tensor(points, device=self.matrix.device).reshape(-1, 2))
+        eye = torch.eye(4, dtype=torch.float64, device=self.matrix.device)
+        return project_points_fisheye(points, eye, self.matrix, self.dist)
+
+    def _solve_theta(self, points, n_iter=20, eps=FISHEYE_EPS, tol=1e-8):
+        """Invert the equidistant model for a set of pixel coordinates.
+
+        Returns (theta, x, y, theta_d, r_ok, ok), all flattened to (K,):
+          theta    incidence angle
+          x, y     normalized coordinates, sanitized to 0 where the input was not finite
+          theta_d  radius of (x, y), sanitized to 1 where r_ok is False
+          r_ok     radius above eps, i.e. not the principal point
+          ok       Newton converged and the point is inside the invertible domain
+        """
+        t_points = to_tensor(points, device=self.matrix.device).reshape(-1, 2)
+        fx, fy = self.matrix[0, 0], self.matrix[1, 1]
+        cx, cy = self.matrix[0, 2], self.matrix[1, 2]
+        k1, k2, k3, k4 = _fisheye_dist_terms(self.dist)
+
+        x = (t_points[:, 0] - cx) / fx
+        y = (t_points[:, 1] - cy) / fy
+
+        finite = torch.isfinite(x) & torch.isfinite(y)
+        x = torch.where(finite, x, torch.zeros_like(x))
+        y = torch.where(finite, y, torch.zeros_like(y))
+
+        td2 = x * x + y * y
+        r_ok = td2 >= eps * eps
+        theta_d = torch.sqrt(torch.where(r_ok, td2, torch.ones_like(td2)))
+        theta_d_c = torch.clamp(theta_d, max=_HALF_PI)  # as cv2 does
+
+        theta = theta_d_c.clone()
+        for _ in range(n_iter):
+            th2 = theta * theta
+            th4 = th2 * th2
+            th6 = th4 * th2
+            th8 = th4 * th4
+            f = theta * (1 + k1 * th2 + k2 * th4 + k3 * th6 + k4 * th8) - theta_d_c
+            fp = 1 + 3 * k1 * th2 + 5 * k2 * th4 + 7 * k3 * th6 + 9 * k4 * th8
+            fp = torch.where(torch.abs(fp) > eps, fp, torch.ones_like(fp))
+            theta = theta - f / fp
+
+        th2 = theta * theta
+        th4 = th2 * th2
+        th6 = th4 * th2
+        th8 = th4 * th4
+        resid = torch.abs(
+            theta * (1 + k1 * th2 + k2 * th4 + k3 * th6 + k4 * th8) - theta_d_c)
+
+        # With a negative k1 the forward model stops being monotone, and a
+        # theta_d past its maximum has no solution at all. cv2 writes -1000000
+        # there; we say NaN, because everything downstream reads NaN as missing
+        # and would happily triangulate a finite -1000000.
+        ok = (finite & torch.isfinite(theta) & (theta >= 0)
+              & (resid <= tol) & (theta_d <= _HALF_PI))
+
+        return theta, x, y, theta_d, r_ok, ok
 
     def undistort_points(self, points):
-        shape = points.shape
-        points = points.reshape(-1, 1, 2)
-        out = cv2.fisheye.undistortPoints(points.astype('float64'),
-                                          self.matrix.astype('float64'),
-                                          self.dist.astype('float64'))
+        shape = to_tensor(points, device=self.matrix.device).shape
+        theta, x, y, theta_d, r_ok, ok = self._solve_theta(points)
+
+        theta_c = torch.clamp(theta, max=_HALF_PI - 1e-9)  # keep tan() finite
+        # scale tends to 1 as the radius tends to 0
+        scale = torch.where(r_ok, torch.tan(theta_c) / theta_d,
+                            torch.ones_like(theta))
+        out = torch.stack([scale * x, scale * y], dim=-1)
+
+        good = ok & (theta < _HALF_PI)
+        out = torch.where(good[:, None], out, torch.full_like(out, float('nan')))
         return out.reshape(shape)
 
-    def project(self, points):
-        points = points.reshape(-1, 1, 3)
-        out, _ = cv2.fisheye.projectPoints(points,
-                                           self.rvec, self.tvec,
-                                           self.matrix.astype('float64'),
-                                           self.dist.astype('float64'))
-        return out
+    def get_camera_rays(self):
+        """Same contract as Camera.get_camera_rays.
 
-    # def set_params(self, params, only_extrinsics):
-    #     self.set_rotation(params[0:3])
-    #     self.set_translation(params[3:6])
+        Overridden because the base version lifts the normalized point to z=1,
+        which needs tan(theta) and so loses all precision as theta approaches 90
+        degrees, and because it would propagate the NaN we emit for pixels
+        outside the invertible domain. Building the direction from theta gives a
+        unit vector directly, for any field of view.
+        """
+        if self.get_size() is None:
+            raise ValueError("Camera must have size set")
 
-    #     if only_extrinsics:
-    #         return
-        
-    #     self.set_focal_length(params[6])
+        w, h = self.get_size()
+        img_points = np.array([
+            [0, 0],           # top left
+            [w-1, 0],         # top right
+            [w-1, h-1],       # bottom right
+            [0, h-1],         # bottom left
+            [w/2, h/2]        # center
+        ], dtype='float64')
 
-    #     dist = np.zeros(4, dtype='float64')
-    #     dist[0] = params[7]
-    #     if self.extra_dist:
-    #         dist[1] = params[8]
-    #     # dist[2] = params[9]
-    #     # dist[3] = params[10]
-    #     self.set_distortions(dist)
+        theta, x, y, theta_d, r_ok, ok = self._solve_theta(img_points)
+        # outside the invertible domain fall back to the pure equidistant angle
+        # rather than NaN, which would poison get_point_cloud's quantiles
+        theta = torch.where(ok, theta, torch.clamp(theta_d, max=_HALF_PI))
 
-    # def get_params(self, only_extrinsics=False):
-    #     if only_extrinsics:
-    #         params = np.zeros(6, dtype='float64')
-    #     else:
-    #         params = np.zeros(8+self.extra_dist, dtype='float64')
-    #     params[0:3] = self.get_rotation()
-    #     params[3:6] = self.get_translation()
-    #     if only_extrinsics:
-    #         return params
-    #     params[6] = self.get_focal_length()
-    #     dist = self.get_distortions()
-    #     params[7] = dist[0]
-    #     if self.extra_dist:
-    #         params[8] = dist[1]
-    #     # params[9] = dist[2]
-    #     # params[10] = dist[3]
-    #     return params
+        ux = torch.where(r_ok, x / theta_d, torch.zeros_like(x))
+        uy = torch.where(r_ok, y / theta_d, torch.zeros_like(y))
+        st, ct = torch.sin(theta), torch.cos(theta)
+        rays_camera = torch.stack([st * ux, st * uy, ct], dim=-1)  # already unit
+
+        R = rodrigues(self.rvec)
+        center = self.get_center_world()
+        directions = (R.T @ rays_camera.T).T
+
+        return [Ray(origin=center, direction=d) for d in directions]
+
+    def projection_sensitivity(self, p):
+        """Same contract as Camera.projection_sensitivity, by autograd.
+
+        The base version is a pinhole Jacobian that ignores distortion
+        altogether, which for an equidistant lens is wrong by d(theta_d)/dr.
+        """
+        p = to_tensor(p, device=self.matrix.device).reshape(-1, 3)
+        ext = self.get_extrinsics_mat().detach()
+        matrix = self.matrix.detach()
+        dist = self.dist.detach()
+
+        with torch.enable_grad():
+            p = p.detach().requires_grad_(True)
+            out = project_points_fisheye(p, ext, matrix, dist)
+            # each output row depends only on its own input row, so one backward
+            # pass per output column gives all the per-row gradients
+            rows = [torch.autograd.grad(out[:, i].sum(), p, retain_graph=(i == 0))[0]
+                    for i in range(2)]
+
+        return torch.stack(rows, dim=1)
 
     def copy(self):
-        return FisheyeCamera(
-            matrix=self.get_camera_matrix().copy(),
-            dist=self.get_distortions().copy(),
-            size=self.get_size(),
-            rvec=self.get_rotation().copy(),
-            tvec=self.get_translation().copy(),
-            name=self.get_name(),
-            extra_dist=self.extra_dist)
+        new_cam = FisheyeCamera(name=self.name, size=self.size,
+                                extra_dist=self.extra_dist)
+        new_cam.load_state_dict(self.state_dict())
+        return new_cam.to(self.matrix.device)
+
 
 class CameraGroup(nn.Module):
     def __init__(self, cameras, metadata={}):
