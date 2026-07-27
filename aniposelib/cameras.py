@@ -12,6 +12,7 @@ import itertools
 from tqdm import trange
 from pprint import pprint
 import time
+import warnings
 
 import torch
 import torch.nn as nn
@@ -347,8 +348,15 @@ def project_points(p3d, ext, matrix, dist):
 
     p2d_dist = kscale[:, None] * p2d_proj_raw + p1_p2_add
 
-    p2d_raw = torch.matmul(to_homogeneous(p2d_dist), matrix.T)
-    p2d = from_homogeneous(p2d_raw)
+    # Index the intrinsics rather than multiplying by the full 3x3. Going
+    # through the matrix makes matrix[2,0] and matrix[2,1] real projective
+    # degrees of freedom, and bundle_adjust hands Adam the whole tensor, so
+    # they drift and the result stops being a pinhole camera at all.
+    # cv2.projectPoints ignores the skew too, so nothing is lost.
+    fx, fy = matrix[0, 0], matrix[1, 1]
+    cx, cy = matrix[0, 2], matrix[1, 2]
+    p2d = torch.stack([fx * p2d_dist[..., 0] + cx,
+                       fy * p2d_dist[..., 1] + cy], dim=-1)
 
     #TODO: handle offset
 
@@ -448,6 +456,13 @@ class Camera(nn.Module):
         
         self.set_size(size)
         self.set_name(name)
+        if extra_dist:
+            # It used to pick how many distortion terms get_params packed. The
+            # torch path optimizes the dist parameter directly, so nothing reads
+            # it any more.
+            warnings.warn(
+                'extra_dist is ignored on the torch path; the full distortion '
+                'vector is optimized', DeprecationWarning, stacklevel=2)
         self.extra_dist = extra_dist
 
     def get_dict(self):
