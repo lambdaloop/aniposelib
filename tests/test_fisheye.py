@@ -227,7 +227,8 @@ def test_fisheye_copy():
     cg = CameraGroup.load(FISHEYE_TOML)
     cam = cg.cameras[3]
 
-    # Camera.copy hardcodes a 5 element dist, so an unoverridden copy raises here
+    # copy() has to build the new camera with a 4 element dist, since
+    # load_state_dict is strict about shapes
     dup = cam.copy()
     assert isinstance(dup, FisheyeCamera)
     assert dup.dist.shape == (4,)
