@@ -11,6 +11,12 @@ from aniposelib.cameras import Camera, CameraGroup
 
 import cv2
 
+
+def to_np(x):
+    """The torch camera model returns tensors that still carry grad."""
+    return x.detach().cpu().numpy() if hasattr(x, 'detach') else np.asarray(x)
+
+
 @given(st.integers())
 def test_is_integer(n):
     assert isinstance(n, int)
@@ -18,27 +24,28 @@ def test_is_integer(n):
 @given(
     arrays(np.float32, (20,3),
            elements=st.floats(
-               min_value=-1e10, max_value=1e10,
-               allow_nan=False, allow_infinity=False))
+               min_value=-1e10, max_value=1e10, width=32,
+               allow_nan=False, allow_infinity=False, allow_subnormal=False))
 )
 def test_project_error(p3d):
     """The reprojection error should be 0 when projecting any 3d points"""
     cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
     p2d = cgroup.project(p3d)
-    err = cgroup.reprojection_error(p3d, p2d)
+    err = to_np(cgroup.reprojection_error(p3d, p2d))
     assert np.allclose(err, 0), err
 
 
 @given(
     arrays(np.float32, (20,3),
-           elements=st.floats(allow_nan=True, allow_infinity=True))
+           elements=st.floats(width=32, allow_nan=True, allow_infinity=True,
+                              allow_subnormal=False))
 )
 @pytest.mark.filterwarnings("ignore:overflow")
 def test_project_nan(p3d):
     """project should handle nans and infs gracefully"""
     cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
     print(p3d)
-    p2d = cgroup.project(p3d)
+    p2d = to_np(cgroup.project(p3d))
 
     finite3d = np.all(np.isfinite(p3d), axis=1)
 
@@ -54,16 +61,16 @@ def test_triangulation_1():
     projecting then triangulating recovers 3d points
     """
     cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
-    p3d = np.vstack([cgroup.get_translations() * 0.5,
-                     cgroup.get_translations() * 0.3])
+    tvecs = to_np(cgroup.get_translations())
+    p3d = np.vstack([tvecs * 0.5, tvecs * 0.3])
     p2d = cgroup.project(p3d)
 
     bad = ~cgroup.is_point_visible(p3d)
     p2d[bad] = np.nan
 
-    p3d_tri = cgroup.triangulate(p2d)
+    p3d_tri = to_np(cgroup.triangulate(p2d))
     # triangulated is close to true 3d
-    assert np.allclose(p3d_tri, p3d)
+    assert np.allclose(p3d_tri, to_np(p3d))
 
 
 def test_triangulation_point_cloud():
@@ -74,12 +81,13 @@ def test_triangulation_point_cloud():
     bad = ~cgroup.is_point_visible(p3d)
     p2d[bad] = np.nan
 
-    p3d_tri = cgroup.triangulate(p2d, fast=False)
+    p3d_tri = cgroup.triangulate(p2d)
 
-    reprojerr = cgroup.reprojection_error(p3d_tri, p2d, mean=True)
+    reprojerr = to_np(cgroup.reprojection_error(p3d_tri, p2d, mean=True))
+    p3d_tri = to_np(p3d_tri)
     p3d_tri[reprojerr > 3] = np.nan # triangulation failed
 
-    err = np.linalg.norm(p3d_tri - p3d, axis=1)
+    err = np.linalg.norm(p3d_tri - to_np(p3d), axis=1)
     err = err[np.isfinite(err)]
 
     # triangulated is close to true 3d
@@ -89,8 +97,9 @@ def test_triangulation_point_cloud():
 
 @given(
     arrays(np.float32, (3,),
-           elements=st.floats(min_value=-1, max_value=1,
-                              allow_nan=False, allow_infinity=False)),
+           elements=st.floats(min_value=-1, max_value=1, width=32,
+                              allow_nan=False, allow_infinity=False,
+                              allow_subnormal=False)),
 
 )
 def test_projection_sensitivity(p):
@@ -110,18 +119,18 @@ def test_projection_sensitivity(p):
     cam = Camera(matrix=K, rvec=rvec, tvec=tvec, dist=dist)
     
     # Analytical Jacobian
-    J_analytical = cam.projection_sensitivity(p[None])[0]
-    
+    J_analytical = to_np(cam.projection_sensitivity(p[None])[0])
+
     # Numerical Jacobian using finite differences
     epsilon = 1e-5
     J_numerical = np.zeros((2, 3))
-    
-    pixel_center = cam.project(p)
-    
+
+    pixel_center = to_np(cam.project(p)).ravel()
+
     for i in range(3):
         p_plus = p.copy()
         p_plus[i] += epsilon
-        pixel_plus = cam.project(p_plus)
+        pixel_plus = to_np(cam.project(p_plus)).ravel()
         J_numerical[:, i] = (pixel_plus - pixel_center) / epsilon
 
     # don't try to test weird analytical edge cases
