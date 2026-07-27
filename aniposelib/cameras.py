@@ -586,8 +586,10 @@ class Camera(nn.Module):
     def copy(self):
         new_cam = Camera(name=self.name, size=self.size, extra_dist=self.extra_dist)
         new_cam.load_state_dict(self.state_dict())
-        return new_cam
-    
+        # load_state_dict copies values in place and does not change device, so a
+        # copy of a cuda camera would otherwise come back on CPU. Preserve device.
+        return new_cam.to(self.matrix.device)
+
     # def copy(self):
     #     return \
     #         Camera(matrix=self.get_camera_matrix().copy(),
@@ -1538,6 +1540,7 @@ class CameraGroup(nn.Module):
                      reproj_error_threshold=15, reproj_loss='soft_l1',
                      n_deriv_smooth=1, scores=None, verbose=False,
                      n_fixed=0,
+                     max_lr=0.1,
                      n_iters=800):
         """
         Take in an array of 2D points of shape CxNxJx2,
@@ -1562,6 +1565,7 @@ class CameraGroup(nn.Module):
             )
 
         n_cams, n_frames, n_joints, _ = points.shape
+        device = next(self.parameters()).device
         constraints = np.array(constraints)
         constraints_weak = np.array(constraints_weak)
 
@@ -1579,22 +1583,30 @@ class CameraGroup(nn.Module):
         t1 = time.time()
 
         params = self._initialize_params_triangulation(
-            p3ds_intp, constraints, constraints_weak)
+            p3ds_intp, constraints, constraints_weak, device=device)
 
         if n_fixed > 0:
-            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed])
+            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed], device=device)
         else:
             p3ds_fixed = None
 
-        points_tensor = to_tensor(points)
-            
-        all_params = list(params.values())
-        optimizer = optim.Adam(all_params, lr=1e-2, weight_decay=0, fused=True)
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5.0, total_steps=n_iters,
-                                                  pct_start=0.2)
+        points_tensor = to_tensor(points, device=device)
+        scores = to_tensor(scores, device=device)
 
-        ftol = 1e-3
-        old_loss = torch.inf
+        all_params = list(params.values())
+        optimizer = optim.Adam(all_params, lr=1e-2, weight_decay=0, amsgrad=True)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=max_lr, total_steps=n_iters,
+            pct_start=0.2, anneal_strategy='cos', final_div_factor=5000.0)
+
+        # Best-params tracking is done entirely on-GPU. Calling `loss.item()` every
+        # iteration forces a CPU<->GPU sync that serializes the loop and leaves the GPU
+        # idle between tiny kernels (nvtop shows ~0% util). Instead we keep best_loss as a
+        # tensor and update best_state branchlessly with torch.where, so nothing is read
+        # back to the host inside the loop and the iterations can pipeline.
+        best_loss = torch.tensor(float('inf'), device=device, dtype=torch.float64)
+        best_state = {k: v.detach().clone() for k, v in params.items()}
+
         for i in range(n_iters):
             optimizer.zero_grad()
             loss = self._error_fun_triangulation(params, points_tensor,
@@ -1609,17 +1621,32 @@ class CameraGroup(nn.Module):
                                                  n_deriv_smooth=n_deriv_smooth,
                                                  p3ds_fixed=p3ds_fixed
                                                  )
-            if verbose and i % 20 == 0:
-                print("iter: {} \t loss: {:.3f}\t delta: {:.4f}".format(i, loss.item(), old_loss - loss.item()))
 
-            old_loss = loss.item()
+            # snapshot best params before stepping; pure GPU ops, no host sync
+            with torch.no_grad():
+                improved = loss < best_loss
+                best_loss = torch.where(improved, loss.detach(), best_loss)
+                for k, v in params.items():
+                    best_state[k] = torch.where(improved, v.detach(), best_state[k])
+
+            if verbose and i % 20 == 0:
+                # opt-in debug print; the .item() here only runs when verbose is set
+                print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
             optimizer.step()
             scheduler.step()
+
+        # Restore best parameters (GPU copy, no host sync)
+        with torch.no_grad():
+            for k, v in params.items():
+                v.data.copy_(best_state[k])
 
         t2 = time.time()
 
         if verbose:
+            print("iter: {} \t best loss: {:.3f}".format(i, best_loss.item()))
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
         return params['p3d'].detach()
@@ -1787,7 +1814,7 @@ class CameraGroup(nn.Module):
  
 
 
-    def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[]):
+    def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[], device=None):
         joint_lengths = np.empty(len(constraints), dtype='float64')
         joint_lengths_weak = np.empty(len(constraints_weak), dtype='float64')
 
@@ -1813,9 +1840,9 @@ class CameraGroup(nn.Module):
         joint_lengths_weak[joint_lengths_weak > med+mad*5] = med
 
         params = {
-            'p3d': nn.Parameter(to_tensor(p3ds)),
-            'joint_lengths': nn.Parameter(to_tensor(joint_lengths)),
-            'joint_lengths_weak': nn.Parameter(to_tensor(joint_lengths_weak))
+            'p3d': nn.Parameter(to_tensor(p3ds, device=device)),
+            'joint_lengths': nn.Parameter(to_tensor(joint_lengths, device=device)),
+            'joint_lengths_weak': nn.Parameter(to_tensor(joint_lengths_weak, device=device))
         }
 
         return params
