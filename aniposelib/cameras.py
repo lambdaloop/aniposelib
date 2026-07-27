@@ -354,6 +354,66 @@ def project_points(p3d, ext, matrix, dist):
 
     return p2d
 
+FISHEYE_EPS = 1e-12
+_HALF_PI = float(np.pi / 2)
+
+
+def _fisheye_dist_terms(dist):
+    """k1..k4 from a distortion vector; pads short vectors, ignores extra terms."""
+    if dist.shape[0] < 4:
+        pad = torch.zeros(4 - dist.shape[0], dtype=dist.dtype, device=dist.device)
+        dist = torch.cat([dist, pad])
+    return dist[0], dist[1], dist[2], dist[3]
+
+
+def project_points_fisheye(p3d, ext, matrix, dist, eps=FISHEYE_EPS):
+    """Differentiable OpenCV fisheye (equidistant) projection.
+
+    Only matrix[0,0], [1,1], [0,2], [1,2] are read. cv2.fisheye ignores the skew
+    too (its alpha is a separate argument), and indexing keeps the unused entries
+    out of the autograd graph, so bundle_adjust cannot drift them away from the
+    0, 0, 0, 1 that makes a camera matrix a camera matrix.
+
+    NaN and inf rows pass through as NaN, elementwise, as triangulate expects.
+    """
+    # Sanitize the input before doing any arithmetic on it. Masking only the
+    # output leaves the values finite but the *gradients* NaN, since the
+    # torch.where backward computes 0 * NaN = NaN on matrix / rvec / tvec.
+    bad = ~torch.isfinite(p3d).all(dim=-1)
+    p3d = torch.where(bad[..., None], torch.zeros_like(p3d), p3d)
+
+    p_cam = torch.matmul(to_homogeneous(p3d), ext.T)[..., :3]
+    x, y, z = p_cam[..., 0], p_cam[..., 1], p_cam[..., 2]
+
+    # cv2 substitutes z = 1 when z underflows
+    z_safe = torch.where(torch.abs(z) >= eps, z, torch.ones_like(z))
+    a, b = x / z_safe, y / z_safe
+
+    r2 = a * a + b * b
+    r_ok = r2 >= eps * eps
+    # guard the sqrt as well, its derivative is infinite at r2 == 0
+    r = torch.sqrt(torch.where(r_ok, r2, torch.ones_like(r2)))
+
+    theta = torch.atan(r)
+    th2 = theta * theta
+    th4 = th2 * th2
+    th6 = th4 * th2
+    th8 = th4 * th4
+    k1, k2, k3, k4 = _fisheye_dist_terms(dist)
+    theta_d = theta * (1 + k1 * th2 + k2 * th4 + k3 * th6 + k4 * th8)
+
+    # theta_d / r tends to 1 as r tends to 0, with zero derivative, so the
+    # constant branch is the exact value and the exact gradient
+    scale = torch.where(r_ok, theta_d / r, torch.ones_like(r))
+
+    fx, fy = matrix[0, 0], matrix[1, 1]
+    cx, cy = matrix[0, 2], matrix[1, 2]
+    p2d = torch.stack([fx * (scale * a) + cx,
+                       fy * (scale * b) + cy], dim=-1)
+
+    return torch.where(bad[..., None], torch.full_like(p2d, float('nan')), p2d)
+
+
 def make_M_torch(rvec, tvec):
     R = rodrigues(rvec)
     M = torch.eye(4, device=rvec.device, dtype=rvec.dtype)
