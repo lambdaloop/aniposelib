@@ -1,12 +1,14 @@
 import cv2
 import numpy as np
-from copy import copy
+from copy import copy, deepcopy
+from contextlib import contextmanager
 from scipy.sparse import lil_matrix, dok_matrix
 from scipy.linalg import inv
 from scipy import optimize
 from scipy import signal
-from numba import jit
 from collections import defaultdict, Counter, namedtuple
+import io
+import re
 import toml
 import itertools
 from tqdm import trange
@@ -24,6 +26,31 @@ from aniposelib.boards import merge_rows, extract_points, \
     extract_rtvecs, get_video_params
 from aniposelib.utils import get_initial_extrinsics, make_M, get_rtvec, \
     get_connections
+from aniposelib._types import returns_like_input
+from aniposelib.params import DEFAULT_FREE_INTRINSICS, validate_intrinsics, matrix_mask
+
+
+class CameraOrderWarning(UserWarning):
+    """CameraGroup.load found camera keys whose numeric order differs from their lexical order
+    (aniposelib <= 0.9 sorted them lexically, so cam_10 came before cam_2), or duplicate names."""
+
+
+def _as_rng(rng):
+    """np.random.Generator from a Generator, an int seed or None (fresh entropy).
+    Never touches the global numpy RNG."""
+    if isinstance(rng, np.random.Generator):
+        return rng
+    if isinstance(rng, np.random.RandomState):
+        return np.random.default_rng(rng.randint(0, 2**31 - 1))
+    return np.random.default_rng(rng)
+
+
+def _check_kwargs(fname, kwargs, allowed):
+    """Raise TypeError naming any keyword not accepted by `allowed` (a set of names)."""
+    bad = sorted(set(kwargs) - set(allowed))
+    if bad:
+        raise TypeError("{}() got unexpected keyword argument(s) {}; valid options are {}".format(
+            fname, ', '.join(repr(b) for b in bad), sorted(allowed)))
 
 # @jit(nopython=True, parallel=True)
 # @torch.compile
@@ -117,7 +144,8 @@ def subset_extra(extra, ixs):
     }
     return new_extra
 
-def resample_points_extra(imgp, extra, n_samp=25):
+def resample_points_extra(imgp, extra, n_samp=25, rng=None):
+    rng = _as_rng(rng)
     n_cams, n_points, _ = imgp.shape
     ids = remap_ids(extra['ids'])
     n_ids = np.max(ids)+1
@@ -127,7 +155,7 @@ def resample_points_extra(imgp, extra, n_samp=25):
     cam_counts = np.zeros((n_ids, n_cams), dtype='int64')
     for idnum in range(n_ids):
         cam_counts[idnum] = np.sum(good[:, ids == idnum], axis=1)
-    cam_counts_random = cam_counts + np.random.random(size=cam_counts.shape)
+    cam_counts_random = cam_counts + rng.random(size=cam_counts.shape)
     best_boards = np.argsort(-cam_counts_random, axis=0)
 
     cam_totals = np.zeros(n_cams, dtype='int64')
@@ -146,7 +174,9 @@ def resample_points_extra(imgp, extra, n_samp=25):
     extra = subset_extra(extra, final_ixs)
     return newp, extra
 
-def resample_points(imgp, extra=None, n_samp=25):
+def resample_points(imgp, extra=None, n_samp=25, rng=None):
+    """Subsample points seen by >= 2 cameras (weighted towards points seen by many cameras).
+    `rng`: np.random.Generator, int seed or None (fresh entropy); the global RNG is not used."""
     n_cams = imgp.shape[0]
     n_points = imgp.shape[1]
     good = ~np.isnan(imgp[:, :, 0])
@@ -163,12 +193,13 @@ def resample_points(imgp, extra=None, n_samp=25):
     if len(valid_ixs) <= target:
         final_ixs = valid_ixs
     else:
+        rng = _as_rng(rng)
         num_cams_valid = num_cams[valid_ixs]
         weights = num_cams_valid.astype(float) ** 3
         weights /= weights.sum()
-        chosen = np.random.choice(len(valid_ixs), size=target, replace=False, p=weights)
+        chosen = rng.choice(len(valid_ixs), size=target, replace=False, p=weights)
         final_ixs = np.sort(valid_ixs[chosen])
-    
+
     newp = imgp[:, final_ixs]
     new_extra = subset_extra(extra, final_ixs)
     return newp, new_extra
@@ -190,6 +221,19 @@ def interpolate_data(vals):
     except ValueError:
         out[:] = 0
     return out
+
+def interior_span(observed):
+    """observed: (N, ...) bool, axis 0 is time. True from the first to the last observed frame
+    of each column (interior gaps included), False before and after (and for columns that are
+    never observed)."""
+    observed = np.asarray(observed, dtype=bool)
+    n = observed.shape[0]
+    if n == 0:
+        return observed.copy()
+    fwd = np.maximum.accumulate(observed, axis=0)
+    bwd = np.maximum.accumulate(observed[::-1], axis=0)[::-1]
+    return fwd & bwd
+
 
 def remap_ids(ids):
     unique_ids = np.unique(ids)
@@ -329,16 +373,43 @@ def rodrigues(rvec):
     
     return R
 
-def project_points(p3d, ext, matrix, dist):
+def _apply_intrinsics(p, matrix):
+    """Normalised (distorted) coordinates -> sensor pixels with the full upper 2x3 of K
+    (fx, skew, cx / K[1,0], fy, cy). With zero skew this is bit-identical to indexing
+    fx, fy, cx, cy. The bottom row of K is assumed to be (0, 0, 1)."""
+    x, y = p[..., 0], p[..., 1]
+    u = matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2]
+    v = matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2]
+    return torch.stack([u, v], dim=-1)
+
+
+def _invert_intrinsics(u, v, matrix):
+    """Sensor pixels -> normalised coordinates, inverting the upper 2x2 of K.
+
+    Written so that with zero skew it reduces exactly to (u - cx) / fx, (v - cy) / fy."""
+    fx, s, cx = matrix[0, 0], matrix[0, 1], matrix[0, 2]
+    k10, fy, cy = matrix[1, 0], matrix[1, 1], matrix[1, 2]
+    du = u - cx
+    dv = v - cy
+    y = (dv - k10 * du / fx) / (fy - k10 * s / fx)
+    x = (du - s * y) / fx
+    return x, y
+
+
+def project_points(p3d, ext, matrix, dist, offset=None):
+    """Brown-Conrady (OpenCV k1, k2, p1, p2, k3) projection with the full camera matrix.
+
+    Unlike cv2.projectPoints, the skew K[0,1] is honoured (decision D3). BA keeps it, and the
+    bottom row of K, frozen by default (see aniposelib.params). `offset` (x, y) is the stored
+    image origin in sensor pixels and is subtracted from the result."""
     p2d_proj_raw = torch.matmul(to_homogeneous(p3d), ext.T)
     p2d_proj_raw = from_homogeneous(p2d_proj_raw[..., :3])
 
-    k1, k2, p1, p2, k3 = dist[:5]
-    k4 = k5 = k6 = 0
+    k1, k2, p1, p2, k3 = _brown_dist_terms(dist)
     r2 = torch.sum(torch.square(p2d_proj_raw), axis=1)
     r4 = r2 * r2
     r6 = r4 * r2
-    kscale = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
+    kscale = 1 + k1 * r2 + k2 * r4 + k3 * r6
 
     x = p2d_proj_raw[..., 0]
     y = p2d_proj_raw[..., 1]
@@ -348,19 +419,19 @@ def project_points(p3d, ext, matrix, dist):
 
     p2d_dist = kscale[:, None] * p2d_proj_raw + p1_p2_add
 
-    # Index the intrinsics rather than multiplying by the full 3x3. Going
-    # through the matrix makes matrix[2,0] and matrix[2,1] real projective
-    # degrees of freedom, and bundle_adjust hands Adam the whole tensor, so
-    # they drift and the result stops being a pinhole camera at all.
-    # cv2.projectPoints ignores the skew too, so nothing is lost.
-    fx, fy = matrix[0, 0], matrix[1, 1]
-    cx, cy = matrix[0, 2], matrix[1, 2]
-    p2d = torch.stack([fx * p2d_dist[..., 0] + cx,
-                       fy * p2d_dist[..., 1] + cy], dim=-1)
-
-    #TODO: handle offset
-
+    p2d = _apply_intrinsics(p2d_dist, matrix)
+    if offset is not None:
+        p2d = p2d - offset
     return p2d
+
+
+def _brown_dist_terms(dist):
+    """k1, k2, p1, p2, k3 from a distortion vector; pads short vectors with zeros.
+    Terms beyond the fifth (rational model k4..k6) are ignored."""
+    if dist.shape[0] < 5:
+        pad = torch.zeros(5 - dist.shape[0], dtype=dist.dtype, device=dist.device)
+        dist = torch.cat([dist, pad])
+    return dist[0], dist[1], dist[2], dist[3], dist[4]
 
 FISHEYE_EPS = 1e-12
 _HALF_PI = float(np.pi / 2)
@@ -374,13 +445,12 @@ def _fisheye_dist_terms(dist):
     return dist[0], dist[1], dist[2], dist[3]
 
 
-def project_points_fisheye(p3d, ext, matrix, dist, eps=FISHEYE_EPS):
+def project_points_fisheye(p3d, ext, matrix, dist, eps=FISHEYE_EPS, offset=None):
     """Differentiable OpenCV fisheye (equidistant) projection.
 
-    Only matrix[0,0], [1,1], [0,2], [1,2] are read. cv2.fisheye ignores the skew
-    too (its alpha is a separate argument), and indexing keeps the unused entries
-    out of the autograd graph, so bundle_adjust cannot drift them away from the
-    0, 0, 0, 1 that makes a camera matrix a camera matrix.
+    The full upper 2x3 of the camera matrix is used, so a skew K[0,1] = alpha * fx
+    matches cv2.fisheye's alpha. The bottom row is not read. BA keeps skew frozen
+    by default (aniposelib.params). `offset` is subtracted from the result.
 
     NaN and inf rows pass through as NaN, elementwise, as triangulate expects.
     """
@@ -414,13 +484,11 @@ def project_points_fisheye(p3d, ext, matrix, dist, eps=FISHEYE_EPS):
     # constant branch is the exact value and the exact gradient
     scale = torch.where(r_ok, theta_d / r, torch.ones_like(r))
 
-    fx, fy = matrix[0, 0], matrix[1, 1]
-    cx, cy = matrix[0, 2], matrix[1, 2]
-    p2d = torch.stack([fx * (scale * a) + cx,
-                       fy * (scale * b) + cy], dim=-1)
+    p2d = _apply_intrinsics(torch.stack([scale * a, scale * b], dim=-1), matrix)
+    if offset is not None:
+        p2d = p2d - offset
 
     return torch.where(bad[..., None], torch.full_like(p2d, float('nan')), p2d)
-
 
 def make_M_torch(rvec, tvec):
     R = rodrigues(rvec)
@@ -430,9 +498,45 @@ def make_M_torch(rvec, tvec):
     return M
 
 
+# keys of a camera dict that Camera understands; anything else goes to Camera.extra
+_CAMERA_KEYS = {'name', 'size', 'matrix', 'distortions', 'rotation', 'translation',
+                'n_dist', 'fisheye', 'offset', 'free_intrinsics'}
+
+
+def _to_builtin(x):
+    """Make a value TOML/JSON friendly (numpy/torch -> lists and Python scalars)."""
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, dict):
+        return {k: _to_builtin(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_builtin(v) for v in x]
+    return x
+
+
 class Camera(nn.Module):
+    """Pinhole camera with Brown-Conrady (OpenCV) distortion, as a torch module.
+
+    Conventions (1.0):
+    - `matrix` is in sensor pixels and is used in full (skew K[0,1] honoured; the bottom row is
+      assumed to be (0, 0, 1)). Only fx, fy, cx, cy are free in bundle adjustment by default,
+      see set_free_intrinsics / aniposelib.params.
+    - `offset` (x, y) is the origin of the stored image in the sensor frame (a crop):
+      project() returns stored-image pixels (sensor minus offset) and undistort_points() takes
+      stored-image pixels (adds offset back). `size` is the stored image size.
+    - `extra` holds unknown per-camera keys from a calibration file (e.g. `moving`,
+      `calibrated`, `model`) and writes them back unchanged.
+    - Public read-only methods follow the input type: numpy in -> numpy out, torch in ->
+      detached torch out; pass return_grad=True to keep the autograd graph.
+    """
     # lets boards.py dispatch on the projection model without importing this module
     fisheye = False
+    # length of the distortion vector of this model (shorter ones are zero-padded on load)
+    n_dist_model = 5
 
     def __init__(self,
                  matrix=np.eye(3),
@@ -442,29 +546,42 @@ class Camera(nn.Module):
                  tvec=np.zeros(3),
                  name=None,
                  *,
-                 n_dist=2):
+                 n_dist=2,
+                 offset=None,
+                 extra=None,
+                 free_intrinsics=DEFAULT_FREE_INTRINSICS,
+                 dtype=torch.float64):
         super().__init__()
 
-        self.register_parameter('matrix', nn.Parameter(to_tensor(matrix)))
-        self.register_parameter('dist', nn.Parameter(to_tensor(dist).view(-1)))
-        self.register_parameter('rvec', nn.Parameter(to_tensor(rvec).view(-1)))
-        self.register_parameter('tvec', nn.Parameter(to_tensor(tvec).view(-1)))
-
-        # self.set_camera_matrix(matrix)
-        # self.set_distortions(dist)
-        # self.set_rotation(rvec)
-        # self.set_translation(tvec)
+        self.register_parameter('matrix', nn.Parameter(to_tensor(matrix, dtype=dtype)))
+        self.register_parameter('dist', nn.Parameter(to_tensor(dist, dtype=dtype).view(-1)))
+        self.register_parameter('rvec', nn.Parameter(to_tensor(rvec, dtype=dtype).view(-1)))
+        self.register_parameter('tvec', nn.Parameter(to_tensor(tvec, dtype=dtype).view(-1)))
+        # non-persistent: moves with .to() and is deep-copied, but stays out of state_dict so
+        # state dicts saved by aniposelib <= 0.9 still load strictly
+        self.register_buffer('offset', torch.zeros(2, dtype=dtype), persistent=False)
+        if offset is not None:
+            self.set_offset(offset)
 
         self.set_size(size)
         self.set_name(name)
+        self.extra = dict(extra) if extra else {}
+        self._frozen_ext = None
 
         # clamp rather than raise here, so a camera built with a short dist and
         # the default n_dist is not an error; set_n_dist validates strictly
         self.n_dist = min(int(n_dist), self.dist.shape[0])
-        self._install_dist_mask()
+        self.free_intrinsics = validate_intrinsics(free_intrinsics)
+        self._install_grad_masks()
 
-    def _install_dist_mask(self):
+    # ------------------------------------------------------------ parameter masks
+
+    def _install_grad_masks(self):
         self.dist.register_hook(self._mask_dist_grad)
+        self.matrix.register_hook(self._mask_matrix_grad)
+
+    # kept for code that called the old name
+    _install_dist_mask = _install_grad_masks
 
     def _mask_dist_grad(self, grad):
         """Zero the gradient of the distortion coefficients beyond n_dist.
@@ -482,12 +599,25 @@ class Camera(nn.Module):
         keep = torch.arange(grad.shape[0], device=grad.device) < n
         return grad * keep.to(grad.dtype)
 
+    def _mask_matrix_grad(self, grad):
+        """Zero the gradient of the camera matrix entries that are not free
+        (by default skew, K[1,0] and the bottom row). Same mechanism as n_dist."""
+        free = getattr(self, 'free_intrinsics', DEFAULT_FREE_INTRINSICS)
+        return grad * matrix_mask(free, dtype=grad.dtype, device=grad.device)
+
     def __setstate__(self, state):
         # Parameter.__deepcopy__ and __reduce_ex__ do not carry backward hooks,
         # so a deepcopied or unpickled camera would keep n_dist while silently
-        # losing the freezing it stands for. Put the hook back.
+        # losing the freezing it stands for. Put the hooks back.
         super().__setstate__(state)
-        self._install_dist_mask()
+        if 'offset' not in self._buffers:  # pickled by aniposelib <= 0.9
+            self.register_buffer('offset', torch.zeros(2, dtype=self.matrix.dtype,
+                                                       device=self.matrix.device),
+                                 persistent=False)
+        self.__dict__.setdefault('extra', {})
+        self.__dict__.setdefault('free_intrinsics', DEFAULT_FREE_INTRINSICS)
+        self.__dict__['_frozen_ext'] = None
+        self._install_grad_masks()
 
     def get_n_dist(self):
         return self.n_dist
@@ -502,7 +632,8 @@ class Camera(nn.Module):
         meaningful step up from it for a pinhole camera.
 
         This does not freeze the camera matrix: fx, fy, cx, cy are still free in
-        a full bundle adjust. Use only_extrinsics=True for that.
+        a full bundle adjust. Use only_extrinsics=True, or set_free_intrinsics((),)
+        for that.
 
         n_dist never grows on its own, so a later set_distortions() with a
         longer vector leaves the extra coefficients frozen.
@@ -527,33 +658,68 @@ class Camera(nn.Module):
 
         self.n_dist = n_dist
 
+    def get_free_intrinsics(self):
+        """Names of the camera-matrix entries bundle adjustment may move."""
+        return self.free_intrinsics
+
+    def set_free_intrinsics(self, names=DEFAULT_FREE_INTRINSICS):
+        """Choose which camera-matrix entries bundle adjustment may move, out of
+        'fx', 'fy', 'cx', 'cy', 'skew'. Default: fx, fy, cx, cy. K[1,0] and the bottom row
+        are always frozen. Like n_dist this is a gradient mask, so it also applies to
+        optimizers you build yourself over cam.parameters()."""
+        self.free_intrinsics = validate_intrinsics(names)
+
+    # ------------------------------------------------------------ (de)serialisation
+
     def get_dict(self):
-        return {
+        d = {
             'name': self.get_name(),
-            'size': list(self.get_size()),
+            'size': _to_builtin(list(self.get_size())) if self.get_size() is not None else None,
             'matrix': self.matrix.detach().cpu().numpy().tolist(),
             'distortions': self.dist.detach().cpu().numpy().tolist(),
             'rotation': self.rvec.detach().cpu().numpy().tolist(),
             'translation': self.tvec.detach().cpu().numpy().tolist(),
             'n_dist': int(self.n_dist),
         }
+        if d['size'] is None:
+            del d['size']
+        if bool(torch.any(self.offset != 0)):
+            d['offset'] = self.offset.detach().cpu().numpy().tolist()
+        if tuple(self.free_intrinsics) != tuple(DEFAULT_FREE_INTRINSICS):
+            d['free_intrinsics'] = list(self.free_intrinsics)
+        for k, v in self.extra.items():
+            if k not in d:
+                d[k] = _to_builtin(v)
+        return d
 
     def load_dict(self, d):
         self.set_camera_matrix(d['matrix'])
         self.set_rotation(d['rotation'])
         self.set_translation(d['translation'])
-        self.set_distortions(d['distortions'])
+        dist = np.asarray(d['distortions'], dtype='float64').ravel()
+        if len(dist) < self.n_dist_model:
+            # pad short vectors (e.g. k1, k2 only) to the model length
+            dist = np.concatenate([dist, np.zeros(self.n_dist_model - len(dist))])
+        self.set_distortions(dist)
         self.set_name(d['name'])
-        self.set_size(d['size'])
+        self.set_size(d.get('size'))
+        self.set_offset(d.get('offset', (0.0, 0.0)))
+        if 'free_intrinsics' in d:
+            self.set_free_intrinsics(d['free_intrinsics'])
+        self.extra = {k: deepcopy(v) for k, v in d.items() if k not in _CAMERA_KEYS}
         # after set_distortions, so its clamp does not eat the loaded value.
         # A calibration written before n_dist existed gets the default.
         if 'n_dist' in d:
             self.set_n_dist(min(int(d['n_dist']), self.dist.shape[0]))
 
-    def from_dict(d):
-        cam = Camera()
+    @classmethod
+    def from_dict(cls, d, dtype=torch.float64):
+        dist = np.asarray(d.get('distortions', np.zeros(cls.n_dist_model))).ravel()
+        cam = cls(dist=np.zeros(max(len(dist), cls.n_dist_model)), dtype=dtype)
         cam.load_dict(d)
         return cam
+
+    # ------------------------------------------------------------ getters / setters
 
     def get_camera_matrix(self):
         return self.matrix
@@ -562,14 +728,11 @@ class Camera(nn.Module):
         return self.dist
 
     def set_camera_matrix(self, matrix):
-        # self.matrix = np.array(matrix, dtype='float64')
-        self.matrix.data = to_tensor(matrix, device=self.matrix.device)
+        self.matrix.data = to_tensor(matrix, device=self.matrix.device, dtype=self.matrix.dtype)
 
     def set_focal_length(self, fx, fy=None):
         if fy is None:
             fy = fx
-        # self.matrix[0, 0] = fx
-        # self.matrix[1, 1] = fy
         self.matrix.data[0, 0] = float(fx)
         self.matrix.data[1, 1] = float(fy)
 
@@ -582,36 +745,51 @@ class Camera(nn.Module):
             return (fx + fy) / 2.0
 
     def set_distortions(self, dist):
-        # self.dist = np.array(dist, dtype='float64').ravel()
-        self.dist.data = to_tensor(dist, device=self.dist.device).view(-1)
+        self.dist.data = to_tensor(dist, device=self.dist.device, dtype=self.dist.dtype).view(-1)
         # a shorter vector has to pull n_dist down with it; a longer one does
         # not push it up, since freeing coefficients should be deliberate
         self.n_dist = min(self.n_dist, self.dist.shape[0])
 
     def zero_distortions(self):
-        # self.dist = self.dist * 0
         self.dist.data.zero_()
 
     def set_rotation(self, rvec):
-        # self.rvec = np.array(rvec, dtype='float64').ravel()
-        self.rvec.data = to_tensor(rvec, device=self.rvec.device).view(-1)
+        self.rvec.data = to_tensor(rvec, device=self.rvec.device, dtype=self.rvec.dtype).view(-1)
+        self._refresh_frozen()
 
     def get_rotation(self):
         return self.rvec
 
     def set_translation(self, tvec):
-        # self.tvec = np.array(tvec, dtype='float64').ravel()
-        self.tvec.data = to_tensor(tvec, device=self.tvec.device).view(-1)
+        self.tvec.data = to_tensor(tvec, device=self.tvec.device, dtype=self.tvec.dtype).view(-1)
+        self._refresh_frozen()
 
     def get_translation(self):
         return self.tvec
 
+    def get_offset(self):
+        """(x, y) origin of the stored image in sensor pixels (crop offset)."""
+        return self.offset
+
+    def set_offset(self, offset):
+        off = to_tensor(offset, device=self.offset.device, dtype=self.offset.dtype).view(-1)
+        if off.shape[0] != 2:
+            raise ValueError("offset must be (x, y), got {}".format(tuple(off.shape)))
+        self.offset.copy_(off)
+
+    def _refresh_frozen(self):
+        if getattr(self, '_frozen_ext', None) is not None:
+            self._frozen_ext = make_M_torch(self.rvec, self.tvec).detach()
+
     def get_extrinsics_mat(self):
+        frozen = getattr(self, '_frozen_ext', None)
+        if frozen is not None:
+            return frozen
         return make_M_torch(self.rvec, self.tvec)
 
     def get_extrinsics_params(self):
         return [self.rvec, self.tvec]
-    
+
     def get_name(self):
         return self.name
 
@@ -626,79 +804,80 @@ class Camera(nn.Module):
         """get size as (width, height)"""
         return self.size
 
+    @property
+    def device(self):
+        return self.matrix.device
+
+    @property
+    def dtype(self):
+        return self.matrix.dtype
+
     def resize_camera(self, scale):
-        """resize the camera by scale factor, updating intrinsics to match"""
+        """resize the camera by scale factor, updating intrinsics (and offset) to match"""
         size = self.get_size()
         new_size = size[0] * scale, size[1] * scale
         self.set_size(new_size)
 
         self.matrix.data *= scale
         self.matrix.data[2, 2] = 1
-        
-        # matrix = self.get_camera_matrix()
-        # new_matrix = matrix * scale
-        # new_matrix[2, 2] = 1
-        # self.set_camera_matrix(new_matrix)
+        self.offset.mul_(scale)
 
+    # ------------------------------------------------------------ geometry
+
+    def _tensor(self, x):
+        return to_tensor(x, device=self.matrix.device, dtype=self.matrix.dtype)
+
+    @returns_like_input()
     def distort_points(self, points):
-        # shape = points.shape
-        # points = points.reshape(-1, 1, 2)
-        # new_points = np.dstack([points, np.ones((points.shape[0], 1, 1))])
-        # out, _ = cv2.projectPoints(new_points, np.zeros(3), np.zeros(3),
-        #                            self.matrix.astype('float64'),
-        #                            self.dist.astype('float64'))
-        # return out.reshape(shape)
-        points = to_homogeneous(to_tensor(points).reshape(-1, 2))
-        eye = torch.eye(4, dtype=torch.float64, device=self.rvec.device)
-        out = project_points(points, eye, self.matrix, self.dist)
-        return out
+        """Normalised (undistorted) coordinates -> stored-image pixels."""
+        return self._distort_points(points)
 
-    # def undistort_points(self, points):
-    #     shape = points.shape
-    #     points = points.reshape(-1, 1, 2)
-    #     out = cv2.undistortPoints(points,
-    #                               self.matrix.astype('float64'),
-    #                               self.dist.astype('float64'))
-    #     return out.reshape(shape)
+    def _distort_points(self, points):
+        points = to_homogeneous(self._tensor(points).reshape(-1, 2))
+        eye = torch.eye(4, dtype=self.matrix.dtype, device=self.matrix.device)
+        return project_points(points, eye, self.matrix, self.dist, self.offset)
 
-    def undistort_points(self, points):
-        t_points = to_tensor(points, device=self.matrix.device)
+    @returns_like_input()
+    def undistort_points(self, points, n_iter=15):
+        """Stored-image pixels (..., 2) -> normalised camera coordinates (..., 2)."""
+        return self._undistort_points(points, n_iter=n_iter)
+
+    def _undistort_points(self, points, n_iter=15):
+        t_points = self._tensor(points)
         shape = t_points.shape
         t_points = t_points.reshape(-1, 2)
-        fx, fy = self.matrix[0, 0], self.matrix[1, 1]
-        cx, cy = self.matrix[0, 2], self.matrix[1, 2]
-        x = (t_points[:, 0] - cx) / fx
-        y = (t_points[:, 1] - cy) / fy
+        x, y = _invert_intrinsics(t_points[:, 0] + self.offset[0],
+                                  t_points[:, 1] + self.offset[1], self.matrix)
         x0, y0 = x.clone(), y.clone()
-        for _ in range(15):
+        k1, k2, p1, p2, k3 = _brown_dist_terms(self.dist)
+        for _ in range(n_iter):
             r2 = x*x + y*y
             r4 = r2*r2
             r6 = r4*r2
-            k1, k2, p1, p2 = self.dist[0], self.dist[1], self.dist[2], self.dist[3]
-            if self.dist.shape[0] > 4:
-                k3 = self.dist[4]
-            else:
-                k3 = torch.tensor(0.0, device=self.dist.device, dtype=self.dist.dtype)
             radial = 1 + k1*r2 + k2*r4 + k3*r6
             dx = 2*p1*x*y + p2*(r2 + 2*x*x)
             dy = p1*(r2 + 2*y*y) + 2*p2*x*y
             x = (x0 - dx) / radial
             y = (y0 - dy) / radial
         return torch.stack([x, y], dim=1).reshape(shape)
-    
-    def project(self, points):
-        # points = points.reshape(-1, 1, 3)
-        # out, _ = cv2.projectPoints(points, self.rvec, self.tvec,
-        #                            self.matrix.astype('float64'),
-        #                            self.dist.astype('float64'))
-        # return out.reshape(points.shape[0], 2)
-        points = to_tensor(points).reshape(-1, 3)
-        out = project_points(points, self.get_extrinsics_mat(),
-                             self.matrix, self.dist)
-        return out
 
+    @returns_like_input()
+    def project(self, points):
+        """(N, 3) world points -> (N, 2) stored-image pixels."""
+        return self._project(points)
+
+    def _project(self, points):
+        points = self._tensor(points).reshape(-1, 3)
+        return project_points(points, self.get_extrinsics_mat(),
+                              self.matrix, self.dist, self.offset)
+
+    @returns_like_input()
     def reprojection_error(self, p3d, p2d):
-        proj = self.project(p3d).reshape(p2d.shape)
+        return self._reprojection_error(p3d, p2d)
+
+    def _reprojection_error(self, p3d, p2d):
+        p2d = self._tensor(p2d)
+        proj = self._project(p3d).reshape(p2d.shape)
         return p2d - proj
 
     def copy(self):
@@ -707,20 +886,25 @@ class Camera(nn.Module):
         # default would break any camera whose dist is not 5 long.
         new_cam = type(self)(name=self.name, size=self.size,
                              dist=np.zeros(self.dist.shape[0]),
-                             n_dist=self.n_dist)
+                             n_dist=self.n_dist,
+                             extra=deepcopy(self.extra),
+                             free_intrinsics=self.free_intrinsics,
+                             dtype=self.matrix.dtype)
         new_cam.load_state_dict(self.state_dict())
+        new_cam.offset.copy_(self.offset.detach().cpu())
         # load_state_dict copies values in place and does not change device, so a
         # copy of a cuda camera would otherwise come back on CPU. Preserve device.
         return new_cam.to(self.matrix.device)
 
+    @returns_like_input()
     def is_point_visible(self, p3d, margin=0):
         """
         Takes as input a set of 3D points: (N, 3).
         Check if 3D points project into camera view.
         margin: pixels from border (e.g., 10 to avoid edge effects)
         """
-        p3d = to_tensor(p3d)
-        p2d = self.project(p3d)
+        p3d = self._tensor(p3d).reshape(-1, 3)
+        p2d = self._project(p3d)
         w, h = self.get_size()
 
         # check if in bounds
@@ -736,14 +920,11 @@ class Camera(nn.Module):
         t = self.tvec
         p_cam = (R @ p3d.T).T + t
 
-        # ext = self.get_extrinsics_mat()
-        # p_cam = torch.matmul(to_homogeneous(p3d), ext.T)
-        # p_cam = from_homogeneous(p_cam[..., :3])
-
         in_front = (p_cam[:, 2] > 0)
 
         return in_bounds & in_front
 
+    @returns_like_input()
     def projection_sensitivity(self, p):
         """
         Compute the sensitivity (Jacobian) of camera projection to 3D point movement.
@@ -755,39 +936,34 @@ class Camera(nn.Module):
 
         Returns:
         --------
-        J : ndarray, shape (2, 3) or (N, 2, 3)
-            Jacobian matrix where J[i,j] = ∂pixel_i/∂world_j
-            Each column gives pixel sensitivity to movement in x, y, z directions
-            If multiple points: J[k] is the Jacobian for point k
+        J : ndarray, shape (N, 2, 3)
+            Jacobian matrix where J[i,j] = d pixel_i / d world_j (pinhole part, distortion
+            ignored; the full upper 2x2 of K, including skew, is used)
         """
-        p = to_tensor(p)
+        return self._projection_sensitivity(p)
+
+    def _projection_sensitivity(self, p):
+        p = self._tensor(p).reshape(-1, 3)
 
         n_points = p.shape[0]
 
-        # Get camera parameters
-        R = rodrigues(self.rvec)  # Convert rotation vector to matrix
+        R = rodrigues(self.rvec)
         t = self.tvec
-        fx, fy = self.get_focal_length(both=True)
 
-        # Transform to camera coordinates
         p_cam = (R @ p.T).T + t
 
         X = p_cam[:, 0]
         Y = p_cam[:, 1]
         Z = p_cam[:, 2]
-        
-        # Jacobian of projection w.r.t camera coordinates
-        # J_proj[i] has shape (2, 3) for point i
-        J_proj = torch.zeros((n_points, 2, 3), dtype=torch.float64)
-        J_proj[:, 0, 0] = fx / Z
-        J_proj[:, 0, 2] = -fx * X / (Z**2)
-        J_proj[:, 1, 1] = fy / Z
-        J_proj[:, 1, 2] = -fy * Y / (Z**2)
-        
-        # Chain rule: J = J_proj @ R
-        # Using einsum for batch matrix multiplication
-        J = torch.einsum('nij,jk->nik', J_proj, R)
 
+        # d(x/z, y/z) / d(X, Y, Z)
+        J_q = torch.zeros((n_points, 2, 3), dtype=p.dtype, device=p.device)
+        J_q[:, 0, 0] = 1 / Z
+        J_q[:, 0, 2] = -X / (Z**2)
+        J_q[:, 1, 1] = 1 / Z
+        J_q[:, 1, 2] = -Y / (Z**2)
+
+        J = torch.einsum('ab,nbj,jk->nak', self.matrix[:2, :2], J_q, R)
         return J
 
     def get_center_world(self):
@@ -799,15 +975,9 @@ class Camera(nn.Module):
         """
         Shoot rays from the 4 corners and center of a camera into 3D space.
 
-        Parameters:
-        -----------
-        camera : Camera
-            The camera to shoot rays from
-
         Returns:
         --------
-        rays : dict
-            Dictionary with keys 'origins' (5x3) and 'directions' (5x3)
+        rays : list of Ray(origin, direction)
             Order: [top_left, top_right, bottom_right, bottom_left, center]
         """
         if self.get_size() is None:
@@ -815,8 +985,6 @@ class Camera(nn.Module):
 
         w, h = self.get_size()
 
-        # Define corner and center points in image coordinates
-        # Order: top_left, top_right, bottom_right, bottom_left, center
         img_points = np.array([
             [0, 0],           # top left
             [w-1, 0],         # top right
@@ -825,30 +993,20 @@ class Camera(nn.Module):
             [w/2, h/2]        # center
         ], dtype='float64')
 
-        # Undistort to get normalized camera coordinates
-        norm_points = self.undistort_points(img_points)
+        norm_points = self._undistort_points(img_points)
 
-        # Convert to 3D rays in camera frame
-        # Normalized points are already x/z, y/z, so we append z=1
         rays_camera = to_homogeneous(norm_points)
-
-        # Normalize the direction vectors
         rays_camera = rays_camera / torch.linalg.norm(rays_camera, dim=1, keepdim=True)
 
-        # Transform rays to world coordinates
         R = rodrigues(self.rvec)
-        t = self.tvec
-
-        # Ray origins are all at camera center in world coordinates
         center = self.get_center_world()
-
-        # Ray directions in world frame
         directions = (R.T @ rays_camera.T).T
 
         rays = [Ray(origin=center, direction=d)
                 for d in directions]
 
         return rays
+
 
 
 class FisheyeCamera(Camera):
@@ -859,6 +1017,7 @@ class FisheyeCamera(Camera):
     """
 
     fisheye = True
+    n_dist_model = 4
 
     def __init__(self,
                  matrix=np.eye(3),
@@ -868,34 +1027,33 @@ class FisheyeCamera(Camera):
                  tvec=np.zeros(3),
                  name=None,
                  *,
-                 n_dist=2):
+                 n_dist=2,
+                 **kwargs):
         super().__init__(matrix=matrix, dist=dist, size=size,
                          rvec=rvec, tvec=tvec, name=name,
-                         n_dist=n_dist)
-
-    def from_dict(d):
-        cam = FisheyeCamera()
-        cam.load_dict(d)
-        return cam
+                         n_dist=n_dist, **kwargs)
 
     def get_dict(self):
         d = super().get_dict()
         d['fisheye'] = True
         return d
 
-    def project(self, points):
-        points = to_tensor(points, device=self.matrix.device).reshape(-1, 3)
+    def _project(self, points):
+        points = self._tensor(points).reshape(-1, 3)
         return project_points_fisheye(points, self.get_extrinsics_mat(),
-                                      self.matrix, self.dist)
+                                      self.matrix, self.dist, offset=self.offset)
 
-    def distort_points(self, points):
-        points = to_homogeneous(
-            to_tensor(points, device=self.matrix.device).reshape(-1, 2))
-        eye = torch.eye(4, dtype=torch.float64, device=self.matrix.device)
-        return project_points_fisheye(points, eye, self.matrix, self.dist)
+    def _distort_points(self, points):
+        points = to_homogeneous(self._tensor(points).reshape(-1, 2))
+        eye = torch.eye(4, dtype=self.matrix.dtype, device=self.matrix.device)
+        return project_points_fisheye(points, eye, self.matrix, self.dist, offset=self.offset)
 
-    def _solve_theta(self, points, n_iter=20, eps=FISHEYE_EPS, tol=1e-8):
+    def _solve_theta(self, points, n_iter=20, eps=FISHEYE_EPS, tol=1e-8, step_tol=1e-12):
         """Invert the equidistant model for a set of pixel coordinates.
+
+        Newton stops early once no point inside the invertible domain moves by more than
+        step_tol (checked at iterations 5, 8, 12, 16, so on CUDA it costs a few host syncs);
+        it converges in ~4 iterations in practice. step_tol=0 runs all n_iter iterations.
 
         Returns (theta, x, y, theta_d, r_ok, ok), all flattened to (K,):
           theta    incidence angle
@@ -904,13 +1062,11 @@ class FisheyeCamera(Camera):
           r_ok     radius above eps, i.e. not the principal point
           ok       Newton converged and the point is inside the invertible domain
         """
-        t_points = to_tensor(points, device=self.matrix.device).reshape(-1, 2)
-        fx, fy = self.matrix[0, 0], self.matrix[1, 1]
-        cx, cy = self.matrix[0, 2], self.matrix[1, 2]
+        t_points = self._tensor(points).reshape(-1, 2)
         k1, k2, k3, k4 = _fisheye_dist_terms(self.dist)
 
-        x = (t_points[:, 0] - cx) / fx
-        y = (t_points[:, 1] - cy) / fy
+        x, y = _invert_intrinsics(t_points[:, 0] + self.offset[0],
+                                  t_points[:, 1] + self.offset[1], self.matrix)
 
         finite = torch.isfinite(x) & torch.isfinite(y)
         x = torch.where(finite, x, torch.zeros_like(x))
@@ -920,9 +1076,10 @@ class FisheyeCamera(Camera):
         r_ok = td2 >= eps * eps
         theta_d = torch.sqrt(torch.where(r_ok, td2, torch.ones_like(td2)))
         theta_d_c = torch.clamp(theta_d, max=_HALF_PI)  # as cv2 does
+        domain = finite & (theta_d <= _HALF_PI)
 
         theta = theta_d_c.clone()
-        for _ in range(n_iter):
+        for i in range(n_iter):
             th2 = theta * theta
             th4 = th2 * th2
             th6 = th4 * th2
@@ -930,7 +1087,12 @@ class FisheyeCamera(Camera):
             f = theta * (1 + k1 * th2 + k2 * th4 + k3 * th6 + k4 * th8) - theta_d_c
             fp = 1 + 3 * k1 * th2 + 5 * k2 * th4 + 7 * k3 * th6 + 9 * k4 * th8
             fp = torch.where(torch.abs(fp) > eps, fp, torch.ones_like(fp))
-            theta = theta - f / fp
+            step = f / fp
+            theta = theta - step
+            if step_tol > 0 and (i + 1) in (5, 8, 12, 16):
+                moving = domain & ~(torch.abs(step) <= step_tol)
+                if not bool(torch.any(moving)):
+                    break
 
         th2 = theta * theta
         th4 = th2 * th2
@@ -948,9 +1110,9 @@ class FisheyeCamera(Camera):
 
         return theta, x, y, theta_d, r_ok, ok
 
-    def undistort_points(self, points):
-        shape = to_tensor(points, device=self.matrix.device).shape
-        theta, x, y, theta_d, r_ok, ok = self._solve_theta(points)
+    def _undistort_points(self, points, n_iter=20):
+        shape = self._tensor(points).shape
+        theta, x, y, theta_d, r_ok, ok = self._solve_theta(points, n_iter=n_iter)
 
         theta_c = torch.clamp(theta, max=_HALF_PI - 1e-9)  # keep tan() finite
         # scale tends to 1 as the radius tends to 0
@@ -961,6 +1123,12 @@ class FisheyeCamera(Camera):
         good = ok & (theta < _HALF_PI)
         out = torch.where(good[:, None], out, torch.full_like(out, float('nan')))
         return out.reshape(shape)
+
+    @returns_like_input()
+    def undistort_points(self, points, n_iter=20):
+        """Stored-image pixels (..., 2) -> normalised camera coordinates (..., 2);
+        NaN outside the invertible domain of the model."""
+        return self._undistort_points(points, n_iter=n_iter)
 
     def get_camera_rays(self):
         """Same contract as Camera.get_camera_rays.
@@ -999,26 +1167,27 @@ class FisheyeCamera(Camera):
 
         return [Ray(origin=center, direction=d) for d in directions]
 
-    def projection_sensitivity(self, p):
+    def _projection_sensitivity(self, p):
         """Same contract as Camera.projection_sensitivity, by autograd.
 
         The base version is a pinhole Jacobian that ignores distortion
         altogether, which for an equidistant lens is wrong by d(theta_d)/dr.
         """
-        p = to_tensor(p, device=self.matrix.device).reshape(-1, 3)
+        p = self._tensor(p).reshape(-1, 3)
         ext = self.get_extrinsics_mat().detach()
         matrix = self.matrix.detach()
         dist = self.dist.detach()
 
         with torch.enable_grad():
             p = p.detach().requires_grad_(True)
-            out = project_points_fisheye(p, ext, matrix, dist)
+            out = project_points_fisheye(p, ext, matrix, dist)  # offset is a constant shift
             # each output row depends only on its own input row, so one backward
             # pass per output column gives all the per-row gradients
             rows = [torch.autograd.grad(out[:, i].sum(), p, retain_graph=(i == 0))[0]
                     for i in range(2)]
 
         return torch.stack(rows, dim=1)
+
 
 
 # cv2.fisheye has no CALIB_FIX_K0, the flags start at k1
@@ -1078,15 +1247,73 @@ def init_camera_intrinsics(camera, objp, imgp, size):
     camera.set_distortions(restore_frozen(np.zeros_like(old_dist)))
 
 
+
+def _natural_key(key):
+    """Sort key: 'cam_10' -> ('cam_', 10). Keys without a numeric suffix sort lexically
+    (and before numbered keys with the same prefix)."""
+    m = re.match(r'^(.*?)(\d+)$', str(key))
+    if m is None:
+        return (str(key), -1)
+    return (m.group(1), int(m.group(2)))
+
+
+def _order_keys(keys, order='natural'):
+    keys = list(keys)
+    if order == 'natural':
+        out = sorted(keys, key=_natural_key)
+        if out != sorted(keys):
+            warnings.warn(
+                "camera keys sorted numerically ({}) differ from their lexical order ({}). "
+                "aniposelib <= 0.9 used the lexical order, so results computed with it on this "
+                "file had the cameras permuted. Pass order='lexical' to get the old order.".format(
+                    out, sorted(keys)), CameraOrderWarning, stacklevel=3)
+        return out
+    if order == 'lexical':
+        return sorted(keys)
+    if order == 'file':
+        return keys
+    raise ValueError("order must be 'natural', 'lexical' or 'file', got {!r}".format(order))
+
+
+def _warn_duplicate_names(names):
+    dup = sorted(n for n, c in Counter(names).items() if c > 1)
+    if dup:
+        warnings.warn("duplicate camera names {}: subset_cameras_names and name lookups will "
+                      "be ambiguous".format(dup), CameraOrderWarning, stacklevel=3)
+
+
 class CameraGroup(nn.Module):
-    def __init__(self, cameras, metadata={}):
+    """A list of cameras (an nn.Module). Points are C x N x 2 in group order, NaN = missing.
+
+    Public read-only methods (project, triangulate*, reprojection_error, undistort_points,
+    average_error, optim_points, ...) follow the input type: numpy in -> numpy out, torch in
+    -> detached torch out on the input's device; return_grad=True keeps the autograd graph."""
+
+    def __init__(self, cameras, metadata=None, dtype=None):
         super().__init__()
         self.cameras = nn.ModuleList(cameras)
-        self.metadata = metadata
+        self.metadata = {} if metadata is None else metadata
+        if dtype is not None:
+            self.to(dtype)
+
+    @property
+    def device(self):
+        for p in self.parameters():
+            return p.device
+        return torch.device('cpu')
+
+    @property
+    def dtype(self):
+        for p in self.parameters():
+            return p.dtype
+        return torch.float64
+
+    def _tensor(self, x):
+        return to_tensor(x, device=self.device, dtype=self.dtype)
 
     def subset_cameras(self, indices):
         cams = [self.cameras[ix].copy() for ix in indices]
-        return CameraGroup(cams, self.metadata)
+        return CameraGroup(cams, deepcopy(self.metadata))
 
     def subset_cameras_names(self, names):
         cur_names = self.get_names()
@@ -1101,49 +1328,102 @@ class CameraGroup(nn.Module):
             indices.append(cur_names_dict[name])
         return self.subset_cameras(indices)
 
+    @contextmanager
+    def frozen(self):
+        """Context for read-only loops (tracking, per-frame triangulation): each camera's
+        extrinsics matrix is built once and reused, instead of a Rodrigues per call.
+        Writes through set_rotation/set_translation refresh the cache. Solvers
+        (bundle_adjust*, calibrate_*) refuse to run inside it, and gradients do not flow to
+        rvec/tvec while it is active."""
+        prev = [getattr(cam, '_frozen_ext', None) for cam in self.cameras]
+        try:
+            with torch.no_grad():
+                for cam in self.cameras:
+                    cam._frozen_ext = make_M_torch(cam.rvec, cam.tvec).detach()
+            yield self
+        finally:
+            for cam, p in zip(self.cameras, prev):
+                cam._frozen_ext = p
+
+    # kept as the name suggested in the EvoVision report
+    frozen_extrinsics = frozen
+
+    def _check_not_frozen(self, what):
+        if any(getattr(cam, '_frozen_ext', None) is not None for cam in self.cameras):
+            raise RuntimeError("{} cannot run inside CameraGroup.frozen(): the extrinsics "
+                               "would be held fixed".format(what))
+
+    @returns_like_input()
     def project(self, points):
         """Given an Nx3 array of points, this returns an CxNx2 array of 2D points,
         where C is the number of cameras"""
-        points = to_tensor(points)
-        
+        return self._project(points)
+
+    def _project(self, points):
+        points = self._tensor(points)
         points = points.reshape(-1, 3)
         n_points = points.shape[0]
-        n_cams = len(self.cameras)
+        out = [cam._project(points).reshape(n_points, 2) for cam in self.cameras]
+        if len(out) == 0:
+            return torch.empty((0, n_points, 2), dtype=points.dtype, device=points.device)
+        return torch.stack(out)
 
-        out = torch.empty((n_cams, n_points, 2), dtype=points.dtype, device=points.device)
-        for cnum, cam in enumerate(self.cameras):
-            out[cnum] = cam.project(points).reshape(n_points, 2)
+    @returns_like_input()
+    def undistort_points(self, points, batch_size=None, progress=False, desc="undistort"):
+        """Undistort per camera: (C, ..., 2) stored-image pixels -> normalised coordinates of
+        the same shape, NaN passing through. The result can go to
+        triangulate(..., undistort=False), which is the fast path when the same detections
+        are triangulated many times (undistortion only depends on the pixels).
+        batch_size=None (default) does all points at once."""
+        return self._undistort_points(points, batch_size=batch_size, progress=progress, desc=desc)
 
-        return out
+    # three downstream projects call the private name
+    _undistort_points_batch = undistort_points
 
-    def _undistort_points_batch(self, points, batch_size=1000, progress=False, desc="undistort"):
-        """Undistort per-camera. points: (C, ..., 2) torch tensor. Returns same shape.
-        NaN passes through (cam.undistort_points is arithmetic-only)."""
+    def _undistort_points(self, points, batch_size=None, progress=False, desc="undistort"):
+        points = self._tensor(points)
         orig_shape = points.shape
         C = orig_shape[0]
         K = points[0].numel() // 2
         points_flat = points.reshape(C, K, 2)
+        if batch_size is None or batch_size >= K:
+            if C == 0:
+                return points.clone()
+            out = torch.stack([cam._undistort_points(points_flat[cnum])
+                               for cnum, cam in enumerate(self.cameras)])
+            return out.reshape(orig_shape)
         new_points = torch.empty_like(points_flat)
         undistort_iter = trange(0, K, batch_size, ncols=70, desc=desc) if progress \
             else range(0, K, batch_size)
         for start in undistort_iter:
             end = min(start + batch_size, K)
             for cnum, cam in enumerate(self.cameras):
-                new_points[cnum, start:end] = cam.undistort_points(points_flat[cnum, start:end])
+                new_points[cnum, start:end] = cam._undistort_points(points_flat[cnum, start:end])
         return new_points.reshape(orig_shape)
 
-    def triangulate(self, points, weights=None, batch_size=1000, undistort=True, progress=False):
-        """Given an CxNx2 array, this returns an Nx3 array of points,
-        where N is the number of points and C is the number of cameras"""
+    # points per SVD chunk when triangulate(batch_size=None); bounds memory on huge inputs
+    TRIANGULATE_CHUNK = 65536
 
+    @returns_like_input()
+    def triangulate(self, points, weights=None, batch_size=None, undistort=True, progress=False):
+        """Given an CxNx2 array, this returns an Nx3 array of points,
+        where N is the number of points and C is the number of cameras.
+
+        batch_size=None (default) undistorts all points at once and solves in chunks of
+        CameraGroup.TRIANGULATE_CHUNK points (the result does not depend on the chunking).
+        undistort=False takes points already passed through undistort_points."""
+        return self._triangulate(points, weights=weights, batch_size=batch_size,
+                                 undistort=undistort, progress=progress)
+
+    def _triangulate(self, points, weights=None, batch_size=None, undistort=True, progress=False):
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
                 len(self.cameras), points.shape
             )
 
-        device = next(self.parameters()).device
-        points = to_tensor(points, device=device)
+        points = self._tensor(points)
+        dtype = points.dtype
 
         one_point = False
         if len(points.shape) == 2:
@@ -1153,34 +1433,35 @@ class CameraGroup(nn.Module):
         n_cams, n_points, _ = points.shape
 
         if undistort:
-            points = self._undistort_points_batch(points, batch_size=batch_size, progress=progress)
+            points = self._undistort_points(points, batch_size=batch_size, progress=progress)
 
         out = torch.full((n_points, 3), torch.nan,
-                         device=points.device, dtype=torch.float64)
+                         device=points.device, dtype=dtype)
 
         cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
 
         # Initialize weights if not provided
         if weights is None:
-            weights = torch.ones((n_cams, n_points), dtype=torch.float64, device=points.device)
+            weights = torch.ones((n_cams, n_points), dtype=dtype, device=points.device)
         else:
-            weights = to_tensor(weights, device=points.device)
+            weights = to_tensor(weights, device=points.device, dtype=dtype)
 
         # Mask NaN points and zero their weights
         valid_mask = ~torch.isnan(points).any(dim=-1)  # [C, N]
         points = torch.nan_to_num(points, nan=0.0)
-        weights = weights * valid_mask.float()
+        weights = weights * valid_mask.to(dtype)
 
         # Count how many cameras have valid data per point
         valid_counts = torch.sum(weights > 0, dim=0)  # [N]
 
+        chunk = self.TRIANGULATE_CHUNK if batch_size is None else batch_size
         if progress:
-            iterator = trange(0, n_points, batch_size, ncols=70, desc="triangulate")
+            iterator = trange(0, n_points, chunk, ncols=70, desc="triangulate")
         else:
-            iterator = range(0, n_points, batch_size)
+            iterator = range(0, n_points, chunk)
 
         for start in iterator:
-            end = min(start + batch_size, n_points)
+            end = min(start + chunk, n_points)
             batch_indices = torch.arange(start, end, device=points.device)
 
             # Only process points observed by at least 2 cameras
@@ -1197,7 +1478,9 @@ class CameraGroup(nn.Module):
 
         return out
 
+    @returns_like_input()
     def triangulate_possible(self, points, undistort=True, min_cams=2, progress=False, batch_size=1000):
+
         """Given an CxNxPx2 array, returns (out, picked_vals, points_2d, errors) by
         triangulating all valid camera-subset/candidate combinations and picking the
         one with lowest mean reprojection error per point.
@@ -1207,8 +1490,13 @@ class CameraGroup(nn.Module):
         so peak GPU working set is O(batch_size) rather than O(N). For large P (e.g. P=2
         with C=9 cameras), use a smaller batch_size (e.g. 25) to stay memory-bounded.
         """
-        device = next(self.parameters()).device
-        points_raw_cpu = to_tensor(points, device='cpu')  # master stays on CPU
+        return self._triangulate_possible(points, undistort=undistort, min_cams=min_cams,
+                                          progress=progress, batch_size=batch_size)
+
+    def _triangulate_possible(self, points, undistort=True, min_cams=2, progress=False, batch_size=1000):
+        device = self.device
+        dtype = self.dtype
+        points_raw_cpu = to_tensor(points, device='cpu', dtype=dtype)  # master stays on CPU
 
         assert points_raw_cpu.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -1219,10 +1507,10 @@ class CameraGroup(nn.Module):
         n_cams, n_points, n_possible, _ = points_raw_cpu.shape
 
         # Output tensors — O(N), small for typical N
-        out         = torch.full((n_points, 3),                    torch.nan, dtype=torch.float64, device=device)
+        out         = torch.full((n_points, 3),                    torch.nan, dtype=dtype, device=device)
         picked_vals = torch.zeros((n_cams, n_points, n_possible),             dtype=torch.bool,    device=device)
-        errors_out  = torch.zeros(n_points,                                   dtype=torch.float64, device=device)
-        points_2d   = torch.full((n_cams, n_points, 2),            torch.nan, dtype=torch.float64, device=device)
+        errors_out  = torch.zeros(n_points,                                   dtype=dtype, device=device)
+        points_2d   = torch.full((n_cams, n_points, 2),            torch.nan, dtype=dtype, device=device)
 
         cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
 
@@ -1240,7 +1528,7 @@ class CameraGroup(nn.Module):
             points_raw_chunk = points_raw_cpu[:, p0:p1].to(device)  # (C, chunk, P, 2)
 
             if undistort:
-                points_undist_chunk = self._undistort_points_batch(points_raw_chunk, batch_size=batch_size)
+                points_undist_chunk = self._undistort_points(points_raw_chunk, batch_size=batch_size)
             else:
                 points_undist_chunk = points_raw_chunk
 
@@ -1303,20 +1591,20 @@ class CameraGroup(nn.Module):
             flat_p = torch.from_numpy(np.concatenate(flat_p_chunks)).to(device=device)
 
             # Build (C, M_chunk, 2) and (C, M_chunk) buffers — bounded by chunk, not N
-            batch_points_undist = torch.zeros((n_cams, M_chunk, 2), dtype=torch.float64, device=device)
-            batch_points_raw    = torch.zeros((n_cams, M_chunk, 2), dtype=torch.float64, device=device)
-            batch_weights       = torch.zeros((n_cams, M_chunk),    dtype=torch.float64, device=device)
+            batch_points_undist = torch.zeros((n_cams, M_chunk, 2), dtype=dtype, device=device)
+            batch_points_raw    = torch.zeros((n_cams, M_chunk, 2), dtype=dtype, device=device)
+            batch_weights       = torch.zeros((n_cams, M_chunk),    dtype=dtype, device=device)
 
             # flat_p is chunk-local: indexes into points_raw_chunk[:, 0:chunk_size, ...]
-            batch_points_undist[flat_c, flat_m] = points_undist_chunk[flat_c, flat_p, flat_q].to(torch.float64)
-            batch_points_raw   [flat_c, flat_m] = points_raw_chunk   [flat_c, flat_p, flat_q].to(torch.float64)
+            batch_points_undist[flat_c, flat_m] = points_undist_chunk[flat_c, flat_p, flat_q].to(dtype)
+            batch_points_raw   [flat_c, flat_m] = points_raw_chunk   [flat_c, flat_p, flat_q].to(dtype)
             batch_weights      [flat_c, flat_m] = 1.0
 
             # One SVD over all M_chunk records; full_matrices=False keeps u bounded
             p3ds_batched = triangulate_simple_batch(batch_points_undist, cam_mats, batch_weights)
 
-            proj     = self.project(p3ds_batched)  # (C, M_chunk, 2)
-            err_norm = torch.linalg.norm(proj.to(torch.float64) - batch_points_raw, dim=-1)
+            proj     = self._project(p3ds_batched)  # (C, M_chunk, 2)
+            err_norm = torch.linalg.norm(proj.to(dtype) - batch_points_raw, dim=-1)
             err      = (err_norm * batch_weights).sum(dim=0) / batch_weights.sum(dim=0)
 
             # Per-point argmin — write into global output tensors using p0 offset
@@ -1334,13 +1622,15 @@ class CameraGroup(nn.Module):
             p_global_idx = flat_p[sel] + p0
             picked_vals[flat_c[sel], p_global_idx, flat_q[sel]] = True
             points_2d  [flat_c[sel], p_global_idx] = \
-                points_raw_chunk[flat_c[sel], flat_p[sel], flat_q[sel]].to(torch.float64)
+                points_raw_chunk[flat_c[sel], flat_p[sel], flat_q[sel]].to(dtype)
 
         return out, picked_vals, points_2d, errors_out
 
+
+    @returns_like_input()
     def triangulate_ransac(self, points, undistort=True, min_cams=2, progress=False):
-        """Given an CxNx2 array, this returns an Nx3 array of points,
-        where N is the number of points and C is the number of cameras"""
+        """Given an CxNx2 array, returns (p3ds Nx3, picked CxNx1 bool, p2ds CxNx2, errors N):
+        the best camera subset per point, as in triangulate_possible."""
 
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -1352,22 +1642,23 @@ class CameraGroup(nn.Module):
 
         points_ransac = points.reshape(n_cams, n_points, 1, 2)
 
-        return self.triangulate_possible(points_ransac,
-                                         undistort=undistort,
-                                         min_cams=min_cams,
-                                         progress=progress)
+        return self._triangulate_possible(points_ransac,
+                                          undistort=undistort,
+                                          min_cams=min_cams,
+                                          progress=progress)
 
-
+    @returns_like_input()
     def reprojection_error(self, p3ds, p2ds, mean=False):
         """Given an Nx3 array of 3D points and an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this returns an CxNx2 array of errors.
         Optionally mean=True, this averages the errors and returns array of length N of errors"""
+        return self._reprojection_error(p3ds, p2ds, mean=mean)
 
-        device = next(self.parameters()).device
-        p3ds = to_tensor(p3ds, device=device)
-        p2ds = to_tensor(p2ds, device=device)
-        
+    def _reprojection_error(self, p3ds, p2ds, mean=False):
+        p3ds = self._tensor(p3ds)
+        p2ds = self._tensor(p2ds)
+
         one_point = False
         if len(p3ds.shape) == 1 and len(p2ds.shape) == 2:
             p3ds = p3ds.reshape(1, 3)
@@ -1381,15 +1672,14 @@ class CameraGroup(nn.Module):
 
         errors = []
         for cnum, cam in enumerate(self.cameras):
-            errors.append(cam.reprojection_error(p3ds, p2ds[cnum]))
+            errors.append(cam._reprojection_error(p3ds, p2ds[cnum]))
         errors = torch.stack(errors)
-            
+
         if mean:
             errors_norm = torch.linalg.norm(errors, dim=2)
             good = ~torch.isnan(errors_norm)
             errors_norm[~good] = 0
-            denom = torch.sum(good, dim=0).to(torch.float64)
-            # denom[denom < 1.5] = torch.nan # less than 2 cameras
+            denom = torch.sum(good, dim=0).to(errors_norm.dtype)
             errors = torch.sum(errors_norm, axis=0) / denom
 
         if one_point:
@@ -1406,14 +1696,19 @@ class CameraGroup(nn.Module):
                            max_nfev=850, ftol=1e-8,
                            n_samp_iter=450, n_samp_full=1000,
                            error_threshold=0.7, only_extrinsics=False,
-                           verbose=False):
+                           verbose=False, rng=None):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
         That is, it performs bundle adjustment multiple times, adjusting the weights given to points
         to reduce the influence of outliers.
         This is inspired by the algorithm for Fast Global Registration by Zhou, Park, and Koltun
+
+        rng: np.random.Generator, int seed or None (fresh entropy) for the point resampling;
+        the global numpy RNG is never used. Pass an int for a reproducible run.
         """
+        self._check_not_frozen('bundle_adjust_iter')
+        rng = _as_rng(rng)
 
         assert p2ds.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -1426,12 +1721,12 @@ class CameraGroup(nn.Module):
         p2ds_full = p2ds
         extra_full = extra
 
-        device = next(self.parameters()).device
+        device = self.device
 
         p2ds, extra = resample_points(p2ds_full, extra_full,
-                                      n_samp=n_samp_full)
+                                      n_samp=n_samp_full, rng=rng)
         p2ds_t = torch.as_tensor(p2ds, device=device)
-        error = self.average_error(p2ds_t, median=True).item()
+        error = self._average_error(p2ds_t, median=True).item()
 
         if verbose:
             print('initial error: ', error)
@@ -1451,10 +1746,10 @@ class CameraGroup(nn.Module):
 
         for i in range(n_iters):
             p2ds, extra = resample_points(p2ds_full, extra_full,
-                                          n_samp=n_samp_full)
+                                          n_samp=n_samp_full, rng=rng)
             p2ds_t = torch.as_tensor(p2ds, device=device)
-            p3ds = self.triangulate(p2ds_t)
-            errors_norm = self.reprojection_error(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
+            p3ds = self._triangulate_ng(p2ds_t)
+            errors_norm = self._reprojection_error_ng(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
 
             finite_errors = errors_norm[np.isfinite(errors_norm)]
             if len(finite_errors) > 0:
@@ -1481,7 +1776,7 @@ class CameraGroup(nn.Module):
 
             extra_good = subset_extra(extra, good)
             p2ds_samp, extra_samp = resample_points(
-                p2ds[:, good], extra_good, n_samp=n_samp_iter)
+                p2ds[:, good], extra_good, n_samp=n_samp_iter, rng=rng)
             p2ds_samp = torch.as_tensor(p2ds_samp, device=device)
 
             error = np.median(finite_errors) if len(finite_errors) > 0 else error
@@ -1490,7 +1785,7 @@ class CameraGroup(nn.Module):
                 break
 
             if verbose:
-                errors_full = self.reprojection_error(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
+                errors_full = self._reprojection_error_ng(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
                 print('iter {}: error: {:.2f}, mu: {:.1f}, ratio: {:.3f}, f_scale: {:.1f}'.format(
                     i, error, mu, np.mean(good), f_scales[i]))
 
@@ -1507,12 +1802,12 @@ class CameraGroup(nn.Module):
             self.bundle_adjust(p2ds_samp, extra_samp,
                                loss='cauchy', ftol=ftol,
                                max_nfev=iter_nfev, only_extrinsics=iter_only_ext,
-                               verbose=verbose, f_scale=f_scales[i])
+                               verbose=verbose, f_scale=f_scales[i], rng=rng)
 
             # Track best state
-            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)
             cur_p2ds_t = torch.as_tensor(cur_p2ds, device=device)
-            cur_error = self.average_error(cur_p2ds_t, median=True).item()
+            cur_error = self._average_error(cur_p2ds_t, median=True).item()
             if cur_error < best_error:
                 best_error = cur_error
                 best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
@@ -1523,13 +1818,13 @@ class CameraGroup(nn.Module):
         # Final bundle adjustment with cleaned points
         for final_pass in range(3):
             p2ds, extra = resample_points(p2ds_full, extra_full,
-                                          n_samp=n_samp_full)
+                                          n_samp=n_samp_full, rng=rng)
             p2ds_t = torch.as_tensor(p2ds, device=device)
-            p3ds = self.triangulate(p2ds_t)
-            errors_norm = self.reprojection_error(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
+            p3ds = self._triangulate_ng(p2ds_t)
+            errors_norm = self._reprojection_error_ng(p3ds, p2ds_t, mean=True).detach().cpu().numpy()
 
             if verbose:
-                errors_full = self.reprojection_error(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
+                errors_full = self._reprojection_error_ng(p3ds, p2ds_t, mean=False).detach().cpu().numpy()
 
             finite_errors = errors_norm[np.isfinite(errors_norm)]
             if len(finite_errors) > 0:
@@ -1549,20 +1844,20 @@ class CameraGroup(nn.Module):
                                    loss='cauchy',
                                    ftol=ftol * 0.1, max_nfev=max(700, max_nfev),
                                    only_extrinsics=only_extrinsics,
-                                   verbose=verbose, f_scale=final_f_scale)
+                                   verbose=verbose, f_scale=final_f_scale, rng=rng)
 
             # Track best after each final pass
-            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+            cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)
             cur_p2ds_t = torch.as_tensor(cur_p2ds, device=device)
-            cur_error = self.average_error(cur_p2ds_t, median=True).item()
+            cur_error = self._average_error(cur_p2ds_t, median=True).item()
             if cur_error < best_error:
                 best_error = cur_error
                 best_cam_state = {k: v.clone() for k, v in self.state_dict().items()}
 
         # Check if final adjustment improved
-        p2ds_check, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full)
+        p2ds_check, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)
         p2ds_check_t = torch.as_tensor(p2ds_check, device=device)
-        final_error = self.average_error(p2ds_check_t, median=True).item()
+        final_error = self._average_error(p2ds_check_t, median=True).item()
 
         if final_error > best_error:
             self.load_state_dict(best_cam_state)
@@ -1574,10 +1869,10 @@ class CameraGroup(nn.Module):
 
         if verbose:
             p2ds_t2 = torch.as_tensor(
-                resample_points(p2ds_full, extra_full, n_samp=n_samp_full)[0],
+                resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)[0],
                 device=device)
-            p3ds = self.triangulate(p2ds_t2)
-            errors_full = self.reprojection_error(p3ds, p2ds_t2, mean=False).detach().cpu().numpy()
+            p3ds = self._triangulate_ng(p2ds_t2)
+            errors_full = self._reprojection_error_ng(p3ds, p2ds_t2, mean=False).detach().cpu().numpy()
             error_dict = get_error_dict(errors_full)
             pprint(error_dict)
             print('final error: ', error)
@@ -1591,10 +1886,17 @@ class CameraGroup(nn.Module):
                       lr=8.0e-4,
                       only_extrinsics=False,
                       verbose=True,
-                      f_scale=None):
+                      f_scale=None,
+                      rng=None):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
-        this performs bundle adjustment to fine-tune the parameters of the cameras"""
+        this performs bundle adjustment to fine-tune the parameters of the cameras.
+
+        Free parameters: extrinsics, plus (unless only_extrinsics) the camera-matrix entries
+        in each camera's free_intrinsics (default fx, fy, cx, cy) and the first n_dist
+        distortion coefficients. rng seeds the board-pose initialisation (extra=...)."""
+        self._check_not_frozen('bundle_adjust')
+        rng = _as_rng(rng)
         
         assert p2ds.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
@@ -1613,7 +1915,7 @@ class CameraGroup(nn.Module):
             objp = extra['objp']
             extra['min_scale'] = torch.amin(objp[objp > 0])
 
-        params = self._initialize_params_bundle(p2ds, extra)
+        params = self._initialize_params_bundle(p2ds, extra, rng=rng)
         
         if only_extrinsics:
             cam_params = list(self.get_extrinsics_params())
@@ -1690,14 +1992,15 @@ class CameraGroup(nn.Module):
         if verbose:
             print("iter: {} \t loss: {:.4f} (best: {:.4f})".format(i, current_loss, best_loss))
             
-        error = self.average_error(p2ds)
+        with torch.no_grad():
+            error = self._average_error(p2ds)
         return error
 
     def _error_fun_bundle(self, params, p2ds, extra, loss='linear', f_scale=None):
         """Error function for bundle adjustment"""
         p3d = params['p3d']
         valid = torch.isfinite(p2ds)
-        proj = self.project(p3d)
+        proj = self._project(p3d)
         diff = proj - p2ds
         diff = torch.where(valid, diff, torch.zeros_like(diff))
         
@@ -1732,7 +2035,7 @@ class CameraGroup(nn.Module):
 
 
 
-    def _initialize_params_bundle(self, p2ds, extra):
+    def _initialize_params_bundle(self, p2ds, extra, rng=None):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         initializes the parameters for bundle adjustment"""
@@ -1742,7 +2045,7 @@ class CameraGroup(nn.Module):
             "number of cameras in CameraGroup does not " \
             "match number of cameras in 2D points given"
 
-        p3ds = self.triangulate(p2ds)
+        p3ds = self._triangulate_ng(p2ds)
         params = {
             'p3d': nn.Parameter(p3ds)
         }
@@ -1762,7 +2065,7 @@ class CameraGroup(nn.Module):
                 for board_num in range(n_boards):
                     point_id = np.where(ids == board_num)[0][0]
                     cam_ids_possible = np.where(valid[:, point_id])[0]
-                    cam_id = np.random.choice(cam_ids_possible)
+                    cam_id = _as_rng(rng).choice(cam_ids_possible)
                     M_cam = self.cameras[cam_id].get_extrinsics_mat().detach().cpu().numpy()
                     M_board_cam = make_M(rvecs_all[cam_id, point_id],
                                          tvecs_all[cam_id, point_id])
@@ -1775,8 +2078,7 @@ class CameraGroup(nn.Module):
             params['tvecs'] = nn.Parameter(torch.as_tensor(tvecs, device=p2ds.device))
 
         return params
-
-
+    @returns_like_input()
     def optim_points(self, points, p3ds,
                      constraints=[],
                      constraints_weak=[],
@@ -1786,7 +2088,8 @@ class CameraGroup(nn.Module):
                      n_deriv_smooth=1, scores=None, verbose=False,
                      n_fixed=0,
                      max_lr=0.1,
-                     n_iters=800):
+                     n_iters=800,
+                     fill='interior'):
         """
         Take in an array of 2D points of shape CxNxJx2,
         an array of 3D points of shape NxJx3,
@@ -1802,7 +2105,38 @@ class CameraGroup(nn.Module):
         constraints = [[0, 1], [1, 2], [2, 3]]
         (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
 
+        fill: what to return where a joint is not seen by at least 2 cameras.
+          'interior' (default): gaps between the first and last observed frame of each joint
+            are filled by the optimisation; frames before the first / after the last
+            observation are NaN (no extrapolation).
+          'none': every frame with fewer than 2 views is NaN.
+          'all': fill everything (aniposelib <= 0.9 behaviour: leading/trailing runs held
+            constant, never-seen joints at the origin, then optimised).
+        The optimisation itself always runs on the fully filled initialisation; fill only
+        decides which cells are returned.
         """
+        return self._optim_points(points, p3ds, constraints=constraints,
+                                  constraints_weak=constraints_weak,
+                                  scale_smooth=scale_smooth, scale_length=scale_length,
+                                  scale_length_weak=scale_length_weak,
+                                  reproj_error_threshold=reproj_error_threshold,
+                                  reproj_loss=reproj_loss, n_deriv_smooth=n_deriv_smooth,
+                                  scores=scores, verbose=verbose, n_fixed=n_fixed,
+                                  max_lr=max_lr, n_iters=n_iters, fill=fill)
+
+    def _optim_points(self, points, p3ds,
+                      constraints=[],
+                      constraints_weak=[],
+                      scale_smooth=4,
+                      scale_length=2, scale_length_weak=0.5,
+                      reproj_error_threshold=15, reproj_loss='soft_l1',
+                      n_deriv_smooth=1, scores=None, verbose=False,
+                      n_fixed=0,
+                      max_lr=0.1,
+                      n_iters=800,
+                      fill='interior'):
+        if fill not in ('interior', 'none', 'all'):
+            raise ValueError("fill must be 'interior', 'none' or 'all', got {!r}".format(fill))
         assert points.shape[0] == len(self.cameras), \
             "Invalid points shape, first dim should be equal to" \
             " number of cameras ({}), but shape is {}".format(
@@ -1810,7 +2144,8 @@ class CameraGroup(nn.Module):
             )
 
         n_cams, n_frames, n_joints, _ = points.shape
-        device = next(self.parameters()).device
+        device = self.device
+        dtype = self.dtype
         constraints = np.array(constraints)
         constraints_weak = np.array(constraints_weak)
 
@@ -1818,6 +2153,13 @@ class CameraGroup(nn.Module):
             p3ds = p3ds.detach().cpu().numpy()
         else:
             p3ds = np.array(p3ds)
+
+        if fill != 'all':
+            pts_np = points.detach().cpu().numpy() if torch.is_tensor(points) else np.asarray(points)
+            observed = np.sum(np.all(np.isfinite(pts_np), axis=-1), axis=0) >= 2  # (N, J)
+            keep = interior_span(observed) if fill == 'interior' else observed
+        else:
+            keep = None
         
         p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
 
@@ -1831,12 +2173,12 @@ class CameraGroup(nn.Module):
             p3ds_intp, constraints, constraints_weak, device=device)
 
         if n_fixed > 0:
-            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed], device=device)
+            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed], device=device, dtype=dtype)
         else:
             p3ds_fixed = None
 
-        points_tensor = to_tensor(points, device=device)
-        scores = to_tensor(scores, device=device)
+        points_tensor = to_tensor(points, device=device, dtype=dtype)
+        scores = to_tensor(scores, device=device, dtype=dtype)
 
         all_params = list(params.values())
         optimizer = optim.Adam(all_params, lr=1e-2, weight_decay=0, amsgrad=True)
@@ -1849,39 +2191,41 @@ class CameraGroup(nn.Module):
         # idle between tiny kernels (nvtop shows ~0% util). Instead we keep best_loss as a
         # tensor and update best_state branchlessly with torch.where, so nothing is read
         # back to the host inside the loop and the iterations can pipeline.
-        best_loss = torch.tensor(float('inf'), device=device, dtype=torch.float64)
+        best_loss = torch.tensor(float('inf'), device=device, dtype=dtype)
         best_state = {k: v.detach().clone() for k, v in params.items()}
 
-        for i in range(n_iters):
-            optimizer.zero_grad()
-            loss = self._error_fun_triangulation(params, points_tensor,
-                                                 constraints=constraints,
-                                                 constraints_weak=constraints_weak,
-                                                 scores=scores,
-                                                 scale_smooth=scale_smooth_full,
-                                                 scale_length=scale_length,
-                                                 scale_length_weak=scale_length_weak,
-                                                 reproj_error_threshold=reproj_error_threshold,
-                                                 reproj_loss=reproj_loss,
-                                                 n_deriv_smooth=n_deriv_smooth,
-                                                 p3ds_fixed=p3ds_fixed
-                                                 )
+        # the public wrapper runs under no_grad; the fit itself needs autograd
+        with torch.enable_grad():
+            for i in range(n_iters):
+                optimizer.zero_grad()
+                loss = self._error_fun_triangulation(params, points_tensor,
+                                                     constraints=constraints,
+                                                     constraints_weak=constraints_weak,
+                                                     scores=scores,
+                                                     scale_smooth=scale_smooth_full,
+                                                     scale_length=scale_length,
+                                                     scale_length_weak=scale_length_weak,
+                                                     reproj_error_threshold=reproj_error_threshold,
+                                                     reproj_loss=reproj_loss,
+                                                     n_deriv_smooth=n_deriv_smooth,
+                                                     p3ds_fixed=p3ds_fixed
+                                                     )
 
-            # snapshot best params before stepping; pure GPU ops, no host sync
-            with torch.no_grad():
-                improved = loss < best_loss
-                best_loss = torch.where(improved, loss.detach(), best_loss)
-                for k, v in params.items():
-                    best_state[k] = torch.where(improved, v.detach(), best_state[k])
+                # snapshot best params before stepping; pure GPU ops, no host sync
+                with torch.no_grad():
+                    improved = loss < best_loss
+                    best_loss = torch.where(improved, loss.detach(), best_loss)
+                    for k, v in params.items():
+                        best_state[k] = torch.where(improved, v.detach(), best_state[k])
 
-            if verbose and i % 20 == 0:
-                # opt-in debug print; the .item() here only runs when verbose is set
-                print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
+                if verbose and i % 20 == 0:
+                    # opt-in debug print; the .item() here only runs when verbose is set
+                    print("iter: {} \t loss: {:.3f}".format(i, loss.item()))
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
-            optimizer.step()
-            scheduler.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
+                optimizer.step()
+                scheduler.step()
 
         # Restore best parameters (GPU copy, no host sync)
         with torch.no_grad():
@@ -1894,7 +2238,11 @@ class CameraGroup(nn.Module):
             print("iter: {} \t best loss: {:.3f}".format(i, best_loss.item()))
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
-        return params['p3d'].detach()
+        out = params['p3d'].detach()
+        if keep is not None:
+            out = out.clone()
+            out[~torch.as_tensor(keep, device=out.device)] = float('nan')
+        return out
 
     def optim_points_possible(self, points, p3ds,
                               constraints=[],
@@ -1929,6 +2277,7 @@ class CameraGroup(nn.Module):
         raise NotImplementedError("optim_points_possible not converted to pytorch yet, post an issue on github or email Lili Karashchuk if you need this function")
         
 
+    @returns_like_input()
     def triangulate_optim(self, points, init_ransac=False, init_progress=False,
                           **kwargs):
         """
@@ -1958,12 +2307,14 @@ class CameraGroup(nn.Module):
         # constraints = np.array(constraints)
         # constraints_weak = np.array(constraints_weak)
 
+        points = self._tensor(points)
         points_shaped = points.reshape(n_cams, n_frames*n_joints, 2)
         if init_ransac:
-            p3ds, picked, p2ds, errors = self.triangulate_ransac(points_shaped, progress=init_progress)
+            p3ds, picked, p2ds, errors = self._triangulate_possible(
+                points_shaped.reshape(n_cams, n_frames*n_joints, 1, 2), progress=init_progress)
             points = p2ds.reshape(points.shape)
         else:
-            p3ds = self.triangulate(points_shaped, progress=init_progress)
+            p3ds = self._triangulate(points_shaped, progress=init_progress)
         p3ds = p3ds.reshape((n_frames, n_joints, 3))
 
         c = torch.isfinite(p3ds[:, :, 0])
@@ -1971,7 +2322,7 @@ class CameraGroup(nn.Module):
             print("warning: not enough 3D points to run optimization")
             return p3ds
 
-        return self.optim_points(points, p3ds, **kwargs)
+        return self._optim_points(points, p3ds, **kwargs)
 
 
 
@@ -2008,7 +2359,7 @@ class CameraGroup(nn.Module):
         # reprojection errors
         p3ds_flat = p3ds.reshape(-1, 3)
         p2ds_flat = p2ds.reshape((n_cams, -1, 2))
-        errors = self.reprojection_error(p3ds_flat, p2ds_flat)
+        errors = self._reprojection_error(p3ds_flat, p2ds_flat)
         if scores is not None:
             scores_flat = scores.reshape((n_cams, -1))
             errors = errors * scores_flat[:, :, None]
@@ -2085,16 +2436,16 @@ class CameraGroup(nn.Module):
         joint_lengths_weak[joint_lengths_weak > med+mad*5] = med
 
         params = {
-            'p3d': nn.Parameter(to_tensor(p3ds, device=device)),
-            'joint_lengths': nn.Parameter(to_tensor(joint_lengths, device=device)),
-            'joint_lengths_weak': nn.Parameter(to_tensor(joint_lengths_weak, device=device))
+            'p3d': nn.Parameter(to_tensor(p3ds, device=device, dtype=self.dtype)),
+            'joint_lengths': nn.Parameter(to_tensor(joint_lengths, device=device, dtype=self.dtype)),
+            'joint_lengths_weak': nn.Parameter(to_tensor(joint_lengths_weak, device=device, dtype=self.dtype))
         }
 
         return params
 
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
-        metadata = copy(self.metadata)
+        metadata = deepcopy(self.metadata)
         return CameraGroup(cameras, metadata)
 
     def set_rotations(self, rvecs):
@@ -2135,9 +2486,64 @@ class CameraGroup(nn.Module):
     def get_n_dists(self):
         return [cam.get_n_dist() for cam in self.cameras]
 
+    def set_free_intrinsics(self, names=DEFAULT_FREE_INTRINSICS):
+        """Choose which camera-matrix entries bundle adjustment may move, on every camera.
+        See Camera.set_free_intrinsics."""
+        for cam in self.cameras:
+            cam.set_free_intrinsics(names)
+
+    def get_free_intrinsics(self):
+        return [cam.get_free_intrinsics() for cam in self.cameras]
+
+    def get_offsets(self):
+        return torch.stack([cam.get_offset() for cam in self.cameras])
+
+    def set_offsets(self, offsets):
+        for cam, off in zip(self.cameras, offsets):
+            cam.set_offset(off)
+
+    def apply_crop_offsets(self, config, set_size=True):
+        """Set per-camera crop offsets from an anipose-style config.
+
+        `config` may be a full anipose config dict (with a 'cameras' table), the 'cameras'
+        table itself ({name: {'offset': [x, y, w, h]}}), or a plain {name: [x, y(, w, h)]}.
+        (x, y) becomes the camera offset (stored-image origin in sensor pixels). With four
+        values and set_size=True the camera size becomes (w, h), the stored image size.
+        Cameras missing from the config are left unchanged. Returns self."""
+        table = config.get('cameras', config) if isinstance(config, dict) else config
+        for cam in self.cameras:
+            entry = table.get(cam.get_name())
+            if entry is None:
+                continue
+            values = entry.get('offset') if isinstance(entry, dict) else entry
+            if values is None:
+                continue
+            values = [float(v) for v in values]
+            if len(values) not in (2, 4):
+                raise ValueError("offset for camera {} must have 2 or 4 values, got {}".format(
+                    cam.get_name(), values))
+            cam.set_offset(values[:2])
+            if len(values) == 4 and set_size:
+                cam.set_size((int(values[2]), int(values[3])))
+        return self
+
+    def _triangulate_ng(self, *args, **kwargs):
+        with torch.no_grad():
+            return self._triangulate(*args, **kwargs)
+
+    def _reprojection_error_ng(self, *args, **kwargs):
+        with torch.no_grad():
+            return self._reprojection_error(*args, **kwargs)
+
+    @returns_like_input()
     def average_error(self, p2ds, median=False):
-        p3ds = self.triangulate(p2ds)
-        errors = self.reprojection_error(p3ds, p2ds, mean=True)
+        """Mean (or median) over points of the per-point mean reprojection error after
+        triangulating p2ds (C x N x 2)."""
+        return self._average_error(p2ds, median=median)
+
+    def _average_error(self, p2ds, median=False):
+        p3ds = self._triangulate(p2ds)
+        errors = self._reprojection_error(p3ds, p2ds, mean=True)
         if median:
             return torch.median(errors)
         else:
@@ -2146,9 +2552,12 @@ class CameraGroup(nn.Module):
     def calibrate_rows(self, all_rows, board,
                        init_intrinsics=True, init_extrinsics=True, verbose=True,
                        **kwargs):
+        """Calibrate from board detections. Extra keyword arguments go to bundle_adjust_iter
+        (unknown ones raise TypeError before any work is done)."""
+        _check_kwargs('calibrate_rows', kwargs, _BA_ITER_KWARGS)
+        self._check_not_frozen('calibrate_rows')
         assert len(all_rows) == len(self.cameras), \
             "Number of camera detections does not match number of cameras"
-
         for rows, camera in zip(all_rows, self.cameras):
             size = camera.get_size()
 
@@ -2212,11 +2621,15 @@ class CameraGroup(nn.Module):
                     print(e)
 
 
+
     def calibrate_videos(self, videos, board,
                          init_intrinsics=True, init_extrinsics=True, verbose=True,
                          **kwargs):
         """Takes as input a list of list of video filenames, one list of each camera.
-        Also takes a board which specifies what should be detected in the videos"""
+        Also takes a board which specifies what should be detected in the videos.
+        Extra keyword arguments go to bundle_adjust_iter (unknown ones raise TypeError
+        before any video is read)."""
+        _check_kwargs('calibrate_videos', kwargs, _BA_ITER_KWARGS)
 
         all_rows = self.get_rows_videos(videos, board, verbose=verbose)
         if init_extrinsics:
@@ -2232,14 +2645,15 @@ class CameraGroup(nn.Module):
         for cam in self.cameras:
             for p in cam.get_extrinsics_params():
                 yield p
-        
+
     def get_dicts(self):
         out = []
         for cam in self.cameras:
             out.append(cam.get_dict())
         return out
 
-    def from_dicts(arr):
+    @staticmethod
+    def from_dicts(arr, metadata=None, dtype=None):
         cameras = []
         for d in arr:
             if 'fisheye' in d and d['fisheye']:
@@ -2247,8 +2661,10 @@ class CameraGroup(nn.Module):
             else:
                 cam = Camera.from_dict(d)
             cameras.append(cam)
-        return CameraGroup(cameras)
+        _warn_duplicate_names([c.get_name() for c in cameras])
+        return CameraGroup(cameras, metadata=metadata, dtype=dtype)
 
+    @staticmethod
     def from_names(names, fisheye=False, n_dist=2):
         cameras = []
         for name in names:
@@ -2263,64 +2679,87 @@ class CameraGroup(nn.Module):
         for cam, d in zip(self.cameras, arr):
             cam.load_dict(d)
 
-    def dump(self, fname):
+    def to_dict(self):
+        """The calibration file as a dict: {'cam_0': {...}, ..., 'metadata': {...}}, cameras
+        in group order. JSON/TOML friendly."""
         dicts = self.get_dicts()
         names = ['cam_{}'.format(i) for i in range(len(dicts))]
         master_dict = dict(zip(names, dicts))
-        master_dict['metadata'] = self.metadata
-        with open(fname, 'w') as f:
-            toml.dump(master_dict, f)
+        master_dict['metadata'] = _to_builtin(deepcopy(self.metadata))
+        return master_dict
 
-    def load(fname):
+    @staticmethod
+    def from_dict(master_dict, order='natural', dtype=None):
+        """Inverse of to_dict. Camera sections are every key other than 'metadata', ordered
+        by `order`: 'natural' (default; cam_2 before cam_10), 'lexical' (aniposelib <= 0.9)
+        or 'file' (dict order)."""
+        keys = [k for k in master_dict.keys() if k != 'metadata']
+        keys = _order_keys(keys, order=order)
+        items = [master_dict[k] for k in keys]
+        metadata = deepcopy(master_dict.get('metadata', {}))
+        return CameraGroup.from_dicts(items, metadata=metadata, dtype=dtype)
+
+    def dumps(self):
+        """The calibration as a TOML string (same content as dump)."""
+        return toml.dumps(self.to_dict())
+
+    @staticmethod
+    def loads(s, order='natural', dtype=None):
+        """Load a calibration from a TOML string (see from_dict for `order`)."""
+        return CameraGroup.from_dict(toml.loads(s), order=order, dtype=dtype)
+
+    def dump(self, fname):
+        with open(fname, 'w') as f:
+            toml.dump(self.to_dict(), f)
+
+    @staticmethod
+    def load(fname, order='natural', dtype=None):
+        """Load a calibration TOML. Cameras are ordered by key with a numeric sort
+        (cam_2 before cam_10); order='lexical' restores the aniposelib <= 0.9 order and
+        order='file' keeps the file's section order. A CameraOrderWarning is issued when
+        the numeric and lexical orders differ, and on duplicate camera names."""
         master_dict = toml.load(fname)
-        keys = sorted(master_dict.keys())
-        items = [master_dict[k] for k in keys if k != 'metadata']
-        cgroup = CameraGroup.from_dicts(items)
-        if 'metadata' in master_dict:
-            cgroup.metadata = master_dict['metadata']
-        return cgroup
+        return CameraGroup.from_dict(master_dict, order=order, dtype=dtype)
 
     def resize_cameras(self, scale):
         for cam in self.cameras:
             cam.resize_camera(scale)
 
+    @returns_like_input()
     def is_point_visible(self, p3d, margin=0):
         """Takes a Nx3 set of 3D points.
         Returns a boolean array of CxN where C is the number of cameras,
         representing if each camera can see each point.
         """
-        all_visible = [cam.is_point_visible(p3d)
+        p3d = self._tensor(p3d)
+        all_visible = [cam.is_point_visible(p3d, margin=margin)
                        for cam in self.cameras]
         return torch.stack(all_visible)
 
-    
+    @returns_like_input()
     def get_triangulation_sensitivity(self, p):
         """
         Compute triangulation sensitivity for a set of 3D points.
-        This is the minimum singular value of all the projection sensitivities from each camera.
-        Generally, a higher value means that large movements of the 3D point
-          would result in small movements in the projections, meaning that the triangulation
-          is likely to be less reliable.
+        This is the condition number of the stacked projection sensitivities of the cameras
+        that see the point. Lower is more reliable; NaN where fewer than 2 cameras see it.
 
         Parameters:
         -----------
-        p : array_like, shape (3,) or (N, 3)
+        p : array_like, shape (N, 3)
             3D point(s) in world coordinates
 
         Returns:
         --------
-        sensitivity : float or ndarray
-            Lower number means more reliable triangulation 
+        sensitivity : (N,) array
         """
-        # p = np.array(p, dtype='float64')
-        p = to_tensor(p)
-        
+        p = self._tensor(p).reshape(-1, 3)
+
         n_points = p.shape[0]
         n_cams = len(self.cameras)
 
-        J_all = torch.zeros((n_points, 2*n_cams, 3), dtype=torch.float64)
+        J_all = torch.zeros((n_points, 2*n_cams, 3), dtype=p.dtype, device=p.device)
         visibles = self.is_point_visible(p)
-        
+
         for i, cam in enumerate(self.cameras):
             J_cam = cam.projection_sensitivity(p)
             J_cam = J_cam * visibles[i, :, None, None]
@@ -2328,46 +2767,53 @@ class CameraGroup(nn.Module):
 
         # handle nans
         J_all[~torch.isfinite(J_all)] = 0
-        
+
         # Compute conditioning
         s = torch.linalg.svdvals(J_all)
         sensitivity = s[:, 0] / (s[:, -1] + 1e-10)
-        # sensitivity = 1/(s[:, -1] + 1e-6)
 
-        # sensitivity = np.min(np.max(np.abs(J_all), axis=1), axis=1)
-        
         count = torch.sum(visibles, dim=0)
         sensitivity[count < 2] = torch.nan
 
         return sensitivity
 
+    def get_point_cloud(self, sensitivity_threshold=4, rng=None):
+        """Sample points that at least two cameras see with good triangulation sensitivity.
+        Returns (points Mx3, sensitivity M) as torch tensors. rng: np.random.Generator, int
+        seed or None (fresh entropy); the global torch RNG is not used."""
+        rng = _as_rng(rng)
+        with torch.no_grad():
+            points = []
+            for c1, c2 in itertools.combinations(self.cameras, 2):
+                rays1 = c1.get_camera_rays()
+                rays2 = c2.get_camera_rays()
+                for r1, r2 in itertools.product(rays1, rays2):
+                    p = closest_point_between_rays(r1, r2)
+                    if p is not None:
+                        points.append(p)
+            points = torch.stack(points)
 
-    def get_point_cloud(self, sensitivity_threshold=4):
-        points = []
-        for c1, c2 in itertools.combinations(self.cameras, 2):
-            rays1 = c1.get_camera_rays()
-            rays2 = c2.get_camera_rays()
-            for r1, r2 in itertools.product(rays1, rays2):
-                p = closest_point_between_rays(r1, r2)
-                if p is not None:
-                    points.append(p)
-        points = torch.stack(points)
+            low, high = torch.quantile(points,
+                                       to_tensor([0.05, 0.95], device=points.device,
+                                                 dtype=points.dtype),
+                                       dim=0)
+            scale = torch.max(high - low) * 0.15
 
-        low, high = torch.quantile(points,
-                                   to_tensor([0.05, 0.95], device=points.device),
-                                   dim=0)
-        scale = torch.max(high - low) * 0.15
+            all_points = [points]
+            for i in range(15):
+                noise = torch.as_tensor(rng.standard_normal(points.shape),
+                                        dtype=points.dtype, device=points.device)
+                pp = points + noise * scale
+                all_points.append(pp)
+            all_points = torch.vstack(all_points)
 
-        all_points = [points]
-        for i in range(15):
-            pp = points + torch.randn(points.shape) * scale 
-            all_points.append(pp)
-        all_points = torch.vstack(all_points)
+            s = self.get_triangulation_sensitivity(all_points)
+            s[torch.isnan(s)] = torch.inf
 
-        s = self.get_triangulation_sensitivity(all_points)
-        s[torch.isnan(s)] = torch.inf
+            good = s < sensitivity_threshold
 
-        good = s < sensitivity_threshold
-        
-        return all_points[good], s[good]
+            return all_points[good], s[good]
 
+
+_BA_ITER_KWARGS = {'n_iters', 'start_mu', 'end_mu', 'max_nfev', 'ftol', 'n_samp_iter',
+                   'n_samp_full', 'error_threshold', 'only_extrinsics', 'rng'}

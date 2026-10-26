@@ -39,8 +39,6 @@ def test_dump_load_roundtrip(rig, tmp_path):
     same(params(cg), params(CameraGroup.load(tmp_path / 'c.toml')))
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0 B1: load() sorts cam_10 before cam_2, permuting rigs with >10 cameras', strict=False)
 @pytest.mark.parametrize('rig', ['allen_12cam', 'outdoor_12cam'])
 def test_dump_load_roundtrip_many_cameras(rig, tmp_path):
     cg = synth.load_rig(rig)

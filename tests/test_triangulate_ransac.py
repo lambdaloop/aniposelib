@@ -24,7 +24,7 @@ def synthetic_scene(cgroup, n_points=100, spread=0.05, seed=0):
     """Generate 3D points near the scene center and project to all cameras."""
     rng = np.random.default_rng(seed)
     p3d_gt = SCENE_CENTER + rng.uniform(-spread, spread, size=(n_points, 3))
-    p2d = cgroup.project(torch.tensor(p3d_gt, dtype=torch.float64)).detach().numpy()
+    p2d = cgroup.project(p3d_gt)  # numpy in -> numpy out
     return p3d_gt, p2d  # p2d: (C, N, 2)
 
 
@@ -43,10 +43,7 @@ def test_shapes_and_nan_mask():
         p2d[c, n] = np.nan
 
     out, picked_vals, points_2d, errors = cgroup.triangulate_ransac(p2d)
-    out = out.detach().numpy()
-    picked_vals = picked_vals.detach().numpy()
-    points_2d = points_2d.detach().numpy()
-    errors = errors.detach().numpy()
+    errors = errors
 
     assert out.shape == (n_points, 3)
     assert picked_vals.shape == (n_cams, n_points, 1)
@@ -77,8 +74,6 @@ def test_ground_truth_recovery():
         p2d[c, n] = np.nan
 
     out, _, _, errors = cgroup.triangulate_ransac(p2d)
-    out = out.detach().numpy()
-    errors = errors.detach().numpy()
 
     assert np.all(np.isfinite(out)), "All 3D points should be finite"
     assert np.all(np.isfinite(errors)), "All errors should be finite"
@@ -102,8 +97,6 @@ def test_outlier_exclusion():
     p2d[outlier_cam, :n_outlier] += rng.normal(0, 30.0, size=(n_outlier, 2))
 
     out, picked_vals, _, _ = cgroup.triangulate_ransac(p2d)
-    out = out.detach().numpy()
-    picked_vals = picked_vals.detach().numpy()
 
     # The outlier camera should be excluded for all corrupted points
     for n in range(n_outlier):
@@ -135,8 +128,6 @@ def test_triangulate_possible_p2():
         p2d_2[c, n, :, :] = np.nan
 
     out, picked_vals, _, _ = cgroup.triangulate_possible(p2d_2)
-    out = out.detach().numpy()
-    picked_vals = picked_vals.detach().numpy()
 
     # For every (cam, point) where any candidate was picked, it must be q=0
     for c in range(n_cams):

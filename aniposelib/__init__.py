@@ -23,4 +23,4 @@ VERSION = __version__
 DISTRIBUTION = 'aniposelib-pytorch'
 BACKEND = 'torch'
 
-from . import boards, cameras, utils
+from . import boards, cameras, params, utils

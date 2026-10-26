@@ -23,7 +23,7 @@ K = np.array([[800.0, 0.0, 320.0],
 def dist_grad(cam):
     """Which distortion coefficients actually receive gradient."""
     cam.dist.grad = None
-    cam.project(np.array([[0.1, 0.2, 3.0], [0.4, -0.2, 2.0]])).sum().backward()
+    cam.project(np.array([[0.1, 0.2, 3.0], [0.4, -0.2, 2.0]]), return_grad=True).sum().backward()
     return np.nonzero(cam.dist.grad.detach().cpu().numpy())[0].tolist()
 
 
@@ -32,7 +32,7 @@ def perturbed_group(n_dist, seed=3):
     cgroup = CameraGroup.load(FISHEYE_TOML)
     rng = np.random.default_rng(seed)
     p3d = rng.normal(size=(400, 3)) * 0.5
-    p2d = cgroup.project(p3d).detach().numpy() + rng.normal(scale=0.5, size=(5, 400, 2))
+    p2d = cgroup.project(p3d) + rng.normal(scale=0.5, size=(5, 400, 2))
 
     for cam in cgroup.cameras:
         cam.rvec.data += torch.as_tensor(rng.normal(size=3) * 0.01)
@@ -121,7 +121,7 @@ def test_bundle_adjust_iter_freezes_exactly():
     before = [c.dist.detach().clone() for c in cgroup.cameras]
 
     cgroup.bundle_adjust_iter(p2d, n_iters=3, n_samp_iter=100, n_samp_full=200,
-                              verbose=False)
+                              verbose=False, rng=0)
 
     for b, cam in zip(before, cgroup.cameras):
         assert torch.equal(cam.dist.detach()[2:], b[2:])
@@ -131,7 +131,7 @@ def test_frozen_values_are_kept_not_zeroed():
     """Seeding known-good distortions and freezing them is the point."""
     cam = FisheyeCamera(matrix=K, dist=np.array([0.05, 0.01, 0.03, -0.02]), n_dist=1)
     cam.dist.grad = None
-    cam.project(np.array([[0.1, 0.2, 3.0]])).sum().backward()
+    cam.project(np.array([[0.1, 0.2, 3.0]]), return_grad=True).sum().backward()
     assert np.allclose(cam.dist.detach().numpy()[1:], [0.01, 0.03, -0.02])
 
 
@@ -211,7 +211,7 @@ def _board_views():
     for _ in range(14):
         truth.set_rotation(rng.normal(scale=0.35, size=3))
         truth.set_translation(np.array([0, 0, 1.1]) + rng.normal(scale=0.28, size=3))
-        p2d = truth.project(objp.reshape(-1, 3)).detach().numpy()
+        p2d = truth.project(objp.reshape(-1, 3))
         if not (p2d.min() > 0 and p2d[:, 0].max() < size[0]
                 and p2d[:, 1].max() < size[1]):
             continue

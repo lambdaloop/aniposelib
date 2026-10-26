@@ -29,7 +29,6 @@ dependencies = [
     # stable since 4.8), so contrib is not needed. opencv-contrib-python also provides cv2
     # and keeps working if it is installed instead.
     "opencv-python>=4.8,<5",
-    "numba",
     "pandas",
     "numpy",
     "scipy",

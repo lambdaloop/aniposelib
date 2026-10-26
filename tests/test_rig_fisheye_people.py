@@ -79,8 +79,6 @@ def test_metric_scale_from_board(true_scale):
     assert abs(np.nanmedian(ratios) / true_scale - 1) < 0.005
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason="1.0 B11: optim_points(fill='interior') must not invent points outside observed spans", strict=False)
 def test_optim_points_does_not_extrapolate(scene):
     true, p3d, p2d, bones = scene
     p2d = p2d.copy()
