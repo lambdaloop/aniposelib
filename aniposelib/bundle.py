@@ -1469,3 +1469,453 @@ def _write_back(cgroup, prob, ext, intr):
                     cam._refresh_frozen()
                 except Exception:
                     pass
+
+
+# ====================================================================== structured rejection
+
+@dataclass
+class RejectSchedule:
+    """Per-round thresholds (px) for structured rejection in :func:`bundle_adjust_robust`
+    (motor observatory ``robust_bundle_adjust``). Round ``r`` uses entry ``min(r, len - 1)``;
+    None disables that mask.
+
+    ``frame``: drop every (camera, frame) block whose median error exceeds the threshold
+    (decoys: a camera locked on something else for whole frames); ``keypoint``: drop
+    (camera, keypoint) pairs a camera systematically gets wrong (occluded body parts);
+    ``obs``: drop single observations above the threshold."""
+    frame: Optional[tuple] = (40, 20, 12, 10)
+    keypoint: Optional[tuple] = (40, 25, 15, 12)
+    obs: Optional[tuple] = (60, 30, 20, 15)
+    min_frame_pts: int = 8
+    min_kpt_obs: int = 20
+    protect_kpts: int = 8
+    max_kpt_frac: float = 0.4
+
+    @staticmethod
+    def pick(seq, r):
+        if seq is None:
+            return None
+        if np.isscalar(seq):
+            return float(seq)
+        return float(seq[min(r, len(seq) - 1)])
+
+    def to_dict(self):
+        return _jsonable(dataclasses.asdict(self))
+
+
+def frame_mask(errors, frame_id, thresh, min_pts=8):
+    """Exclusion mask ``[C,N]`` of every (camera, frame) block whose median error > ``thresh``
+    (blocks with fewer than ``min_pts`` finite errors are kept). Also returns ``[C,F]`` bad blocks
+    and the frame ids ``F``."""
+    errors = np.asarray(errors, dtype=float)
+    frame_id = np.asarray(frame_id)
+    frames, inv = np.unique(frame_id, return_inverse=True)
+    C, F = errors.shape[0], len(frames)
+    order = np.argsort(inv, kind='stable')
+    counts = np.bincount(inv, minlength=F)
+    width = int(counts.max()) if F else 0
+    cols = np.concatenate([np.arange(c) for c in counts]) if F else np.zeros(0, int)
+    grid = np.full((C, F, max(width, 1)), np.nan)
+    grid[:, inv[order], cols] = errors[:, order]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        med = np.nanmedian(grid, axis=2)
+    cnt = np.isfinite(grid).sum(2)
+    bad = (med > thresh) & (cnt >= min_pts)
+    return bad[:, inv], bad, frames
+
+
+def keypoint_mask(errors, kpt_id, thresh, min_obs=20, protect=8, max_frac=0.4):
+    """Exclusion mask ``[C,N]`` of (camera, keypoint) pairs whose median error > ``thresh``,
+    capped at ``max_frac`` of the keypoints per camera and never leaving fewer than ``protect``
+    keypoints (motor ``keypoint_mask``). Also returns the ``[C,K]`` mask."""
+    errors = np.asarray(errors, dtype=float)
+    kpt_id = np.asarray(kpt_id).astype(np.int64)
+    C = errors.shape[0]
+    K = int(kpt_id.max()) + 1 if len(kpt_id) else 0
+    mask = np.zeros((C, K), bool)
+    for i in range(C):
+        med = np.full(K, np.nan)
+        fin = np.isfinite(errors[i])
+        for k in range(K):
+            sel = (kpt_id == k) & fin
+            if sel.sum() >= min_obs:
+                med[k] = np.median(errors[i][sel])
+        cand = np.isfinite(med) & (med > thresh)
+        order = np.argsort(np.where(np.isfinite(med), med, -np.inf))
+        if cand.sum() > max_frac * K:
+            cand = np.zeros(K, bool)
+            cand[order[-int(max_frac * K):]] = True
+        if protect and (~cand).sum() < protect:
+            keep = order[::-1]
+            keep = [k for k in np.argsort(np.where(np.isfinite(med), med, np.inf))[:protect]]
+            cand = np.ones(K, bool)
+            cand[keep] = False
+        mask[i] = cand
+    return mask[:, kpt_id], mask
+
+
+# ====================================================================== resection
+
+@dataclass
+class ResectResult:
+    """Outcome of resecting one camera. ``n_inliers_before/after``: its detections within
+    ``tau_pnp`` px of the points triangulated from the other cameras, before / with the new pose."""
+    camera: str
+    updated: bool
+    n_points: int
+    n_inliers_before: int
+    n_inliers_after: int
+    rvec: Any = None
+    tvec: Any = None
+    reason: str = ''
+
+    def to_dict(self):
+        return _jsonable(dataclasses.asdict(self))
+
+
+def _pnp_normalized(X, xn, thresh_n, iters, rng_seed=None, guess=None):
+    import cv2
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    xn = np.ascontiguousarray(xn, dtype=np.float64)
+    K = np.eye(3)
+    if guess is not None:
+        ok, rv, tv, inl = cv2.solvePnPRansac(X, xn, K, None, rvec=guess[0].copy(), tvec=guess[1].copy(),
+                                             useExtrinsicGuess=True, reprojectionError=thresh_n,
+                                             iterationsCount=iters, confidence=0.9999,
+                                             flags=cv2.SOLVEPNP_ITERATIVE)
+    else:
+        if rng_seed is not None:
+            cv2.setRNGSeed(int(rng_seed))
+        ok, rv, tv, inl = cv2.solvePnPRansac(X, xn, K, None, reprojectionError=thresh_n, iterationsCount=iters,
+                                             confidence=0.9999, flags=cv2.SOLVEPNP_EPNP)
+    if not ok or inl is None or len(inl) < 6:
+        return None
+    ii = inl[:, 0]
+    rv, tv = cv2.solvePnPRefineLM(X[ii], xn[ii], K, None, rv, tv)
+    return rv.ravel(), tv.ravel()
+
+
+def _count_inliers(cam_P, X, uv, rv, tv, tau):
+    Pc = dataclasses.replace(cam_P, rvec=torch.as_tensor(rv, dtype=cam_P.dtype, device=cam_P.device)[None],
+                             tvec=torch.as_tensor(tv, dtype=cam_P.dtype, device=cam_P.device)[None], ext=None)
+    e = G.reproj_err(Pc, X, uv[None])[0]
+    e = np.where(np.isfinite(e), e, np.inf)
+    return int((e < tau).sum()), e
+
+
+def _frame_pnp(X, xn, uv, frame_id, cam_P, tau, n_frames_sample=3, n_iters=200, min_frame_pts=8, rng=None):
+    """Motor ``frame_pnp_ransac``: minimal samples are whole frames, scored by inlier frames."""
+    rng = _as_rng(rng)
+    fr, cnt = np.unique(frame_id, return_counts=True)
+    fr = fr[cnt >= min_frame_pts]
+    if len(fr) < 2:
+        return None
+    f = cam_P.K[0, 0, 0].item()
+    best = None
+    k = min(n_frames_sample, len(fr))
+    for _ in range(n_iters):
+        sel = np.isin(frame_id, rng.choice(fr, size=k, replace=False))
+        if sel.sum() < 6:
+            continue
+        sol = _pnp_normalized(X[sel], xn[sel], tau / f, 80, rng_seed=int(rng.integers(1 << 30)))
+        if sol is None:
+            continue
+        _, e = _count_inliers(cam_P, X, uv, sol[0], sol[1], tau)
+        bad_all, bad, frames = frame_mask(e[None], frame_id, tau, min_pts=min_frame_pts)
+        good_frames = frames[~bad[0]]
+        score = int(np.isin(fr, good_frames).sum())
+        if best is None or score > best[0]:
+            best = (score, sol, good_frames)
+    if best is None:
+        return None
+    keep = np.isin(frame_id, best[2])
+    sol = _pnp_normalized(X[keep], xn[keep], tau / f, 2000, guess=best[1]) or best[1]
+    return sol
+
+
+def resect_cameras(cgroup, p2ds, cams=None, tau_tri=5.0, tau_pnp=8.0, min_points=50, sample='points',
+                   frame_id=None, contrib=None, force=False, rng=None, iters=5000, min_gain=0.0, max_dist=5.0):
+    """Leave-one-out resection: for each camera, robustly triangulate (MSAC, ``tau_tri``) from the
+    *other* cameras, PnP-RANSAC this camera against those points and keep the new pose if it
+    explains more of its detections (within ``tau_pnp`` px; at least ``min_gain`` relative gain).
+    All cameras are resected against the input rig, then updated together. Degenerate solutions
+    (inliers clustered in a small image region, or the camera more than ``max_dist`` times the
+    other cameras' median distance from the points) are rejected. ``force=True`` always takes a valid
+    PnP solution (placement of cameras with unknown poses). ``sample='frames'`` draws whole frames
+    (``frame_id`` per point) as minimal samples, robust to decoys. Modifies ``cgroup`` in place;
+    returns a list of :class:`ResectResult`."""
+    _check_group(cgroup, 'resect_cameras')
+    rng = _as_rng(rng)
+    p = np.asarray(_np(p2ds), dtype=np.float64)
+    C = p.shape[0]
+    p = p.reshape(C, -1, 2)
+    if frame_id is not None:
+        frame_id = np.asarray(frame_id).reshape(-1)
+    if sample == 'frames' and frame_id is None:
+        raise ValueError("sample='frames' needs frame_id")
+    names = cgroup.get_names()
+    cams = range(C) if cams is None else [_cam_index(cgroup, c) for c in cams]
+    valid = np.isfinite(p).all(-1)
+    out = []
+    P = G.pack(cgroup)       # every camera is resected against the same (input) rig
+    updates = []
+    for c in cams:
+        pm = p.copy()
+        pm[c] = np.nan
+        idx = np.nonzero(valid[c] & (np.isfinite(pm).all(-1).sum(0) >= 2))[0]
+        if len(idx) < min_points:
+            out.append(ResectResult(names[c], False, int(len(idx)), 0, 0, reason='too few points'))
+            continue
+        con = None
+        if contrib is not None:
+            con = np.asarray(contrib, bool).copy()
+            con[c] = False
+        R = T.triangulate_robust(P, pm[:, idx], 'msac', tau=tau_tri, contrib=con)
+        good = R.n_inliers >= 2
+        if good.sum() < min_points:
+            out.append(ResectResult(names[c], False, int(good.sum()), 0, 0, reason='too few consistent points'))
+            continue
+        X = R.p3d[good]
+        uv = p[c, idx[good]]
+        Pc = P.subset([c])
+        n0, _ = _count_inliers(Pc, X, uv, Pc.rvec[0].cpu().numpy(), Pc.tvec[0].cpu().numpy(), tau_pnp)
+        xn = G.undistort(Pc, uv[None])[0]
+        okn = np.isfinite(xn).all(-1)
+        f = float(Pc.K[0, 0, 0])
+        if sample == 'frames':
+            sol = _frame_pnp(X[okn], xn[okn], uv[okn], frame_id[idx[good]][okn], Pc, tau_pnp, rng=rng)
+        else:
+            sol = _pnp_normalized(X[okn], xn[okn], tau_pnp / f, iters, rng_seed=int(rng.integers(1 << 30)))
+        if sol is None:
+            out.append(ResectResult(names[c], False, int(len(X)), n0, 0, reason='PnP failed'))
+            continue
+        n1, e1 = _count_inliers(Pc, X, uv, sol[0], sol[1], tau_pnp)
+        # degeneracy guards: the inliers must cover the image like the detections do (a decoy
+        # explains many detections with a camera placed far away, all points on one pixel), and
+        # the camera must not end up far outside the rig
+        inl = e1 < tau_pnp
+        spread_ok = n1 >= 6 and float(np.sqrt(uv[inl].var(0).sum())) >= 0.3 * float(np.sqrt(uv.var(0).sum()))
+        Rn = G.rodrigues(torch.as_tensor(sol[0], dtype=torch.float64)).numpy()
+        cnew = -Rn.T @ np.asarray(sol[1])
+        cen_all = P.centers().cpu().numpy()
+        others = np.delete(cen_all, c, axis=0)
+        mid = np.nanmedian(X, axis=0)
+        far = np.linalg.norm(cnew - mid) > max_dist * max(np.median(np.linalg.norm(others - mid, axis=1)), 1e-12)
+        sane = spread_ok and not far
+        upd = sane and ((n1 > n0 + min_gain * max(n0, 1)) or (force and n1 >= 6))
+        if upd:
+            updates.append((c, sol))
+        out.append(ResectResult(names[c], bool(upd), int(len(X)), int(n0), int(n1), rvec=sol[0], tvec=sol[1],
+                                reason='more inliers' if upd and n1 > n0 else ('forced' if upd else ('kept' if sane else 'degenerate PnP'))))
+    with torch.no_grad():
+        for c, sol in updates:
+            cam = cgroup.cameras[c]
+            cam.rvec.data.copy_(torch.as_tensor(sol[0], dtype=cam.rvec.dtype, device=cam.rvec.device).reshape(cam.rvec.shape))
+            cam.tvec.data.copy_(torch.as_tensor(sol[1], dtype=cam.tvec.dtype, device=cam.tvec.device).reshape(cam.tvec.shape))
+    return out
+
+
+def place_cameras(cgroup, p2ds, cams, **kwargs):
+    """Place cameras with unknown poses (``cams``) by PnP against the others' points
+    (:func:`resect_cameras` with ``force=True``)."""
+    kwargs.setdefault('force', True)
+    return resect_cameras(cgroup, p2ds, cams=cams, **kwargs)
+
+
+def add_camera(cgroup, camera, p2d_cam, p2ds, **kwargs):
+    """A new group with ``camera`` appended and placed by PnP against points triangulated from
+    ``cgroup`` (``p2d_cam``: the new camera's detections ``N x 2`` (or ``N x J x 2``) of the same
+    points as ``p2ds``). Returns ``(new_group, ResectResult)``."""
+    from copy import deepcopy
+    from .cameras import CameraGroup
+    cams = [deepcopy(c) for c in cgroup.cameras] + [deepcopy(camera)]
+    new = CameraGroup(cams, metadata=deepcopy(getattr(cgroup, 'metadata', None)))
+    p = np.asarray(_np(p2ds), dtype=np.float64)
+    pc = np.asarray(_np(p2d_cam), dtype=np.float64).reshape((1,) + p.shape[1:])
+    res = place_cameras(new, np.concatenate([p, pc], 0), [len(cams) - 1], **kwargs)
+    return new, res[0]
+
+
+# ====================================================================== robust recipe
+
+def _robust_errors(cgroup, flat, tau, contrib=None):
+    P = G.pack(cgroup)
+    R = T.triangulate_robust(P, flat, 'msac', tau=tau, contrib=contrib, min_inliers=2)
+    return R
+
+
+def _per_camera_stats(names, errors, fit=None):
+    out = {}
+    for c, n in enumerate(names):
+        m, p90 = _err_stats(errors[c])
+        d = dict(n_obs=int(np.isfinite(errors[c]).sum()), median=m, p90=p90)
+        if fit is not None:
+            d['n_fit'] = int(fit[c].sum())
+        out[n] = d
+    return out
+
+
+def bundle_adjust_robust(cgroup, p2ds, groups=None, schedule=((200, 100, 50), (40, 20, 10, 5), (20, 10, 5)),
+                         reject='default', resect=True, min_inliers=3, final=('extrinsics', 'intrinsics'),
+                         spec=None, contrib=None, rng=None, max_points=20000, n_iter=25, sig_frac=0.5,
+                         only_extrinsics=False, report_tau=None, resect_kw=None, inplace=True,
+                         revert_if_worse=False, return_report=True, verbose=False):
+    """Robust bundle adjustment recipe (mouse-outdoor / Emory ``calibrate`` + motor masks).
+
+    For each round of ``schedule`` (thresholds ``tau`` in px): MSAC triangulation with ``tau`` ->
+    points with ``>= min_inliers`` inlier views -> LM on their inlier observations (Cauchy,
+    ``f_scale = sig_frac * tau``, extrinsics only); then optional LOO resection of every camera
+    (:func:`resect_cameras`), then structured rejection (``reject``, a :class:`RejectSchedule`;
+    needs ``groups['frame']`` / ``groups['keypoint']``, filled automatically for ``C x N x J x 2``
+    input). ``final`` stages re-run the last round's thresholds with extrinsics, then with the
+    intrinsics of ``spec`` (default: each camera's masks).
+
+    Masks restrict the *fit* only. Errors in the report (per camera, before/after) are computed on
+    **all** observations, against points robustly triangulated with ``report_tau`` (default: the
+    last threshold of the schedule).
+
+    ``contrib``: bool per camera, cameras allowed to define points (others are passengers).
+    Returns a :class:`BAReport` (``method='robust'``), or its ``error`` if ``return_report=False``.
+    """
+    t0 = _time.time()
+    _check_group(cgroup, 'bundle_adjust_robust')
+    if not inplace:
+        from copy import deepcopy
+        cgroup = deepcopy(cgroup)
+    rng_ = _as_rng(rng)
+    if reject == 'default':
+        reject = RejectSchedule()
+    p = np.asarray(_np(p2ds), dtype=np.float64)
+    C = p.shape[0]
+    pshape = p.shape[1:-1]
+    flat = p.reshape(C, -1, 2)
+    NP = flat.shape[1]
+    groups = dict(groups or {})
+    if len(pshape) == 2:
+        n_, j_ = np.meshgrid(np.arange(pshape[0]), np.arange(pshape[1]), indexing='ij')
+        groups.setdefault('frame', n_)
+        groups.setdefault('keypoint', j_)
+    grp = {k: np.broadcast_to(np.asarray(v), pshape).reshape(-1) for k, v in groups.items()}
+    frame_id, kpt_id = grp.get('frame'), grp.get('keypoint')
+    names = cgroup.get_names()
+    valid = np.isfinite(flat).all(-1)
+    schedule = [tuple(np.atleast_1d(s).tolist()) for s in schedule]
+    report_tau = float(report_tau or schedule[-1][-1])
+    base_spec = _resolve_spec(cgroup, spec)
+    ext_spec = base_spec.replace(intrinsics=(), n_dist=0)
+    state0 = {k: v.clone() for k, v in cgroup.state_dict().items()}
+    scale0 = rig_scale_from_centers(G.pack(cgroup).centers())
+
+    rep = BAReport(method='robust', seed=rng if isinstance(rng, (int, np.integer)) else None)
+    rep.config = dict(schedule=schedule, reject=reject.to_dict() if reject else None, resect=resect,
+                      min_inliers=min_inliers, final=list(final or ()), spec=base_spec.to_dict(),
+                      max_points=max_points, n_iter=n_iter, sig_frac=sig_frac, report_tau=report_tau)
+    R0 = _robust_errors(cgroup, flat, report_tau, contrib)
+    e_before = np.where(valid, R0.errors, np.nan)
+    rep.error_before = _err_stats(e_before[valid])[0]
+    before = _per_camera_stats(names, e_before)
+    fit = valid.copy()
+
+    def run_stage(taus, sp, label):
+        for tau in taus:
+            P = G.pack(cgroup)
+            pm = np.where(fit[..., None], flat, np.nan)
+            R = T.triangulate_robust(P, pm, 'msac', tau=float(tau), contrib=contrib, min_inliers=2)
+            n_in = R.n_inliers
+            mi = min_inliers
+            ok = np.nonzero(n_in >= mi)[0]
+            if len(ok) < 50 and mi > 2:
+                ok = np.nonzero(n_in >= 2)[0]
+                mi = 2
+            if len(ok) < 10:
+                rep.history.append(dict(stage=label, tau=float(tau), skipped=True, n_points=int(len(ok))))
+                continue
+            if max_points is not None and len(ok) > max_points:
+                ok = np.sort(rng_.choice(ok, size=max_points, replace=False))
+            inl = R.inliers[:, ok] & fit[:, ok]
+            ci, pj = np.nonzero(inl)
+            obs = Observations(ci, ok[pj], flat[ci, ok[pj]], n_points=NP, n_cams=C)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                r = bundle_adjust_lm(cgroup, obs, p3d_init=R.p3d, spec=sp, loss='cauchy',
+                                     f_scale=float(tau) * sig_frac, n_iter=n_iter, return_report=True,
+                                     min_points_per_camera=6)
+            rep.history.append(dict(stage=label, tau=float(tau), n_points=r.n_points, n_obs=r.n_obs,
+                                    min_inliers=mi, error_before=r.error_before, error=r.error,
+                                    n_iter=r.n_iter, frozen=r.frozen_cameras))
+            rep.stages.append(r)
+            if verbose:
+                print('{} tau {:g}: {} points, {} obs, {:.3f} -> {:.3f} px'.format(
+                    label, tau, r.n_points, r.n_obs, r.error_before, r.error))
+
+    rep.excluded = {}
+    resections = []
+    for rnd, taus in enumerate(schedule):
+        run_stage(taus, ext_spec, 'round{}'.format(rnd))
+        if resect:
+            kw = dict(tau_tri=5.0, tau_pnp=8.0, contrib=contrib, rng=rng_)
+            kw.update(resect_kw or {})
+            pm = np.where(fit[..., None], flat, np.nan)
+            res = resect_cameras(cgroup, pm, **kw)
+            resections.append([r.to_dict() for r in res])
+            if verbose:
+                for r in res:
+                    if r.updated:
+                        print('  resected {}: inliers {} -> {}'.format(r.camera, r.n_inliers_before, r.n_inliers_after))
+        if reject and rnd < len(schedule) - 1 or (reject and not final and rnd == len(schedule) - 1):
+            R = _robust_errors(cgroup, flat, max(5.0, float(taus[-1])), contrib)
+            err = np.where(valid, R.errors, np.nan)
+            new_fit = valid.copy()
+            thr = RejectSchedule.pick(reject.frame, rnd)
+            if thr is not None and frame_id is not None:
+                fm, fbad, _ = frame_mask(err, frame_id, thr, reject.min_frame_pts)
+                new_fit &= ~fm
+                rep.excluded['frame'] = fbad
+            thr = RejectSchedule.pick(reject.keypoint, rnd)
+            if thr is not None and kpt_id is not None:
+                km, kbad = keypoint_mask(err, kpt_id, thr, reject.min_kpt_obs, reject.protect_kpts,
+                                         reject.max_kpt_frac)
+                new_fit &= ~km
+                rep.excluded['keypoint'] = kbad
+            thr = RejectSchedule.pick(reject.obs, rnd)
+            if thr is not None:
+                new_fit &= ~(np.nan_to_num(err, nan=np.inf) > thr)
+            new_fit[:, new_fit.sum(0) < 2] = False
+            fit = new_fit
+    for stage in (final or ()):
+        if stage == 'extrinsics':
+            run_stage(schedule[-1], ext_spec, 'final_extrinsics')
+        elif stage == 'intrinsics':
+            if not only_extrinsics:
+                run_stage(schedule[-1][-2:], base_spec, 'final_intrinsics')
+        else:
+            raise ValueError("final stages must be 'extrinsics' or 'intrinsics', got {!r}".format(stage))
+
+    R1 = _robust_errors(cgroup, flat, report_tau, contrib)
+    e_after = np.where(valid, R1.errors, np.nan)
+    rep.error = _err_stats(e_after[valid])[0]
+    after = _per_camera_stats(names, e_after, fit)
+    for n in names:
+        rep.per_camera[n] = dict(n_obs=after[n]['n_obs'], n_fit=after[n]['n_fit'],
+                                 median_before=before[n]['median'], p90_before=before[n]['p90'],
+                                 median_after=after[n]['median'], p90_after=after[n]['p90'])
+    rep.excluded['fit'] = (valid & ~fit).reshape((C,) + tuple(pshape))
+    rep.excluded['n_fit_excluded'] = int((valid & ~fit).sum())
+    rep.n_obs = int(fit.sum())
+    rep.n_points = int((fit.sum(0) >= 2).sum())
+    rep.n_iter = len(rep.history)
+    rep.config['resections'] = resections
+    scale1 = rig_scale_from_centers(G.pack(cgroup).centers())
+    rep.gauge = dict(scale_before=scale0, scale_after=scale1, scale_ratio=scale1 / scale0 if scale0 > 0 else float('nan'))
+    rep.obs_errors = e_after.reshape((C,) + tuple(pshape))
+    rep.p3d = np.asarray(R1.p3d).reshape(tuple(pshape) + (3,))
+    if revert_if_worse and not (rep.error <= rep.error_before):
+        cgroup.load_state_dict(state0)
+        rep.reverted = True
+        rep.error = rep.error_before
+    rep.elapsed_s = _time.time() - t0
+    rep.cgroup = cgroup
+    if verbose:
+        print(rep.summary())
+    return rep if return_report else float(rep.error)
