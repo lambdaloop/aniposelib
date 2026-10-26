@@ -42,6 +42,8 @@ dev = ["pytest", "pytest-cov", "hypothesis", "build", "twine"]
 # learned ChArUco detector (aniposelib.detectors.deepcharuco): HF weight downloads + ONNX backend.
 # backend='torch' works without these (plain HTTPS download fallback).
 deepcharuco = ["huggingface_hub", "onnxruntime", "onnx"]
+# VGGT initialisation hypotheses (aniposelib.init.vggt); the module imports without them
+vggt = ["vggt", "huggingface_hub"]
 # audio decoding for aniposelib.sync.load_audio (an ffmpeg executable also works without it)
 sync = ["soundfile", "av"]
 
@@ -49,7 +51,7 @@ sync = ["soundfile", "av"]
 Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
 
 [tool.setuptools]
-packages = ["aniposelib", "aniposelib.detectors"]
+packages = ["aniposelib", "aniposelib.detectors", "aniposelib.init"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
