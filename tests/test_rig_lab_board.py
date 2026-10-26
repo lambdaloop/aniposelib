@@ -76,8 +76,6 @@ def test_calibrate_rows_end_to_end():
     assert synth.center_error(cg, true).max() < 0.08
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0: LM/robust BA should recover board rigs to <0.5% of rig scale and <0.5% focal', strict=False)
 def test_board_ba_recovers_rig_precisely():
     true = synth.load_rig('allen_7cam')
     cg, imgp, extra = initialise(true)

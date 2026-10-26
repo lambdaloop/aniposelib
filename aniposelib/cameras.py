@@ -2016,8 +2016,131 @@ class CameraGroup(nn.Module):
                            max_nfev=850, ftol=1e-8,
                            n_samp_iter=450, n_samp_full=1000,
                            error_threshold=0.7, only_extrinsics=False,
+                           verbose=False, rng=None, *, method='lm', spec=None,
+                           return_report=False, max_points=20000, resect=True):
+        """Iterative robust bundle adjustment of C x N x 2 (or C x N x J x 2) points.
+
+        method='lm' (default since 1.0): Levenberg-Marquardt (aniposelib.bundle).
+          * without `extra`: :func:`aniposelib.bundle.bundle_adjust_robust` -- MSAC triangulation,
+            LM on inlier observations with an annealed threshold (`n_iters` steps from
+            ~1.5 x the initial error down to 10 px, then 20/10/5 px), LOO resection of cameras
+            (`resect`), structured rejection, then a final extrinsics (+ intrinsics unless
+            `only_extrinsics`) stage. `max_points` bounds the points per LM solve.
+          * with `extra` (boards from calibrate_rows): each board is a rigid body (6 pose
+            parameters); an extrinsics-only LM pass then a full pass (Cauchy loss).
+          Returns the final median reprojection error (px, python float) or a BAReport if
+          `return_report`. `spec` (aniposelib.params.ParamSpec) selects the free parameters
+          (default: each camera's free_intrinsics + n_dist). `start_mu`, `end_mu`, `max_nfev`,
+          `ftol`, `n_samp_iter`, `n_samp_full` and `error_threshold` only affect method='adam'.
+        method='adam': the aniposelib 0.9 Adam/OneCycle code path, unchanged (`spec` and
+          `return_report` are not supported); returns a float.
+        rng: np.random.Generator, int seed or None (fresh entropy); the global RNG is never used.
+        """
+        if method == 'adam':
+            if spec is not None or return_report:
+                raise TypeError("spec= and return_report= need method='lm'")
+            from .bundle import BAError
+            return BAError(self._bundle_adjust_iter_adam(
+                p2ds, extra, n_iters=n_iters, start_mu=start_mu, end_mu=end_mu, max_nfev=max_nfev,
+                ftol=ftol, n_samp_iter=n_samp_iter, n_samp_full=n_samp_full,
+                error_threshold=error_threshold, only_extrinsics=only_extrinsics, verbose=verbose,
+                rng=rng))
+        if method != 'lm':
+            raise ValueError("method must be 'lm' or 'adam', got {!r}".format(method))
+        self._check_not_frozen('bundle_adjust_iter')
+        from . import bundle as _B
+        p2ds = p2ds.detach().cpu().numpy() if torch.is_tensor(p2ds) else np.asarray(p2ds, dtype='float64')
+        assert p2ds.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(len(self.cameras), p2ds.shape)
+        if extra is not None:
+            r1 = _B.bundle_adjust_lm(self, p2ds, extra=extra, spec=spec, only_extrinsics=True,
+                                     loss='cauchy', f_scale=10.0, n_iter=50, rng=rng,
+                                     return_report=True, verbose=verbose)
+            rep = r1
+            if not only_extrinsics:
+                rep = _B.bundle_adjust_lm(self, p2ds, extra=extra, spec=spec, loss='cauchy',
+                                          f_scale=2.0, n_iter=100, rng=rng, return_report=True,
+                                          verbose=verbose)
+                rep.error_before = r1.error_before
+                rep.stages = [r1]
+        else:
+            flat = p2ds.reshape(p2ds.shape[0], -1, 2)
+            from . import geometry as _G, triangulation as _T
+            R0 = _T.triangulate_robust(_G.pack(self), flat, 'msac', tau=200.0)
+            e0 = R0.errors[np.isfinite(R0.errors)]
+            err0 = float(np.median(e0)) if len(e0) else 50.0
+            tau0 = float(np.clip(1.5 * err0, 20.0, 200.0))
+            n1 = max(2, int(np.ceil(n_iters / 2)))
+            round1 = tuple(float(t) for t in np.geomspace(tau0, 10.0, n1))
+            final = ('extrinsics',) if only_extrinsics else ('extrinsics', 'intrinsics')
+            if spec is None and not only_extrinsics and getattr(self, 'param_spec', None) is None:
+                # points rarely cover the image the way boards do: anchor the intrinsics to their
+                # starting values so they move only where the data really asks for it
+                from copy import deepcopy as _dc
+                from .params import ParamSpec as _PS, IntrinsicsPrior as _IP
+                spec = _PS(intrinsics=None, priors=_IP(_dc(self), **_DEFAULT_ITER_PRIOR))
+            rep = _B.bundle_adjust_robust(self, p2ds, schedule=(round1, (20.0, 10.0, 5.0)),
+                                          resect=resect, final=final, spec=spec, rng=rng,
+                                          max_points=max_points, only_extrinsics=only_extrinsics,
+                                          verbose=verbose)
+        return rep if return_report else _B.BAError(rep.error)
+
+    def bundle_adjust(self, p2ds, extra=None,
+                      loss='huber',
+                      ftol=1e-4,
+                      max_nfev=500,
+                      lr=8.0e-4,
+                      only_extrinsics=False,
+                      verbose=True,
+                      f_scale=None,
+                      rng=None, *, method='lm', spec=None, return_report=False):
+        """Bundle adjustment of C x N x 2 points (one solve, no outlier schedule).
+
+        method='lm' (default since 1.0): Schur-complement Levenberg-Marquardt
+          (:func:`aniposelib.bundle.bundle_adjust_lm`) on all observations with the robust
+          `loss` ('huber' | 'cauchy' | 'soft_l1' | 'linear') of scale `f_scale` px (default 1.0
+          for huber, 1.5 otherwise, as before); at most min(max_nfev, 100) iterations.
+          Free parameters: extrinsics (first camera fixed as gauge), plus (unless
+          only_extrinsics) each camera's free_intrinsics and first n_dist distortion
+          coefficients, or `spec`. With `extra` boards are rigid bodies.
+        method='adam': the aniposelib 0.9 Adam code path (lr, ftol, rng used), unchanged.
+        Returns the mean reprojection error after triangulating p2ds (python float, as before
+        but no longer a tensor), or a BAReport if `return_report` (method='lm').
+        """
+        if method == 'adam':
+            if spec is not None or return_report:
+                raise TypeError("spec= and return_report= need method='lm'")
+            from .bundle import BAError
+            return BAError(self._bundle_adjust_adam(p2ds, extra, loss=loss, ftol=ftol, max_nfev=max_nfev,
+                                                  lr=lr, only_extrinsics=only_extrinsics,
+                                                  verbose=verbose, f_scale=f_scale, rng=rng))
+        if method != 'lm':
+            raise ValueError("method must be 'lm' or 'adam', got {!r}".format(method))
+        self._check_not_frozen('bundle_adjust')
+        from . import bundle as _B
+        assert p2ds.shape[0] == len(self.cameras), \
+            "Invalid points shape, first dim should be equal to" \
+            " number of cameras ({}), but shape is {}".format(len(self.cameras), p2ds.shape)
+        if f_scale is None:
+            f_scale = 1.0 if loss == 'huber' else 1.5
+        rep = _B.bundle_adjust_lm(self, p2ds, extra=extra, spec=spec, loss=loss, f_scale=f_scale,
+                                  n_iter=min(int(max_nfev), 100), only_extrinsics=only_extrinsics,
+                                  rng=rng, return_report=True, verbose=verbose)
+        if return_report:
+            return rep
+        with torch.no_grad():
+            return _B.BAError(self._average_error(self._tensor(p2ds)))
+
+    def _bundle_adjust_iter_adam(self, p2ds, extra=None,
+                           n_iters=8, start_mu=12, end_mu=0.06,
+                           max_nfev=850, ftol=1e-8,
+                           n_samp_iter=450, n_samp_full=1000,
+                           error_threshold=0.7, only_extrinsics=False,
                            verbose=False, rng=None):
-        """Given an CxNx2 array of 2D points,
+        """bundle_adjust_iter(method='adam'): the aniposelib 0.9 code path, unchanged.
+
+        Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs iterative bundle adjustsment to fine-tune the parameters of the cameras.
         That is, it performs bundle adjustment multiple times, adjusting the weights given to points
@@ -2119,7 +2242,7 @@ class CameraGroup(nn.Module):
 
             iter_only_ext = only_extrinsics or (i < n_ext_only)
 
-            self.bundle_adjust(p2ds_samp, extra_samp,
+            self._bundle_adjust_adam(p2ds_samp, extra_samp,
                                loss='cauchy', ftol=ftol,
                                max_nfev=iter_nfev, only_extrinsics=iter_only_ext,
                                verbose=verbose, f_scale=f_scales[i], rng=rng)
@@ -2160,7 +2283,7 @@ class CameraGroup(nn.Module):
             extra_good = subset_extra(extra, good)
             final_f_scale = max(0.8 - 0.15 * final_pass, 0.3)
             if np.sum(good) >= 10:
-                self.bundle_adjust(p2ds_t[:, good], extra_good,
+                self._bundle_adjust_adam(p2ds_t[:, good], extra_good,
                                    loss='cauchy',
                                    ftol=ftol * 0.1, max_nfev=max(700, max_nfev),
                                    only_extrinsics=only_extrinsics,
@@ -2199,7 +2322,7 @@ class CameraGroup(nn.Module):
 
         return error
 
-    def bundle_adjust(self, p2ds, extra=None,
+    def _bundle_adjust_adam(self, p2ds, extra=None,
                       loss='huber',
                       ftol=1e-4,
                       max_nfev=500,
@@ -2208,7 +2331,9 @@ class CameraGroup(nn.Module):
                       verbose=True,
                       f_scale=None,
                       rng=None):
-        """Given an CxNx2 array of 2D points,
+        """bundle_adjust(method='adam'): the aniposelib 0.9 code path, unchanged (returns a tensor).
+
+        Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
         this performs bundle adjustment to fine-tune the parameters of the cameras.
 
@@ -3174,5 +3299,11 @@ class CameraGroup(nn.Module):
             return all_points[good], s[good]
 
 
+# intrinsics anchoring of bundle_adjust_iter(method='lm') on points (spec=None): sigma of log
+# focal length, principal point (px) and distortion coefficients; each prior residual weighs like
+# one observation with that many pixels of error
+_DEFAULT_ITER_PRIOR = dict(sigma_logf=0.02, sigma_c=10.0, sigma_k=0.02)
+
 _BA_ITER_KWARGS = {'n_iters', 'start_mu', 'end_mu', 'max_nfev', 'ftol', 'n_samp_iter',
-                   'n_samp_full', 'error_threshold', 'only_extrinsics', 'rng'}
+                   'n_samp_full', 'error_threshold', 'only_extrinsics', 'rng', 'method', 'spec',
+                   'return_report', 'max_points', 'resect'}

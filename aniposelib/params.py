@@ -33,8 +33,8 @@ A spec can be stored on a group (``cgroup.param_spec = spec``; it is deep-copied
 and is then used by the LM solver when no ``spec=`` is passed.
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -259,8 +259,6 @@ class ParamSpec:
                 didx |= set(range(min(int(nd), len(DIST_NAMES[model]), cam.dist.shape[0])))
         if self.skew == 'free':
             mat.add('skew')
-        elif self.intrinsics is not None:
-            mat.discard('skew') if 'skew' not in self.intrinsics else None
         if self.aspect == 'fixed' and ('fx' in mat or 'fy' in mat):
             mat -= {'fx', 'fy'}
             use_f = True

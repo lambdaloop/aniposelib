@@ -53,7 +53,7 @@ from . import geometry as G
 from . import triangulation as T
 from .params import ParamSpec, IntrinsicsPrior, DIST_NAMES, dist_index
 
-__all__ = ['Observations', 'BAReport', 'RejectSchedule', 'ResectResult', 'bundle_adjust_lm',
+__all__ = ['Observations', 'BAReport', 'BAError', 'RejectSchedule', 'ResectResult', 'bundle_adjust_lm',
            'bundle_adjust_robust', 'resect_cameras', 'place_cameras', 'add_camera', 'frame_mask',
            'keypoint_mask', 'LOSSES']
 
@@ -181,6 +181,22 @@ class Observations:
         return cls(ci, pi, flat[ci, pi], weight=w, time=t, group=grp, n_points=N, n_cams=C,
                    point_shape=tuple(pshape))
 
+    @classmethod
+    def from_timed(cls, timed, frame_time=None, n_cams=None):
+        """From :class:`aniposelib.stba.TimedObservations` (``cam, point (track), uv, t, clip,
+        weight``). A 3D point is one track at one time: observations of the same track whose
+        times fall in the same ``frame_time`` bin (exact times if None) share a point. ``time`` is
+        kept, and ``group`` gets ``track`` (and ``clip`` if given)."""
+        t = np.asarray(timed.t, dtype=float)
+        key_t = np.round(t / frame_time).astype(np.int64) if frame_time else t
+        keys = np.stack([np.asarray(timed.point, dtype=float), key_t.astype(float)], 1)
+        _, pidx = np.unique(keys, axis=0, return_inverse=True)
+        grp = {'track': np.asarray(timed.point)}
+        if getattr(timed, 'clip', None) is not None:
+            grp['clip'] = np.asarray(timed.clip)
+        return cls(timed.cam, pidx.ravel(), timed.uv, weight=getattr(timed, 'weight', None), time=t,
+                   group=grp, n_cams=n_cams)
+
     def subset(self, mask):
         """Observations selected by a boolean mask or index array (point indexing unchanged)."""
         m = np.asarray(mask)
@@ -259,6 +275,24 @@ class BAReport:
                 str(name), int(pc.get('n_obs', 0)), pc.get('median_before', float('nan')),
                 pc.get('median_after', float('nan'))))
         return '\n'.join(lines)
+
+
+class BAError(float):
+    """A python float (the final error of a bundle adjustment) that also answers ``.item()``,
+    ``.detach()``, ``.cpu()`` and ``.numpy()``, so code written for the 0.9 tensor return keeps
+    working."""
+
+    def item(self):
+        return float(self)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return np.float64(self)
 
 
 def _err_stats(e):
@@ -455,7 +489,6 @@ def _velocities(obs, X, st_valid):
     """Per-point velocity [N,3] from tracks (group 'track' > 'keypoint' > one track) and times."""
     N = X.shape[0]
     t_pt = np.full(N, np.nan)
-    np.minimum.at if False else None
     # point time: mean of its observation times
     cnt = np.bincount(obs.point_idx, minlength=N)
     tsum = np.bincount(obs.point_idx, weights=obs.time, minlength=N)
@@ -476,8 +509,6 @@ def _velocities(obs, X, st_valid):
         idx = idx[np.argsort(t_pt[idx], kind='stable')]
         tt, xx = t_pt[idx], Xn[idx]
         g = np.zeros_like(xx)
-        dt_f = np.diff(tt)
-        good = dt_f > 0
         # central differences where possible
         for i in range(len(idx)):
             lo, hi = max(i - 1, 0), min(i + 1, len(idx) - 1)
@@ -743,55 +774,22 @@ class _Kind:
     def n(self):
         return self.values.shape[0]
 
-    def world(self, Sv, delta_o, rep=1):
+    def world(self, Sv, delta_o):
         if self.name == 'rigid':
             R = G.rodrigues(Sv[:, :3])
-            objp = self.objp.repeat(rep, 1) if rep > 1 else self.objp
-            return torch.einsum('mij,mj->mi', R, objp) + Sv[:, 3:6]
+            return torch.einsum('mij,mj->mi', R, self.objp) + Sv[:, 3:6]
         if self.vel is not None:
-            vel = self.vel[self.sidx]
-            vel = vel.repeat(rep, 1) if rep > 1 else vel
-            return Sv + delta_o[:, None] * vel
+            return Sv + delta_o[:, None] * self.vel[self.sidx]
         return Sv
 
 
-def _kind_project(prob, kind, Lst, Sv):
+def _kind_residual(prob, kind, Lst, Sv):
     st = prob.st_o[kind.sel]
     cam = prob.cam_o[kind.sel]
     Lo = Lst[st]
-    So = Sv[kind.sidx]
-    k10, off, kb = prob.k10[cam], prob.off[cam], prob.is_kb[cam]
-
-    def f(L_, S_, rep=1):
-        """rep: rows of L_/S_ are the m observations repeated rep times."""
-        rp = (lambda a: a.repeat((rep,) + (1,) * (a.ndim - 1))) if rep > 1 else (lambda a: a)
-        return _project_local(L_, kind.world(S_, L_[:, _DELTA], rep), rp(k10), rp(off), rp(kb),
-                              prob.has_b, prob.has_k)[0]
-    return f, Lo, So, cam
-
-
-def _kind_residual(prob, kind, Lst, Sv):
-    f, Lo, So, cam = _kind_project(prob, kind, Lst, Sv)
-    st = prob.st_o[kind.sel]
-    uvp, z = _project_local(Lo, kind.world(So, Lo[:, _DELTA]), prob.k10[cam], prob.off[cam],
+    uvp, z = _project_local(Lo, kind.world(Sv[kind.sidx], Lo[:, _DELTA]), prob.k10[cam], prob.off[cam],
                             prob.is_kb[cam], prob.has_b, prob.has_k)
-    r = uvp - prob.uv[kind.sel]
-    return r, z
-
-
-def _jac_columns(fn, x, basis):
-    """d fn / d x along each basis vector -> [K, m, ...out], by forward-mode AD on a batch where
-    the m rows are repeated once per basis vector (one dual-number pass, no vmap)."""
-    import torch.autograd.forward_ad as fwAD
-    K, m = basis.shape[0], x.shape[0]
-    xr = x.unsqueeze(0).expand(K, *x.shape).reshape(K * m, *x.shape[1:])
-    tr = basis[:, None, :].expand(K, m, basis.shape[1]).reshape(K * m, basis.shape[1])
-    with fwAD.dual_level():
-        out = fn(fwAD.make_dual(xr, tr), K)
-        tan = fwAD.unpack_dual(out).tangent
-    if tan is None:
-        tan = torch.zeros_like(fwAD.unpack_dual(out).primal)
-    return tan.reshape(K, m, *tan.shape[1:])
+    return uvp - prob.uv[kind.sel], z
 
 
 def _kind_linearize(prob, kind, Lst, Sv):
@@ -952,7 +950,6 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
     cost = total_cost(ext, intr, delta, values)
     history = [dict(iter=0, cost=cost, lam=lam, accepted=True)]
     converged = False
-    eyeQ = torch.eye(max(Q, 1), dtype=dt, device=dev)[:Q, :Q]
     for it in range(n_iter):
         Lst = prob.local(ext, intr, delta)
         U_loc = torch.zeros(S, Q, Q, dtype=dt, device=dev)
@@ -1164,8 +1161,6 @@ def _init_boards(X, set_idx, objp, board_ids, extra=None, prob=None, obs=None):
                 scales.append(s)
                 out[bi, :3] = G._rotmat_to_rvec_np(R[None])[0]
                 out[bi, 3:] = t
-                out[bi, 3:] = t   # scale applied later (the rig may be rescaled to board units)
-                out[bi] = np.r_[out[bi, :3], t]
                 continue
         if extra is not None and 'rvecs' in extra and 'tvecs' in extra and prob is not None:
             # compose a camera's board pose with that camera's extrinsics (as the Adam path)
@@ -1174,7 +1169,6 @@ def _init_boards(X, set_idx, objp, board_ids, extra=None, prob=None, obs=None):
                 cs = np.nonzero(np.isfinite(rv[:, p]).all(-1))[0] if rv.ndim == 3 else []
                 if len(cs):
                     c = cs[0]
-                    Rc = G._rotmat_to_rvec_np  # noqa
                     import cv2
                     Rcam = cv2.Rodrigues(prob.P.rvec[c].detach().cpu().numpy())[0]
                     tcam = prob.P.tvec[c].detach().cpu().numpy()
@@ -1186,6 +1180,28 @@ def _init_boards(X, set_idx, objp, board_ids, extra=None, prob=None, obs=None):
                     break
     scale = float(np.median(scales)) if scales else 1.0
     return out, scale
+
+
+def _apply_stations(cgroup, obs, st):
+    """A :class:`aniposelib.stations.Stations` -> per-observation station indices (observations in
+    'skip' intervals are dropped) and the ``stations`` dict for :func:`bundle_adjust_lm`."""
+    if obs.time is None:
+        raise ValueError('stations need Observations.time')
+    names = cgroup.get_names()
+    station = np.full(len(obs), -1, np.int64)
+    station_cam, snames = [], []
+    for c, n in enumerate(names):
+        m = obs.cam_idx == c
+        local = st.lookup(n, obs.time[m]) if n in st else np.zeros(int(m.sum()), int)
+        cam_names = st.names(n) if n in st else [n]
+        base = len(station_cam)
+        station_cam += [c] * len(cam_names)
+        snames += [str(x) for x in cam_names]
+        station[m] = np.where(local >= 0, local + base, -1)
+    keep = station >= 0
+    obs = obs.subset(keep)
+    obs.station = station[keep]
+    return obs, dict(station_cam=np.array(station_cam), names=snames)
 
 
 def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy', f_scale=5.0,
@@ -1210,7 +1226,10 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
         ``max_px`` or whose depth is ``<= min_depth``, then points with fewer than 2 observations
     extra : anipose board dict (``ids``, ``objp``, optional ``rvecs``/``tvecs``) for dense input:
         points with the same board id are corners of one rigid board (6 pose parameters per board)
-    stations : F5, ``dict(station_cam=[S], rvec=[S,3], tvec=[S,3], names=[S])`` for ``obs.station``
+    stations : F5, an :class:`aniposelib.stations.Stations` (looked up with ``obs.time``; 'skip'
+        observations are dropped) or ``dict(station_cam=[S], rvec=[S,3], tvec=[S,3], names=[S])``
+        for ``obs.station``. All stations start at their camera's extrinsics unless given;
+        ``report.stations`` has the result, the camera keeps its first station.
     only_extrinsics : shortcut for a spec with all intrinsics fixed
     min_points_per_camera : cameras with fewer observations are frozen (and reported)
     inplace : write the result into ``cgroup`` (else into a copy, returned as ``report.cgroup``)
@@ -1233,6 +1252,8 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
         obs = obs_or_p2ds
     else:
         obs = Observations.from_dense(obs_or_p2ds)
+    if stations is not None and hasattr(stations, 'lookup'):
+        obs, stations = _apply_stations(cgroup, obs, stations)
     if obs.n_cams > len(cgroup.cameras) or (len(obs) and obs.cam_idx.max() >= len(cgroup.cameras)):
         raise ValueError('observations refer to {} cameras, the group has {}'.format(obs.n_cams, len(cgroup.cameras)))
     obs.n_cams = len(cgroup.cameras)
@@ -1272,7 +1293,6 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
         obs = obs.subset(obs_sel)
 
     prob = _Problem(cgroup, obs, spec, device, dtype, stations=stations)
-    S = prob.S
 
     # ---- initial structure
     pts = np.unique(obs.point_idx)
@@ -1345,7 +1365,6 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
 
     # ---- kinds
     kinds = []
-    okt = torch.as_tensor(ok, device=device)
     sel_p = np.nonzero(ok & ~is_rigid_o)[0]
     if len(sel_p):
         upts, inv = np.unique(obs.point_idx[sel_p], return_inverse=True)
@@ -1759,7 +1778,7 @@ def _per_camera_stats(names, errors, fit=None):
 def bundle_adjust_robust(cgroup, p2ds, groups=None, schedule=((200, 100, 50), (40, 20, 10, 5), (20, 10, 5)),
                          reject='default', resect=True, min_inliers=3, final=('extrinsics', 'intrinsics'),
                          spec=None, contrib=None, rng=None, max_points=20000, n_iter=25, sig_frac=0.5,
-                         only_extrinsics=False, report_tau=None, resect_kw=None, inplace=True,
+                         only_extrinsics=False, report_tau=None, resect_kw=None, resect_below=0.9, inplace=True,
                          revert_if_worse=False, return_report=True, verbose=False):
     """Robust bundle adjustment recipe (mouse-outdoor / Emory ``calibrate`` + motor masks).
 
@@ -1775,6 +1794,8 @@ def bundle_adjust_robust(cgroup, p2ds, groups=None, schedule=((200, 100, 50), (4
     **all** observations, against points robustly triangulated with ``report_tau`` (default: the
     last threshold of the schedule).
 
+    ``resect_below``: only cameras with fewer than this fraction of their (fit) detections within
+    ``tau_pnp`` of the robust points are resected (None: all cameras, as mouse-outdoor).
     ``contrib``: bool per camera, cameras allowed to define points (others are passengers).
     Returns a :class:`BAReport` (``method='robust'``), or its ``error`` if ``return_report=False``.
     """
@@ -1857,7 +1878,15 @@ def bundle_adjust_robust(cgroup, p2ds, groups=None, schedule=((200, 100, 50), (4
             kw = dict(tau_tri=5.0, tau_pnp=8.0, contrib=contrib, rng=rng_)
             kw.update(resect_kw or {})
             pm = np.where(fit[..., None], flat, np.nan)
-            res = resect_cameras(cgroup, pm, **kw)
+            cams = None
+            if resect_below is not None:
+                # only cameras whose detections disagree with the rig are worth a LOO resection
+                Rr = _robust_errors(cgroup, pm, kw['tau_tri'], contrib)
+                vf = np.isfinite(pm).all(-1)
+                with np.errstate(invalid='ignore'):
+                    frac = ((Rr.errors < kw['tau_pnp']) & vf).sum(1) / np.maximum(vf.sum(1), 1)
+                cams = [c for c in range(C) if frac[c] < resect_below]
+            res = resect_cameras(cgroup, pm, cams=cams, **kw) if cams is None or cams else []
             resections.append([r.to_dict() for r in res])
             if verbose:
                 for r in res:
