@@ -149,21 +149,28 @@ def _apply_scale(cg, scale, p2ds):
 
 
 def _refine(cg, p2ds, frame_id, method, rng, ba_kwargs):
-    """Final refinement. 'auto' / 'refine': the robust sparse extrinsics refinement
-    :func:`sfm.refine_group`; 'robust': ``cgroup.bundle_adjust_robust`` (1.0 bundle, if
-    available; ``ba_kwargs`` are passed through). 'iter':
-    ``bundle_adjust_iter`` (extrinsics only), kept only if it lowers the robust median error.
-    None/False: no refinement."""
+    """Final refinement. 'auto' / 'robust': :func:`aniposelib.bundle.bundle_adjust_robust`
+    (extrinsics only, MSAC inliers + LM + resection + structured rejection; reverted if the robust
+    median error does not improve; ``ba_kwargs`` are passed through). 'refine': the robust sparse
+    extrinsics refinement :func:`sfm.refine_group`. 'iter': ``bundle_adjust_iter`` (extrinsics
+    only), kept only if it lowers the robust median error. None/False: no refinement."""
     kw = dict(ba_kwargs or {})
     if not method:
         return cg, dict(method=None)
-    if method == 'robust':
+    if method in ('auto', 'robust'):
         p = np.asarray(to_np(p2ds), dtype='float64')
-        flat = p.reshape(p.shape[0], -1, 2)
         kw.setdefault('only_extrinsics', True)
-        out = cg.bundle_adjust_robust(flat, **kw)
-        return cg, dict(method='bundle_adjust_robust', result=out)
-    if method in ('auto', 'refine'):
+        kw.setdefault('final', ('extrinsics',) if kw['only_extrinsics'] else ('extrinsics', 'intrinsics'))
+        kw.setdefault('revert_if_worse', True)
+        kw.setdefault('rng', 0 if rng is None else rng)
+        if frame_id is not None and 'groups' not in kw:
+            fid = np.asarray(frame_id)
+            if p.ndim == 3 and fid.shape == p.shape[1:2]:
+                kw['groups'] = dict(frame=fid)
+        out = cg.bundle_adjust_robust(p, **kw)
+        return cg, dict(method='bundle_adjust_robust', result=out, before_px=out.error_before,
+                        after_px=out.error, kept=not out.reverted)
+    if method == 'refine':
         out, st = sfm.refine_group(cg, p2ds, frame_id=frame_id, rng=rng, **kw)
         st['method'] = 'refine_group'
         return out, st

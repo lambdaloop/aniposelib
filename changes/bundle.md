@@ -22,6 +22,16 @@
     scale_constraint=None)` (free gauge, damped) or `method='adam'`.
   - Frozen parameters (beyond `n_dist`, skew, `K[1,0]`, bottom row of K, or not in the spec) are not
     in the LM problem at all: bit-for-bit unchanged, as with Adam's hooks.
+  - `bundle_adjust_iter(method='lm')` on points (no `extra`) with the default `spec=None` anchors the
+    intrinsics stage with Gaussian priors on the starting values (`IntrinsicsPrior(start,
+    sigma_logf=0.02, sigma_c=10 px, sigma_k=0.02)`, `cameras._DEFAULT_ITER_PRIOR`): trajectories /
+    keypoints rarely cover the image, and unconstrained k2 ran away (k2 +144 on a synthetic 9-cam
+    trajectory, 3 % camera-centre drift). *Old behaviour (free intrinsics):* pass
+    `spec=ParamSpec(intrinsics=None)`.
+- New `CameraGroup.bundle_adjust_lm`, `bundle_adjust_robust`, `resect_cameras`, `place_cameras`,
+  `add_camera` (thin delegates to `aniposelib.bundle`).
+- `init.calibrate_from_points(refine='auto')` now uses `bundle_adjust_robust` (extrinsics only,
+  `revert_if_worse=True`); the previous default is `refine='refine'` (`sfm.refine_group`).
 - **Return type (D2):** `bundle_adjust*` return a python `float` (subclass `bundle.BAError`, which
   still answers `.item()`, `.detach()`, `.cpu()`, `.numpy()` for 0.9-style code) instead of a 0-d
   tensor, or a `BAReport` with `return_report=True` (LM only).
@@ -68,7 +78,7 @@
   LM when no `spec=` is passed. New: `ParamSpec.extrinsics_only()`, `replace()`, `to_dict()`.
 
 ## Tests
-- `tests/test_bundle.py` (18 tests); targets flipped (markers removed, original calls and
+- `tests/test_bundle.py` (21 tests, incl. scale invariance on 1e-3 / 1 / 1e3 rigs); targets flipped (markers removed, original calls and
   thresholds): `test_rig_lab_board::test_board_ba_recovers_rig_precisely`,
   `test_rig_outdoor::test_ba_with_outliers_and_decoy_camera`,
   `test_rig_keypoint_decoy::test_ba_on_keypoints_recovers_rig`, `::test_ba_on_keypoints_with_decoy`.

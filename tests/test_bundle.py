@@ -316,3 +316,17 @@ def test_paramspec_core_api_still_works():
         ParamSpec(scale_constraint='bad')
     s = ParamSpec(priors={'a': {'f': (1000, 0.1, 'log')}})
     json.dumps(s.to_dict())
+
+
+@pytest.mark.parametrize('scale', [1e-3, 1.0, 1e3])
+def test_lm_is_scale_invariant(outdoor, scale):
+    """Unit-scale (SfM) and mm rigs converge the same way: steps are scaled by the Hessian."""
+    true, p3d, p2d = outdoor
+    t = deepcopy(true)
+    for c in t.cameras:
+        with torch.no_grad():
+            c.tvec *= scale
+    cg = synth.perturb_extrinsics(t, rot_deg=0.5, trans_frac=0.01, seed=4)
+    rep = bundle_adjust_lm(cg, p2d, only_extrinsics=True, return_report=True)
+    assert synth.center_error(cg, t).max() < 4e-3
+    assert rep.error < 0.5 and rep.n_iter < 15

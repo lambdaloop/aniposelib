@@ -2132,6 +2132,33 @@ class CameraGroup(nn.Module):
         with torch.no_grad():
             return _B.BAError(self._average_error(self._tensor(p2ds)))
 
+    def bundle_adjust_lm(self, obs_or_p2ds, **kwargs):
+        """Schur-complement Levenberg-Marquardt bundle adjustment; see
+        :func:`aniposelib.bundle.bundle_adjust_lm` (``return_report=True`` for a BAReport)."""
+        from . import bundle as _B
+        return _B.bundle_adjust_lm(self, obs_or_p2ds, **kwargs)
+
+    def bundle_adjust_robust(self, p2ds, **kwargs):
+        """Robust bundle adjustment recipe (MSAC inliers, annealed LM, resection, structured
+        rejection) -> BAReport; see :func:`aniposelib.bundle.bundle_adjust_robust`."""
+        from . import bundle as _B
+        return _B.bundle_adjust_robust(self, p2ds, **kwargs)
+
+    def resect_cameras(self, p2ds, cams=None, **kwargs):
+        """Leave-one-out PnP-RANSAC resection; see :func:`aniposelib.bundle.resect_cameras`."""
+        from . import bundle as _B
+        return _B.resect_cameras(self, p2ds, cams=cams, **kwargs)
+
+    def place_cameras(self, p2ds, cams, **kwargs):
+        """Place cameras with unknown poses; see :func:`aniposelib.bundle.place_cameras`."""
+        from . import bundle as _B
+        return _B.place_cameras(self, p2ds, cams, **kwargs)
+
+    def add_camera(self, camera, p2d_cam, p2ds, **kwargs):
+        """New group with ``camera`` appended and placed; see :func:`aniposelib.bundle.add_camera`."""
+        from . import bundle as _B
+        return _B.add_camera(self, camera, p2d_cam, p2ds, **kwargs)
+
     def _bundle_adjust_iter_adam(self, p2ds, extra=None,
                            n_iters=8, start_mu=12, end_mu=0.06,
                            max_nfev=850, ftol=1e-8,
