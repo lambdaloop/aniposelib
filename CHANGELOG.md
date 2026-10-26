@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av, pyyaml); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
 
 ## 1.0.0
