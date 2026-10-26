@@ -500,6 +500,10 @@ def _to_builtin(x):
     return x
 
 
+# rig scale (median camera-to-point distance) at which the Adam BA learning rates were tuned;
+# see CameraGroup._bundle_adjust_adam(trans_scale=...)
+ADAM_REF_SCALE = 1.0
+
 class Camera(nn.Module):
     """Pinhole camera with Brown-Conrady (OpenCV) distortion, as a torch module.
 
@@ -2072,7 +2076,8 @@ class CameraGroup(nn.Module):
                            n_samp_iter=450, n_samp_full=1000,
                            error_threshold=0.7, only_extrinsics=False,
                            verbose=False, rng=None, *, method='lm', spec=None,
-                           return_report=False, max_points=20000, resect=True):
+                           return_report=False, max_points=20000, resect=True,
+                           trans_scale='auto'):
         """Iterative robust bundle adjustment of C x N x 2 (or C x N x J x 2) points.
 
         method='lm' (default since 1.0): Levenberg-Marquardt (aniposelib.bundle).
@@ -2099,7 +2104,7 @@ class CameraGroup(nn.Module):
                 p2ds, extra, n_iters=n_iters, start_mu=start_mu, end_mu=end_mu, max_nfev=max_nfev,
                 ftol=ftol, n_samp_iter=n_samp_iter, n_samp_full=n_samp_full,
                 error_threshold=error_threshold, only_extrinsics=only_extrinsics, verbose=verbose,
-                rng=rng))
+                rng=rng, trans_scale=trans_scale))
         if method != 'lm':
             raise ValueError("method must be 'lm' or 'adam', got {!r}".format(method))
         self._check_not_frozen('bundle_adjust_iter')
@@ -2149,7 +2154,8 @@ class CameraGroup(nn.Module):
                       only_extrinsics=False,
                       verbose=True,
                       f_scale=None,
-                      rng=None, *, method='lm', spec=None, return_report=False):
+                      rng=None, *, method='lm', spec=None, return_report=False,
+                      trans_scale='auto'):
         """Bundle adjustment of C x N x 2 points (one solve, no outlier schedule).
 
         method='lm' (default since 1.0): Schur-complement Levenberg-Marquardt
@@ -2159,7 +2165,9 @@ class CameraGroup(nn.Module):
           Free parameters: extrinsics (first camera fixed as gauge), plus (unless
           only_extrinsics) each camera's free_intrinsics and first n_dist distortion
           coefficients, or `spec`. With `extra` boards are rigid bodies.
-        method='adam': the aniposelib 0.9 Adam code path (lr, ftol, rng used), unchanged.
+        method='adam': the aniposelib 0.9 Adam code path (lr, ftol, rng used). Its translation
+          step sizes are scaled to the rig (``trans_scale='auto'``) so it no longer diverges or
+          stalls depending on the length units; ``trans_scale=None`` restores the 0.9 steps.
         Returns the mean reprojection error after triangulating p2ds (python float, as before
         but no longer a tensor), or a BAReport if `return_report` (method='lm').
         """
@@ -2169,7 +2177,8 @@ class CameraGroup(nn.Module):
             from .bundle import BAError
             return BAError(self._bundle_adjust_adam(p2ds, extra, loss=loss, ftol=ftol, max_nfev=max_nfev,
                                                   lr=lr, only_extrinsics=only_extrinsics,
-                                                  verbose=verbose, f_scale=f_scale, rng=rng))
+                                                  verbose=verbose, f_scale=f_scale, rng=rng,
+                                                  trans_scale=trans_scale))
         if method != 'lm':
             raise ValueError("method must be 'lm' or 'adam', got {!r}".format(method))
         self._check_not_frozen('bundle_adjust')
@@ -2222,8 +2231,9 @@ class CameraGroup(nn.Module):
                            max_nfev=850, ftol=1e-8,
                            n_samp_iter=450, n_samp_full=1000,
                            error_threshold=0.7, only_extrinsics=False,
-                           verbose=False, rng=None):
-        """bundle_adjust_iter(method='adam'): the aniposelib 0.9 code path, unchanged.
+                           verbose=False, rng=None, trans_scale='auto'):
+        """bundle_adjust_iter(method='adam'): the aniposelib 0.9 code path (translation steps
+        scaled to the rig unless trans_scale=None; see _bundle_adjust_adam).
 
         Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -2330,7 +2340,8 @@ class CameraGroup(nn.Module):
             self._bundle_adjust_adam(p2ds_samp, extra_samp,
                                loss='cauchy', ftol=ftol,
                                max_nfev=iter_nfev, only_extrinsics=iter_only_ext,
-                               verbose=verbose, f_scale=f_scales[i], rng=rng)
+                               verbose=verbose, f_scale=f_scales[i], rng=rng,
+                               trans_scale=trans_scale)
 
             # Track best state
             cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)
@@ -2372,7 +2383,8 @@ class CameraGroup(nn.Module):
                                    loss='cauchy',
                                    ftol=ftol * 0.1, max_nfev=max(700, max_nfev),
                                    only_extrinsics=only_extrinsics,
-                                   verbose=verbose, f_scale=final_f_scale, rng=rng)
+                                   verbose=verbose, f_scale=final_f_scale, rng=rng,
+                                   trans_scale=trans_scale)
 
             # Track best after each final pass
             cur_p2ds, _ = resample_points(p2ds_full, extra_full, n_samp=n_samp_full, rng=rng)
@@ -2415,8 +2427,16 @@ class CameraGroup(nn.Module):
                       only_extrinsics=False,
                       verbose=True,
                       f_scale=None,
-                      rng=None):
-        """bundle_adjust(method='adam'): the aniposelib 0.9 code path, unchanged (returns a tensor).
+                      rng=None,
+                      trans_scale='auto'):
+        """bundle_adjust(method='adam'): the aniposelib 0.9 Adam optimiser (returns a tensor).
+
+        trans_scale: Adam's step size is in parameter units, so translation-like parameters
+        (camera tvecs, 3D points, board translations) get their learning rate multiplied by
+        ``rig_scale / ADAM_REF_SCALE`` (and their gradients are clipped in those normalised
+        units). This makes the optimiser invariant to the rig's length units (mm, m, unit-scale
+        SfM rigs). 'auto' estimates rig_scale as the median camera-to-point distance; a float
+        sets rig_scale; None reproduces the 0.9 absolute step sizes exactly.
 
         Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -2452,12 +2472,22 @@ class CameraGroup(nn.Module):
         else:
             cam_params = list(self.parameters())
 
+        k = self._adam_trans_factor(params['p3d'], trans_scale)
+        tvec_ids = {id(cam.tvec) for cam in self.cameras}
+        cam_trans = [p for p in cam_params if id(p) in tvec_ids]
+        cam_other = [p for p in cam_params if id(p) not in tvec_ids]
+        trans_params = cam_trans + [params['p3d']] + ([params['tvecs']] if 'rvecs' in params else [])
+
         param_groups = [
-            {'params': cam_params, 'lr': lr},
-            {'params': [params['p3d']], 'lr': lr * 65.0},
+            {'params': cam_other, 'lr': lr},
+            {'params': cam_trans, 'lr': lr * k},
+            {'params': [params['p3d']], 'lr': lr * 65.0 * k},
         ]
+        max_lr = [lr * 65.0, lr * 65.0 * k, lr * 260.0 * k]
         if 'rvecs' in params:
-            param_groups.append({'params': [params['rvecs'], params['tvecs']], 'lr': lr * 30.0})
+            param_groups.append({'params': [params['rvecs']], 'lr': lr * 30.0})
+            param_groups.append({'params': [params['tvecs']], 'lr': lr * 30.0 * k})
+            max_lr += [lr * 130.0, lr * 130.0 * k]
 
         all_params = cam_params + list(params.values())
 
@@ -2467,7 +2497,7 @@ class CameraGroup(nn.Module):
         optimizer = optim.Adam(param_groups, weight_decay=0, amsgrad=True)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[lr * 65.0, lr * 260.0] + ([lr * 130.0] if 'rvecs' in params else []),
+            max_lr=max_lr,
             total_steps=max_nfev,
             pct_start=0.18,
             anneal_strategy='cos',
@@ -2509,7 +2539,16 @@ class CameraGroup(nn.Module):
                 break
             old_loss = current_loss
             loss_val.backward()
+            if k != 1.0:
+                # clip in normalised units (theta / rig_scale) so clipping is scale-invariant too
+                for p in trans_params:
+                    if p.grad is not None:
+                        p.grad.mul_(k)
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
+            if k != 1.0:
+                for p in trans_params:
+                    if p.grad is not None:
+                        p.grad.div_(k)
             optimizer.step()
             scheduler.step()
 
@@ -2525,6 +2564,30 @@ class CameraGroup(nn.Module):
         with torch.no_grad():
             error = self._average_error(p2ds)
         return error
+
+    def _adam_trans_factor(self, p3d, trans_scale):
+        """Learning-rate multiplier for translation-like parameters in the Adam BA."""
+        if trans_scale is None:
+            return 1.0
+        if trans_scale == 'auto':
+            with torch.no_grad():
+                P = p3d.detach().reshape(-1, 3)
+                P = P[torch.isfinite(P).all(dim=1)]
+                if len(P) > 2000:
+                    P = P[torch.linspace(0, len(P) - 1, 2000, device=P.device).long()]
+                centers = torch.stack([torch.as_tensor(c.get_center_world(), device=P.device,
+                                                       dtype=P.dtype).reshape(3)
+                                       for c in self.cameras])
+                if len(P) == 0:
+                    d = torch.cdist(centers, centers)
+                    scale = float(torch.median(d[d > 0])) if (d > 0).any() else 1.0
+                else:
+                    scale = float(torch.median(torch.cdist(centers, P)))
+        else:
+            scale = float(trans_scale)
+        if not np.isfinite(scale) or scale <= 0:
+            return 1.0
+        return scale / ADAM_REF_SCALE
 
     def _error_fun_bundle(self, params, p2ds, extra, loss='linear', f_scale=None):
         """Error function for bundle adjustment"""
@@ -3453,4 +3516,4 @@ _DEFAULT_ITER_PRIOR = dict(sigma_logf=0.02, sigma_c=10.0, sigma_k=0.02)
 
 _BA_ITER_KWARGS = {'n_iters', 'start_mu', 'end_mu', 'max_nfev', 'ftol', 'n_samp_iter',
                    'n_samp_full', 'error_threshold', 'only_extrinsics', 'rng', 'method', 'spec',
-                   'return_report', 'max_points', 'resect'}
+                   'return_report', 'max_points', 'resect', 'trans_scale'}
