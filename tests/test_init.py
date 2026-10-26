@@ -198,6 +198,9 @@ def test_calibrate_from_points_recipe():
     assert rep.init == 'sfm' and cg.get_names() == true.get_names()
     assert synth.center_error(cg, true).max() < 0.005
     assert abs(synth.rig_scale(cg) / synth.rig_scale(true) - 1) < 0.01
+    # scale=<reference> also aligns the gauge (rotation and origin) to the reference
+    assert np.abs(synth.camera_centers(cg) - synth.camera_centers(true)).max() < 0.01 * synth.rig_scale(true)
+    assert rep.scale.details['align']['gauge_cameras']
     assert rep.quality is not None
     json.dumps(rep.to_dict())
     # a given candidate competes with SfM through select()

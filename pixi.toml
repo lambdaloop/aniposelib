@@ -1,6 +1,6 @@
 [workspace]
 name = "aniposelib-pytorch"
-version = "0.9.1"
+version = "1.0.0"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
