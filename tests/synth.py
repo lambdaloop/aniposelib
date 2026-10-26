@@ -301,3 +301,24 @@ def center_error(cg_est, cg_true, with_scale=True):
     a, b = camera_centers(cg_est), camera_centers(cg_true)
     s, R, t = umeyama(a, b, with_scale)
     return np.linalg.norm(s * a @ R.T + t - b, axis=1) / rig_scale(cg_true)
+
+
+def crowd(cgroup, n_people, n_frames, model=PERSON, size=3.5, sep=1.0, spread=0.05, phase=0.0,
+          seed=0):
+    """Several skeletons walking near the scene centre, kept apart: (n_people, N, J, 3).
+
+    Each figure follows its own small random walk (`skeleton`, seed + i) recentred on a point
+    of a circle of radius `sep` / 3 of rig scale (starting at angle `phase`) in the plane orthogonal to the mean
+    viewing direction, so the subjects are never in the same place."""
+    s = rig_scale(cgroup)
+    up = -camera_axes(cgroup).mean(0)
+    up /= np.linalg.norm(up)
+    x = np.cross(up, [1.0, 0, 0]) if abs(up[0]) < 0.9 else np.cross(up, [0, 1.0, 0])
+    x /= np.linalg.norm(x); y = np.cross(up, x)
+    out = []
+    for i in range(n_people):
+        p3d, _ = skeleton(cgroup, n_frames, model=model, size=size, spread=spread, seed=seed + i)
+        a = phase + 2 * np.pi * i / max(n_people, 1)
+        centre = scene_center(cgroup) + sep * s / 3 * (np.cos(a) * x + np.sin(a) * y)
+        out.append(p3d - p3d.reshape(-1, 3).mean(0) + centre)
+    return np.stack(out)

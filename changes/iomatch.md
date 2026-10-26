@@ -36,3 +36,23 @@ All additive (new modules); no existing behaviour changes.
   max_error_px=0.5)` (the tailcyclenet `johnson_fly` telephoto-pinhole construction, checked on support points).
 - `triangulate_affine(cameras, points)` (exact linear LS), `affine_from_points(X, uv)`.
 - Not (yet) usable inside `CameraGroup` (projection/BA there assume pinhole/fisheye).
+
+## `aniposelib.matching` (new, F6)
+- `associate_tracklets(cgroup, detections, track_ids, min_cams=3, max_pair_error=40, min_overlap=8,
+  ambiguity_ratio=3.0, dedupe_ratio=0.2, *, min_len=10, sample_frames=40, backbone_frames=120, verify=True,
+  verify_mult=4.0, verify_floor=100.0, min_score=None, min_points=4) -> Groups`: per-camera 2D tracklets (tracker ids
+  with no cross-camera meaning) -> cross-camera subject groups. Merges duplicate ids, scores tracklet pairs by two-view
+  error (one batched triangulation per camera pair), union-find clustering (backbone tier first, same-camera-same-frame
+  exclusion), relative per-camera id-switch guard (`verify`), leave-one-camera-out ambiguity abstention. Ported from
+  EvoVision `identify_main_3d` / `calib_reuse.tracklet_points`. Differences from the original: `verify` drops the worst
+  camera per frame and re-triangulates (the one-shot version also dropped cameras the switched one had pulled off);
+  the tracklet entry gate is `min_points` finite keypoints instead of a score sum on body-17.
+- `Groups.to_points(n_frames=None, score_thr=None, min_cams=None, frames='sample'|'all', min_points=4)` ->
+  `TrackletPoints(points [C,F,K,2], frame_id, group_id)` (frame budget shared across groups) for BA/QA;
+  `Groups.dense()`, `Group.observations(cam)` (maps back to detection indices), `to_dict()`.
+  Documented loop: associate -> bundle adjust -> re-associate.
+- `associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, max_instances=0, scores=None) ->
+  Association` (+ `associate_points_frames`): per-frame multi-animal association of single-point detections (all
+  cross-camera pairs triangulated in one batch, ranked by support count then residual, greedy growth, refit gate, each
+  detection used once). Ported from tailcyclenet `infer/associate.py`.
+- tests: `synth.crowd()` helper (several separated skeletons).
