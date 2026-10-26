@@ -49,9 +49,6 @@ def test_ba_recovers_perturbed_rig_from_trajectory(scene):
     assert synth.center_error(cg, true).max() < before / 4
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0: robust BA (robust inner triangulation + resection) should survive a '
-                          'camera stuck on a sync LED and 5% false detections', strict=False)
 def test_ba_with_outliers_and_decoy_camera(scene):
     true, p3d, p2d = scene
     p2d = synth.add_outliers(p2d, frac=0.05, cgroup=true, seed=6)

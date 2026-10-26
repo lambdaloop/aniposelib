@@ -94,13 +94,15 @@ def test_set_distortions_clamps_down_only():
     assert cam.get_n_dist() == 3
 
 
-@pytest.mark.parametrize('n_dist', [0, 1, 2])
-def test_bundle_adjust_freezes_exactly(n_dist):
+@pytest.mark.parametrize('n_dist,method', [(0, 'lm'), (1, 'lm'), (2, 'lm'), (2, 'adam')])
+def test_bundle_adjust_freezes_exactly(n_dist, method):
+    """LM (default) leaves frozen coefficients out of the solve; Adam relies on the gradient
+    hooks plus weight_decay=0."""
     cgroup, p2d = perturbed_group(n_dist)
     before = [c.dist.detach().clone() for c in cgroup.cameras]
 
     cgroup.bundle_adjust(torch.as_tensor(p2d), max_nfev=300, verbose=False,
-                         only_extrinsics=False)
+                         only_extrinsics=False, method=method)
 
     moved = 0.0
     for b, cam in zip(before, cgroup.cameras):
