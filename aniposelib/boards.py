@@ -629,10 +629,11 @@ class Checkerboard(CalibrationObject):
                        cv2.TERM_CRITERIA_MAX_ITER,
                        30, 0.01)
 
-    def __init__(self, squaresX, squaresY, square_length=1, manually_verify=False):
+    def __init__(self, squaresX, squaresY, square_length=1, manually_verify=False, *, units=None):
         self.squaresX = squaresX
         self.squaresY = squaresY
         self.square_length = square_length
+        self.units = units
         self.manually_verify = manually_verify
 
         total_size = squaresX * squaresY
@@ -872,6 +873,9 @@ class CharucoBoard(CalibrationObject):
         detectors, off for ``'opencv'`` (compatibility).
     max_homography_px : float
         Threshold of the validation gate.
+    units : str, optional
+        Unit of ``square_length``/``marker_length`` (e.g. ``'mm'``, ``'m'``). Informational:
+        :func:`aniposelib.scale.from_board` writes it to ``cgroup.metadata['units']``.
 
     Object points
     -------------
@@ -899,7 +903,9 @@ class CharucoBoard(CalibrationObject):
                  detector_params=None,
                  detector_kwargs=None,
                  validate=None,
-                 max_homography_px=3.0):
+                 max_homography_px=3.0,
+                 units=None):
+        self.units = units
         self.squaresX = int(squaresX)
         self.squaresY = int(squaresY)
         self.square_length = square_length
@@ -977,9 +983,10 @@ class CharucoBoard(CalibrationObject):
 
     def __repr__(self):
         return ('CharucoBoard(squaresX={}, squaresY={}, square_length={}, marker_length={}, '
-                'legacy_pattern={}, detector={!r})'.format(
+                'legacy_pattern={}, detector={!r}{})'.format(
                     self.squaresX, self.squaresY, self.square_length, self.marker_length,
-                    self.legacy_pattern, self.detector_name))
+                    self.legacy_pattern, self.detector_name,
+                    '' if getattr(self, 'units', None) is None else ', units={!r}'.format(self.units)))
 
     def __getstate__(self):
         # cv2 objects do not pickle; rebuild them on unpickling
@@ -992,6 +999,7 @@ class CharucoBoard(CalibrationObject):
         return state
 
     def __setstate__(self, state):
+        state.setdefault('units', None)
         self.__dict__.update(state)
         self.dictionary = get_aruco_dictionary(self.aruco_dict, self.marker_bits, self.dict_size)
         self.board = cv2.aruco.CharucoBoard((self.squaresX, self.squaresY),

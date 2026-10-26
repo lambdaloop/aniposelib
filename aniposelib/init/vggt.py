@@ -658,7 +658,7 @@ class _Session:
 
 
 def predict(frame_sets, model=DEFAULT_MODEL, device=None, dtype='auto', local_files_only='auto',
-            names=None, keep_model=False, mode='crop', target_size=TARGET_SIZE):
+            names=None, keep_model=False, mode='pad', target_size=TARGET_SIZE):
     """Run VGGT on every template.
 
     Parameters
@@ -675,8 +675,9 @@ def predict(frame_sets, model=DEFAULT_MODEL, device=None, dtype='auto', local_fi
         fails; ``True`` never downloads; ``False`` always lets HF check the Hub.
     keep_model : keep the loaded model in a module cache for later calls (``free_model()``
         drops it); by default the ~5 GB model is freed and the CUDA cache emptied.
-    mode : VGGT preprocessing, ``'crop'`` (VGGT default) or ``'pad'`` (keeps all pixels of
-        portrait/mixed-orientation frames). Intrinsics are corrected for either.
+    mode : preprocessing, ``'pad'`` (default since 1.0: letterbox to 518x518, keeps every pixel
+        of portrait / mixed-orientation frames) or ``'crop'`` (VGGT's own default: width -> 518,
+        centre crop of tall frames). Intrinsics are corrected to original pixels for either.
 
     Returns a :class:`VGGTPrediction`.
     """
@@ -707,7 +708,7 @@ def predict(frame_sets, model=DEFAULT_MODEL, device=None, dtype='auto', local_fi
 
 
 def predict_pairwise(frame_sets, pairs=None, model=DEFAULT_MODEL, device=None, dtype='auto',
-                     local_files_only='auto', keep_model=False, mode='crop', min_templates=3, **kw):
+                     local_files_only='auto', keep_model=False, mode='pad', min_templates=3, **kw):
     """VGGT on **camera pairs** (motor ``vggt_pairwise_rotations``): each two-image
     reconstruction has exactly one relative pose, so a failure stays local to its edge.
     ``pairs`` defaults to all ``i < j``. The model is loaded once for all pairs.
