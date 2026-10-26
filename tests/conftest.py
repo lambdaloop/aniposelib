@@ -9,6 +9,9 @@ from hypothesis import settings
 settings.register_profile("dev", deadline=None, max_examples=25)
 settings.load_profile("dev")
 
+# small problems: many threads only add overhead (and oversubscribe shared machines)
+torch.set_num_threads(int(os.environ.get('ANIPOSELIB_TEST_THREADS', '4')))
+
 # make tests/synth.py importable as `synth`
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
