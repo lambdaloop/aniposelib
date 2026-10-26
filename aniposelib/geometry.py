@@ -514,7 +514,7 @@ def _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed=None):
         sy = (jxx * ey - jyx * ex) / det
         x = x - sx; y = y - sy
         if it % 4 == 3:
-            step = torch.nan_to_num(torch.abs(sx) + torch.abs(sy), nan=0.0, posinf=0.0)
+            step = torch.nan_to_num((torch.abs(sx) + torch.abs(sy)).detach(), nan=0.0, posinf=0.0)
             if step.numel() == 0 or float(step.max()) < tol:
                 break
     # keep the better of fixed point and Newton (Newton can run off in non-invertible regions)
