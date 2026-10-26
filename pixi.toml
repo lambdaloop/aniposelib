@@ -20,5 +20,7 @@ aniposelib = { path = "shim" }
 aniposelib-pytorch = { path = ".", editable = true }
 
 [tasks]
-test = "pytest tests/ -q -m 'not integration'"
-test-all = "pytest tests/ -q"
+test = "pytest -q"
+test-unit = "pytest -q -m 'not integration and not slow and not target'"
+test-targets = "pytest -q -rxX -m target"
+test-all = "pytest -q -m ''"

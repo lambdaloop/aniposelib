@@ -47,6 +47,5 @@ Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
 packages = ["aniposelib"]
 
 [tool.pytest.ini_options]
-markers = [
-    "integration"
-]
+testpaths = ["tests"]
+addopts = "-m 'not slow and not target'"

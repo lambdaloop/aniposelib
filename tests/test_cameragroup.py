@@ -10,16 +10,15 @@ import numpy as np
 from aniposelib.cameras import Camera, CameraGroup
 
 import cv2
+import os
+
+MOTOBS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'rigs', 'motobs_7cam.toml')
 
 
 def to_np(x):
     """The torch camera model returns tensors that still carry grad."""
     return x.detach().cpu().numpy() if hasattr(x, 'detach') else np.asarray(x)
 
-
-@given(st.integers())
-def test_is_integer(n):
-    assert isinstance(n, int)
 
 @given(
     arrays(np.float32, (20,3),
@@ -29,7 +28,7 @@ def test_is_integer(n):
 )
 def test_project_error(p3d):
     """The reprojection error should be 0 when projecting any 3d points"""
-    cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
+    cgroup = CameraGroup.load(MOTOBS)
     p2d = cgroup.project(p3d)
     err = to_np(cgroup.reprojection_error(p3d, p2d))
     assert np.allclose(err, 0), err
@@ -43,7 +42,7 @@ def test_project_error(p3d):
 @pytest.mark.filterwarnings("ignore:overflow")
 def test_project_nan(p3d):
     """project should handle nans and infs gracefully"""
-    cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
+    cgroup = CameraGroup.load(MOTOBS)
     print(p3d)
     p2d = to_np(cgroup.project(p3d))
 
@@ -60,7 +59,7 @@ def test_triangulation_1():
     For some points roughly in center of arena,
     projecting then triangulating recovers 3d points
     """
-    cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
+    cgroup = CameraGroup.load(MOTOBS)
     tvecs = to_np(cgroup.get_translations())
     p3d = np.vstack([tvecs * 0.5, tvecs * 0.3])
     p2d = cgroup.project(p3d)
@@ -74,7 +73,7 @@ def test_triangulation_1():
 
 
 def test_triangulation_point_cloud():
-    cgroup = CameraGroup.load('tests/data/calib_motobs_7cam.toml')
+    cgroup = CameraGroup.load(MOTOBS)
     p3d, s = cgroup.get_point_cloud()
     p2d = cgroup.project(p3d)
 

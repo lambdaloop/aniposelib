@@ -13,7 +13,7 @@ from aniposelib.cameras import (Camera, CameraGroup, FisheyeCamera,
                                 init_camera_intrinsics)
 
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-FISHEYE_TOML = os.path.join(DATA, 'calib_fisheye_5cam.toml')
+FISHEYE_TOML = os.path.join(DATA, 'rigs', 'fisheye_5cam.toml')
 
 K = np.array([[800.0, 0.0, 320.0],
               [0.0, 800.0, 240.0],
