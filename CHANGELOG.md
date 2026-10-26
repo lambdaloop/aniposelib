@@ -344,6 +344,14 @@ Numerical differences from the per-camera `CameraGroup` path (relevant once meth
   best held-out p95 (ported from disco `board_intrinsics_ba.py`). `LadderResult.to_camera()` gives a
   `Camera`/`FisheyeCamera` with the matching `n_dist`.
 
+- `bundle_adjust(method='adam')` / `bundle_adjust_iter(method='adam')` are now scale-invariant. Translation-like
+  parameters (camera tvecs, 3D points, board translations) get learning rates scaled by
+  `rig_scale / ADAM_REF_SCALE` (rig_scale = median camera-to-point distance, `ADAM_REF_SCALE = 1.0`), and their
+  gradients are clipped in normalised units. Before, the absolute step sizes stalled on mm-scale or tiny rigs and
+  drifted or diverged on others: camera-centre error after BA ranged 0.09–3.5% of rig scale depending only on
+  units; it is now identical at 1e-3, 1 and 1e3. Old behaviour: `trans_scale=None`. A fixed scale:
+  `trans_scale=<float>`.
+
 ### quality (1.0-quality): calibration QA and global scale/gauge (plan 01 C4, C5)
 
 New, additive modules (functions taking a `CameraGroup`; `CameraGroup` method aliases such as
