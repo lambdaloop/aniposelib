@@ -403,6 +403,18 @@ def _warn_if_bad_layout(board, rows, min_checked=5):
             RuntimeWarning, stacklevel=3)
 
 
+
+def _auto_margin(margin, width, height, nx, ny, frac=0.5):
+    """Margin in pixels; 'auto' = `frac` of a square, with the square size chosen so that
+    board + margin on both sides fits in width x height."""
+    if margin is None or (isinstance(margin, str) and margin == 'auto'):
+        p = min(width / (nx + 2 * frac), height / (ny + 2 * frac))
+        return max(int(round(frac * p)), 1)
+    margin = int(margin)
+    if margin < 0:
+        raise ValueError('margin must be >= 0 or "auto", got {}'.format(margin))
+    return margin
+
 class CalibrationObject(ABC):
     @abstractmethod
     def draw(self, size):
@@ -657,13 +669,15 @@ class Checkerboard(CalibrationObject):
     def get_square_length(self):
         return self.square_length
 
-    def draw(self, size, margin=0):
+    def draw(self, size, margin='auto'):
         """Render the checkerboard as a uint8 image of ``size = (width, height)`` pixels.
 
         The board has ``(squaresX + 1) x (squaresY + 1)`` squares (squaresX/Y count inner
-        corners), centred on a white background, top-left square black."""
+        corners), centred on a white background, top-left square black. margin: minimum white
+        border in pixels; ``'auto'`` (default) = half a square, ``0`` = as large as fits."""
         width, height = int(size[0]), int(size[1])
         nx, ny = self.squaresX + 1, self.squaresY + 1
+        margin = _auto_margin(margin, width, height, nx, ny)
         p = int(min((width - 2 * margin) // nx, (height - 2 * margin) // ny))
         if p <= 0:
             raise ValueError('size {} too small for a {}x{} checkerboard'.format(size, nx, ny))
@@ -1020,9 +1034,15 @@ class CharucoBoard(CalibrationObject):
     def get_empty_detection(self):
         return np.copy(self.empty_detection)
 
-    def draw(self, size, margin=0, border_bits=1):
-        """Render the board as a uint8 image of ``size = (width, height)`` pixels."""
-        return self.board.generateImage(tuple(int(s) for s in size),
+    def draw(self, size, margin='auto', border_bits=1):
+        """Render the board as a uint8 image of ``size = (width, height)`` pixels.
+
+        margin: white border in pixels around the board. ``'auto'`` (default) leaves half a
+        square on every side, the quiet zone the outer markers need to be detected
+        (edge-to-edge renders lose most edge corners). ``0`` renders edge to edge (0.9 output)."""
+        width, height = int(size[0]), int(size[1])
+        margin = _auto_margin(margin, width, height, self.squaresX, self.squaresY)
+        return self.board.generateImage((width, height),
                                         marginSize=int(margin), borderBits=int(border_bits))
 
     def fill_points(self, corners, ids):

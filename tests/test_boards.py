@@ -119,6 +119,21 @@ def test_from_rows_cols_and_draw():
     assert corners is not None and len(corners) == 35
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+def test_draw_default_margin_is_detectable(legacy):
+    """draw() leaves a quiet zone by default, so its raw output is fully detectable."""
+    b = CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, legacy_pattern=legacy)
+    img = b.draw((1200, 1000))
+    c, i = b.detect_image(img)
+    assert len(i) == b.total_size
+    assert (img[:5] == 255).all() and (img[:, :5] == 255).all()
+    edge = b.draw((1200, 1000), margin=0)
+    assert not (edge[:5] == 255).all()
+    cb = Checkerboard(7, 5, square_length=1.0)
+    corners, _ = cb.detect_image(cb.draw((640, 480)))
+    assert corners is not None and len(corners) == 35
+
+
 def test_object_points_origin_convention():
     b = make_board()
     assert np.allclose(b.get_object_points()[0], 0)

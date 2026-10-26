@@ -1,5 +1,9 @@
 # Changelog (aniposelib-pytorch)
 
+## Unreleased
+
+- `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
+
 ## 1.0.0
 
 Still imports as `aniposelib`; still cannot be installed alongside classic `aniposelib` (see README).

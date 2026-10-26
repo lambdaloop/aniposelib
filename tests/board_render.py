@@ -12,7 +12,7 @@ def render_board(board, K, rvec, tvec, size, dist=None, fisheye=False, backgroun
     nx, ny = board.squaresX, board.squaresY
     if ppu is None:
         ppu = 120.0 / sl  # texture pixels per board unit
-    tex = board.draw((int(round(nx * sl * ppu)), int(round(ny * sl * ppu))))
+    tex = board.draw((int(round(nx * sl * ppu)), int(round(ny * sl * ppu))), margin=0)
     xs, ys = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
     pix = np.stack([xs.ravel(), ys.ravel()], 1).reshape(-1, 1, 2)
     if fisheye:
