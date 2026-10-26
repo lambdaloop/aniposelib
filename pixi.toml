@@ -24,3 +24,17 @@ test = "pytest -q"
 test-unit = "pytest -q -m 'not integration and not slow and not target'"
 test-targets = "pytest -q -rxX -m target"
 test-all = "pytest -q -m ''"
+
+# Guard env (D10): only opencv-python (no contrib), so the board code cannot silently
+# depend on the legacy contrib aruco functions again. `pixi run -e nocontrib test-nocontrib`.
+[feature.nocontrib.pypi-dependencies]
+opencv-python = ">=4.8,<5"
+
+[feature.nocontrib.activation.env]
+ANIPOSELIB_EXPECT_NOCONTRIB = "1"
+
+[feature.nocontrib.tasks]
+test-nocontrib = "pytest -q tests/test_boards.py tests/test_deepcharuco.py tests/test_intrinsics.py tests/test_rig_lab_board.py tests/test_fisheye.py"
+
+[environments]
+nocontrib = ["nocontrib"]

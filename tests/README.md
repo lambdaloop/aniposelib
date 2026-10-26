@@ -24,3 +24,12 @@ Generators in `synth.py`:
 - corruption: `add_noise`, `drop_views`, `add_outliers`, `add_decoy`;
 - rig helpers: `perturb_extrinsics`, `center_error` (similarity-aligned camera centres, as a fraction of rig scale),
   `rig_scale`, `scene_center`.
+
+## Boards and detectors
+- `test_boards.py`: ChArUco/checkerboard detection on boards **rendered** through a camera (`board_render.py`,
+  pinhole and fisheye), `legacy_pattern`, `aruco_dict`, the homography gate, board pose accuracy, and a guard that
+  greps `aniposelib/` for legacy contrib-only `cv2.aruco` functions. Must pass with plain `opencv-python`
+  (`pixi run -e nocontrib test-nocontrib`; there `ANIPOSELIB_EXPECT_NOCONTRIB=1` also asserts contrib is absent).
+- `test_deepcharuco.py`: needs the small r5_c6 weights (~27 MB; looked up in the HF / aniposelib caches,
+  downloaded once otherwise; skipped if unavailable, or set `ANIPOSELIB_NO_DOWNLOAD=1` to never download).
+- `test_intrinsics.py`: `calibrate_ladder` model selection on synthetic board views.
