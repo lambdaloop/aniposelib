@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aniposelib"
+version = "0.0.1"
+description = "Placeholder installed by aniposelib-pytorch (which provides the `aniposelib` import). For classic numpy aniposelib, install aniposelib>=0.8 in an environment without aniposelib-pytorch."
+readme = "README.md"
+authors = [
+    {name = "Lili Karashchuk", email = "lili.karashchuk@gmail.com"}
+]
+requires-python = ">=3.7"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/lambdaloop/anipose-lib"
+
+[tool.setuptools]
+packages = []

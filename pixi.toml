@@ -1,6 +1,6 @@
 [workspace]
-name = "aniposelib"
-version = "0.7.2"
+name = "aniposelib-pytorch"
+version = "0.9.0"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
@@ -12,11 +12,12 @@ pytest-cov = "*"
 hypothesis = "*"
 
 [pypi-dependencies]
-# Tesla T4 (sm_75) on driver 470 -> CUDA 11.4 max, so cu118 wheels only, and torch >= 2.4
-# cu118 ships a triton that needs a CUDA 12 driver. Same pin as ~/lili-tests/vggt-calib.
-torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
+# cu128 wheels: needed for Blackwell (sm_120) GPUs on the dev machine.
+torch = { version = ">=2.7", index = "https://download.pytorch.org/whl/cu128" }
 numpy = "<2"
-aniposelib = { path = ".", editable = true }
+# file-less placeholder that aniposelib-pytorch requires (see shim/)
+aniposelib = { path = "shim" }
+aniposelib-pytorch = { path = ".", editable = true }
 
 [tasks]
 test = "pytest tests/ -q -m 'not integration'"

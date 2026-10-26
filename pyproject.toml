@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aniposelib"
-version = "0.7.2"
-description = "An easy-to-use library for calibrating cameras in python, made for Anipose"
+name = "aniposelib-pytorch"
+version = "0.9.0"
+description = "PyTorch/GPU camera calibration and triangulation library for Anipose (torch fork of aniposelib; imports as `aniposelib`)"
 readme = "README.md"
 authors = [
     {name = "Lili Karashchuk", email = "lili.karashchuk@gmail.com"}
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: BSD License",
@@ -19,9 +19,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Recognition"
 ]
 dependencies = [
+    # File-less placeholder under the classic name: makes classic aniposelib (numpy, 0.8.x)
+    # impossible to install alongside this package, which also provides the `aniposelib` import.
+    "aniposelib==0.0.1",
+    "torch>=2.1",
     # OpenCV 5 moved the cv2.fisheye.CALIB_* flags to the top-level cv2 namespace,
     # which breaks the fisheye intrinsics path in cameras.py at import time.
-    "opencv-contrib-python>=4.7.0.68,<5",
+    # aruco is in main opencv since 4.7, so contrib is not needed.
+    "opencv-python>=4.7.0.68,<5",
     "numba",
     "pandas",
     "numpy",
@@ -35,7 +40,10 @@ dependencies = [
 dev = ["pytest", "pytest-cov", "hypothesis", "build", "twine"]
 
 [project.urls]
-Homepage = "https://github.com/lambdaloop/aniposelib"
+Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
+
+[tool.setuptools]
+packages = ["aniposelib"]
 
 [tool.pytest.ini_options]
 markers = [

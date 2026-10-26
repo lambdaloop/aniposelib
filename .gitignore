@@ -114,3 +114,8 @@ ENV/
 
 # development
 dev/
+
+# local agent notes / editor clutter
+CLAUDE.md
+.aider*
+*.~undo-tree~
