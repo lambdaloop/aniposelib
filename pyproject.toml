@@ -39,6 +39,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "hypothesis", "build", "twine"]
+# audio decoding for aniposelib.sync.load_audio (an ffmpeg executable also works without it)
+sync = ["soundfile", "av"]
 
 [project.urls]
 Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
