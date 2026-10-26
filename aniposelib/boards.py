@@ -40,8 +40,8 @@ def pnp_inputs(camera, points):
     K = camera.get_camera_matrix().cpu().detach().numpy()
 
     if getattr(camera, 'fisheye', False):
-        undistorted = camera.undistort_points(points)
-        undistorted = undistorted.detach().cpu().numpy().reshape(points.shape)
+        undistorted = np.asarray(camera.undistort_points(np.asarray(points)))
+        undistorted = undistorted.reshape(points.shape)
         focal = 0.5 * (K[0, 0] + K[1, 1])
         return undistorted, np.eye(3), np.zeros(5), 1.0 / focal
 

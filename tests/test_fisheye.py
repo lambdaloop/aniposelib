@@ -49,7 +49,7 @@ def frame_grid(nx=40, ny=30):
 
 
 def to_np(x):
-    return x.detach().cpu().numpy()
+    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 
 def test_fisheye_constructs_and_loads():
@@ -155,7 +155,7 @@ def test_fisheye_gradients_finite(dist):
                       [1.0, float('inf'), 2.0]],
                      dtype=torch.float64, requires_grad=True)
 
-    out = cam.project(p)
+    out = cam.project(p, return_grad=True)
     assert torch.isnan(out[3]).all() and torch.isnan(out[4]).all()
     assert torch.isfinite(out[:3]).all()
 
@@ -255,7 +255,7 @@ def _tri_case():
     cg = CameraGroup.load(FISHEYE_TOML)
     rng = np.random.default_rng(1)
     p3d = rng.normal(size=(300, 3)) * 0.5
-    return cg, p3d, cg.project(p3d).detach()
+    return cg, p3d, cg.project(torch.as_tensor(p3d))
 
 
 def test_fisheye_triangulate_cpu():
