@@ -78,6 +78,16 @@ def test_metric_scale_from_board(true_scale):
                            np.linalg.norm(tri[f, i] - tri[f, j], axis=1)) for f in range(F)]
     assert abs(np.nanmedian(ratios) / true_scale - 1) < 0.005
 
+    # the same through aniposelib.scale.from_board (per-frame medians, MAD, board shape)
+    from aniposelib import scale
+    res = scale.from_board(arbitrary, p2d, board)
+    assert res.accepted and not res.flags
+    assert abs(res.scale / true_scale - 1) < 0.005
+    assert res.stats['board_resid'] < 0.005  # board units (m): the rig shape is right
+    res.apply(arbitrary)
+    assert arbitrary.metadata['scale_source'] == 'charuco'
+    assert synth.center_error(arbitrary, true, with_scale=False).max() < 0.005
+
 
 def test_optim_points_does_not_extrapolate(scene):
     true, p3d, p2d, bones = scene
