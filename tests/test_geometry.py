@@ -25,7 +25,9 @@ def test_project_parity_with_cameragroup(rig):
     cg = synth.load_rig(rig)
     P = G.pack(cg)
     X, p2d = visible_points(cg)
-    ref = synth.to_np(cg.project(X))
+    # reference: the per-camera path (CameraGroup.project itself now delegates to the kernel)
+    with torch.no_grad():
+        ref = torch.stack([c._project(torch.as_tensor(X)) for c in cg.cameras]).numpy()
     uv, z = G.project(P, X)
     assert uv.shape == ref.shape and z.shape == ref.shape[:2]
     vis = np.isfinite(p2d).all(-1)
@@ -49,7 +51,9 @@ def test_undistort_parity_with_cameragroup(rig):
     cg = synth.load_rig(rig)
     P = G.pack(cg)
     X, p2d = visible_points(cg)
-    ref = synth.to_np(cg._undistort_points_batch(torch.as_tensor(p2d)))
+    with torch.no_grad():  # per-camera reference (the group method now delegates to the kernel)
+        ref = torch.stack([c._undistort_points(torch.as_tensor(p2d[i]))
+                           for i, c in enumerate(cg.cameras)]).numpy()
     und = G.undistort(P, p2d)
     assert np.array_equal(np.isfinite(und), np.isfinite(ref))
     # where the reference (15 fixed-point iterations) has converged the two agree to 1e-9; where it
