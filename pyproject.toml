@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aniposelib-pytorch"
-version = "0.9.0"
+version = "0.9.1"
 description = "PyTorch/GPU camera calibration and triangulation library for Anipose (torch fork of aniposelib; imports as `aniposelib`)"
 readme = "README.md"
 authors = [
@@ -25,8 +25,9 @@ dependencies = [
     "torch>=2.1",
     # OpenCV 5 moved the cv2.fisheye.CALIB_* flags to the top-level cv2 namespace,
     # which breaks the fisheye intrinsics path in cameras.py at import time.
-    # aruco is in main opencv since 4.7, so contrib is not needed.
-    "opencv-python>=4.7.0.68,<5",
+    # contrib is required: boards.py uses the legacy aruco functions (detectMarkers,
+    # interpolateCornersCharuco, estimatePoseCharucoBoard), which main opencv dropped in 4.7.
+    "opencv-contrib-python>=4.7.0.68,<5",
     "numba",
     "pandas",
     "numpy",
