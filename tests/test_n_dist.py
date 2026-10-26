@@ -121,7 +121,7 @@ def test_bundle_adjust_iter_freezes_exactly():
     before = [c.dist.detach().clone() for c in cgroup.cameras]
 
     cgroup.bundle_adjust_iter(p2d, n_iters=3, n_samp_iter=100, n_samp_full=200,
-                              verbose=False)
+                              verbose=False, rng=0)
 
     for b, cam in zip(before, cgroup.cameras):
         assert torch.equal(cam.dist.detach()[2:], b[2:])

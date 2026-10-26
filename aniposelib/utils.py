@@ -22,9 +22,27 @@ def get_rtvec(M):
     tvec = M[:3, 3].flatten()
     return rvec, tvec
 
+def _whiten_safe(vals):
+    """scipy's whiten, but columns with zero (or non-finite) spread are left unscaled
+    instead of becoming inf/NaN (e.g. identical transforms from VGGT)."""
+    vals = np.asarray(vals, dtype='float64')
+    std = np.std(vals, axis=0)
+    std = np.where(np.isfinite(std) & (std > 1e-12), std, 1.0)
+    return vals / std
+
+
 def get_most_common(vals):
-    Z = linkage(whiten(vals), 'ward')
-    n_clust = max(len(vals)/10, 3)
+    """Boolean mask of the largest cluster of rows of vals (ward linkage on whitened
+    columns). Fewer than 3 rows, or rows that are all identical, are all kept."""
+    vals = np.asarray(vals, dtype='float64')
+    n = len(vals)
+    if n < 3:
+        return np.ones(n, dtype=bool)
+    w = _whiten_safe(vals)
+    if np.allclose(w, w[0]):
+        return np.ones(n, dtype=bool)
+    Z = linkage(w, 'ward')
+    n_clust = max(n/10, 3)
     clusts = fcluster(Z, t=n_clust, criterion='maxclust')
     cc = Counter(clusts[clusts >= 0])
     most = cc.most_common(n=1)
@@ -33,7 +51,14 @@ def get_most_common(vals):
     return good
 
 def select_matrices(Ms):
+    """The largest cluster of similar 4x4 transforms. Empty input raises ValueError;
+    one transform (or identical ones) are returned as they are."""
     Ms = np.array(Ms)
+    if len(Ms) == 0:
+        raise ValueError("select_matrices: no transforms given (no common board detections "
+                         "between this camera pair?)")
+    if len(Ms) < 2:
+        return Ms
     rvecs = [cv2.Rodrigues(M[:3,:3])[0][:, 0] for M in Ms]
     tvecs = np.array([M[:3, 3] for M in Ms])
     best = get_most_common(np.hstack([rvecs, tvecs]))
@@ -50,16 +75,30 @@ def mean_transform(M_list):
 
     return make_M(rvec, tvec)
 
+
+def median_transform(M_list):
+    """Elementwise median of the rotation vectors and translations (a robust seed)."""
+    rvecs = [cv2.Rodrigues(np.asarray(M)[:3,:3])[0][:, 0] for M in M_list]
+    tvecs = [np.asarray(M)[:3, 3] for M in M_list]
+    return make_M(np.median(rvecs, axis=0), np.median(tvecs, axis=0))
+
+
 def mean_transform_robust(M_list, approx=None, error=0.3):
+    """Mean of the transforms whose rotation is within `error` (max abs difference of the
+    rotation matrices) of `approx`. approx=None uses the median transform as the seed
+    (was: no filtering). If nothing is within `error`, the transform closest to the seed
+    is returned rather than a NaN mean."""
+    M_list = [np.asarray(M) for M in M_list]
+    if len(M_list) == 0:
+        raise ValueError("mean_transform_robust: no transforms given")
+    if len(M_list) == 1:
+        return mean_transform(M_list)
     if approx is None:
-        M_list_robust = M_list
-    else:
-        M_list_robust = []
-        for M in M_list:
-            rot_error = M[:3,:3] - approx[:3,:3]
-            m = np.max(np.abs(rot_error))
-            if m < error:
-                M_list_robust.append(M)
+        approx = median_transform(M_list)
+    errs = [np.max(np.abs(M[:3,:3] - approx[:3,:3])) for M in M_list]
+    M_list_robust = [M for M, m in zip(M_list, errs) if m < error]
+    if len(M_list_robust) == 0:
+        M_list_robust = [M_list[int(np.argmin(errs))]]
     return mean_transform(M_list_robust)
 
 

@@ -12,7 +12,7 @@ from aniposelib.utils import get_initial_extrinsics
 pytestmark = pytest.mark.integration
 
 BOARD = dict(squaresX=6, squaresY=5, square_length=24, marker_length=18, marker_bits=4, dict_size=50)
-FAST_BA = dict(n_iters=2, max_nfev=100, n_samp_full=300, n_samp_iter=150)
+FAST_BA = dict(n_iters=2, max_nfev=100, n_samp_full=300, n_samp_iter=150, rng=0)
 
 
 def make_board():

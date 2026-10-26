@@ -28,7 +28,6 @@ dependencies = [
     # contrib is required: boards.py uses the legacy aruco functions (detectMarkers,
     # interpolateCornersCharuco, estimatePoseCharucoBoard), which main opencv dropped in 4.7.
     "opencv-contrib-python>=4.7.0.68,<5",
-    "numba",
     "pandas",
     "numpy",
     "scipy",

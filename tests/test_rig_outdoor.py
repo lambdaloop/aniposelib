@@ -9,7 +9,7 @@ import synth
 
 pytestmark = pytest.mark.integration
 
-FAST_BA = dict(n_iters=2, max_nfev=100, n_samp_full=300, n_samp_iter=150)
+FAST_BA = dict(n_iters=2, max_nfev=100, n_samp_full=300, n_samp_iter=150, rng=0)
 
 
 @pytest.fixture(scope='module')
