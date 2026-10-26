@@ -1,8 +1,11 @@
+import warnings
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass, asdict
+
 import cv2
 import numpy as np
-from abc import ABC, abstractmethod
 from tqdm import trange
-from collections import defaultdict
 
 
 def get_video_params_cap(cap):
@@ -260,6 +263,146 @@ def extract_rtvecs(merged,
     return rtvecs
 
 
+
+def empty_corners():
+    """An empty detection, shaped like a non-empty one: corners (0, 1, 2) float32, ids (0, 1) int32."""
+    return np.zeros((0, 1, 2), dtype='float32'), np.zeros((0, 1), dtype='int32')
+
+
+def _to_gray(image):
+    if image.ndim == 3:
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return image
+
+
+def draw_corners(image, corners, ids=None, color=(0, 0, 255), radius=None):
+    """Draw detected corners (and their ids) on a copy of ``image`` (BGR or gray).
+
+    A local replacement for OpenCV's ``drawDetectedCornersCharuco`` (contrib-only on
+    some OpenCV builds). Returns the annotated BGR image."""
+    out = image.copy()
+    if out.ndim == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    if corners is None or len(corners) == 0:
+        return out
+    pts = np.asarray(corners, dtype='float64').reshape(-1, 2)
+    if radius is None:
+        radius = max(2, int(round(min(out.shape[:2]) / 200)))
+    ids_flat = None if ids is None else np.asarray(ids).ravel()
+    for n, (x, y) in enumerate(pts):
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        c = (int(round(x)), int(round(y)))
+        cv2.circle(out, c, radius, color, -1, cv2.LINE_AA)
+        if ids_flat is not None:
+            cv2.putText(out, str(int(ids_flat[n])), (c[0] + radius + 1, c[1] - radius - 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    return out
+
+
+@dataclass
+class DetectionCheck:
+    """Result of :meth:`CharucoBoard.validate_detection` (truthy when the detection passes).
+
+    ``max_residual_px`` / ``median_residual_px``: residuals of a least-squares homography from
+    the board plane to the image fitted on *all* corners; ``inlier_fraction``: fraction of
+    corners within ``max_homography_px`` of a RANSAC homography. Wrong ids (a transposed
+    board, wrong ``legacy_pattern``, a confused learned detector) cannot be fitted by any
+    homography, so they show up as a large residual and a low inlier fraction."""
+    ok: bool
+    n_corners: int
+    max_residual_px: float
+    median_residual_px: float
+    inlier_fraction: float
+    reason: str = ''
+
+    def __bool__(self):
+        return bool(self.ok)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def homography_check(objp, corners, ids, max_homography_px=3.0, min_corners=6):
+    """Homography gate for one planar-board detection (see :class:`DetectionCheck`).
+
+    ``objp`` is the (K, 2|3) board layout indexed by corner id."""
+    nan = float('nan')
+    if corners is None or ids is None or len(corners) == 0:
+        return DetectionCheck(False, 0, nan, nan, 0.0, 'no corners')
+    objp = np.asarray(objp, dtype='float64').reshape(len(objp), -1)[:, :2]
+    pts = np.asarray(corners, dtype='float64').reshape(-1, 2)
+    ids = np.asarray(ids).astype('int64').ravel()
+    n = len(ids)
+    if len(pts) != n:
+        return DetectionCheck(False, n, nan, nan, 0.0, 'corners and ids differ in length')
+    good = np.all(np.isfinite(pts), axis=1)
+    pts, ids = pts[good], ids[good]
+    n = len(ids)
+    if n and (ids.min() < 0 or ids.max() >= len(objp)):
+        return DetectionCheck(False, n, nan, nan, 0.0, 'corner id out of range for this board')
+    if len(np.unique(ids)) != n:
+        return DetectionCheck(False, n, nan, nan, 0.0, 'duplicate corner ids')
+    if n < max(int(min_corners), 4):
+        return DetectionCheck(False, n, nan, nan, 0.0,
+                              'fewer than {} corners'.format(max(int(min_corners), 4)))
+    src = objp[ids]
+    try:
+        H, _ = cv2.findHomography(src, pts, 0)
+    except cv2.error:
+        H = None
+    if H is None:
+        return DetectionCheck(False, n, float('inf'), float('inf'), 0.0, 'homography fit failed')
+    proj = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
+    res = np.linalg.norm(proj - pts, axis=1)
+    try:
+        Hr, mask = cv2.findHomography(src, pts, cv2.RANSAC, float(max_homography_px))
+    except cv2.error:
+        Hr, mask = None, None
+    if Hr is None or mask is None:
+        frac = float(np.mean(res <= max_homography_px))
+    else:
+        projr = cv2.perspectiveTransform(src.reshape(-1, 1, 2), Hr).reshape(-1, 2)
+        frac = float(np.mean(np.linalg.norm(projr - pts, axis=1) <= max_homography_px))
+    mx = float(np.max(res))
+    ok = mx <= max_homography_px
+    reason = '' if ok else 'homography residual {:.2f} px > {:.2f} px'.format(mx, max_homography_px)
+    return DetectionCheck(bool(ok), n, mx, float(np.median(res)), frac, reason)
+
+
+def _warn_if_bad_layout(board, rows, min_checked=5):
+    """Warn when most detections do not fit the board layout (e.g. squaresX/squaresY swapped)."""
+    if not hasattr(board, 'validate_detection'):
+        return
+    fracs = []
+    for r in rows:
+        ids = r.get('ids')
+        if ids is None or len(ids) < 6:
+            continue
+        pts = np.asarray(r['corners'], dtype='float64').reshape(-1, 2)
+        pts = pts[np.all(np.isfinite(pts), axis=1)]
+        if len(pts) < 6:
+            continue
+        # tolerant threshold (a fraction of the corner spacing), so that lens distortion
+        # does not trigger it but wrong ids (whole squares off) do
+        span = np.ptp(pts, axis=0)
+        spacing = np.sqrt(max(span[0] * span[1], 1.0) / len(pts))
+        chk = board.validate_detection(r['corners'], ids,
+                                       max_homography_px=max(3.0, 0.3 * spacing))
+        fracs.append(chk.inlier_fraction)
+    if len(fracs) >= min_checked and np.median(fracs) < 0.6:
+        warnings.warn(
+            'most board detections do not fit the board layout (median homography inlier '
+            'fraction {:.2f} over {} detections). Check the board definition: squaresX is the '
+            'number of squares across (columns) and squaresY down (rows) -- use '
+            'CharucoBoard.from_rows_cols(rows, cols, ...) to be explicit -- and legacy_pattern '
+            '(boards made by calib.io or OpenCV < 4.6 with an even number of rows need '
+            'legacy_pattern=True).'.format(float(np.median(fracs)), len(fracs)),
+            RuntimeWarning, stacklevel=3)
+
+
 class CalibrationObject(ABC):
     @abstractmethod
     def draw(self, size):
@@ -293,7 +436,18 @@ class CalibrationObject(ABC):
         corners, ids = self.detect_image(image)
         return self.estimate_pose_points(camera, corners, ids)
 
+    def detect_frames(self, frames):
+        """Detect the board in a list of decoded frames (BGR or gray arrays).
+
+        Returns a list of ``(corners, ids)``, one per frame. Batched detectors
+        (``detector='deepcharuco'``) run whole batches at once."""
+        return [self.detect_image(f) for f in frames]
+
     def detect_images(self, images, progress=False, prefix=None):
+        """Detect the board in a list of image filenames (or decoded image arrays).
+
+        Returns rows (dicts with ``framenum``, ``corners``, ``ids``, ``filled``, and
+        ``fname`` for filenames)."""
         length = len(images)
         rows = []
 
@@ -304,7 +458,13 @@ class CalibrationObject(ABC):
 
         for framenum in it:
             imname = images[framenum]
-            frame = cv2.imread(imname)
+            if isinstance(imname, np.ndarray):
+                frame = imname
+                imname = None
+            else:
+                frame = cv2.imread(imname)
+                if frame is None:
+                    raise FileNotFoundError(f'could not read image "{imname}"')
 
             corners, ids = self.detect_image(frame)
 
@@ -319,20 +479,36 @@ class CalibrationObject(ABC):
                     'framenum': key,
                     'corners': corners,
                     'ids': ids,
-                    'fname': imname
                 }
+                if imname is not None:
+                    row['fname'] = imname
 
                 rows.append(row)
 
         rows = self.fill_points_rows(rows)
+        _warn_if_bad_layout(self, rows)
 
         return rows
 
-    def detect_video(self, vidname, prefix=None, skip=20, progress=False):
+    def detect_video(self, vidname, prefix=None, skip=20, progress=False,
+                     frame_indices=None):
+        """Detect the board in a video. Returns rows (see ``detect_images``).
+
+        By default every ``skip``-th frame is checked, densifying to every frame for
+        ``skip/2`` frames after each detection. Pass ``frame_indices`` to detect on
+        exactly those frames instead (decoded in order; batched for batched detectors)."""
         cap = cv2.VideoCapture(vidname)
         if not cap.isOpened():
             raise FileNotFoundError(f'missing video file "{vidname}"')
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if frame_indices is not None:
+            rows = self._detect_video_indices(cap, frame_indices, prefix, progress)
+            cap.release()
+            rows = self.fill_points_rows(rows)
+            _warn_if_bad_layout(self, rows)
+            return rows
+
         if length < 10:
             length = int(1e9)
             progress = False
@@ -368,7 +544,44 @@ class CalibrationObject(ABC):
         cap.release()
 
         rows = self.fill_points_rows(rows)
+        _warn_if_bad_layout(self, rows)
 
+        return rows
+
+    def _detect_video_indices(self, cap, frame_indices, prefix, progress):
+        wanted = sorted(set(int(i) for i in frame_indices))
+        batch = max(1, int(getattr(self, 'batch_size', 1) or 1))
+        rows, buf, nums = [], [], []
+
+        def flush():
+            for num, (corners, ids) in zip(nums, self.detect_frames(buf)):
+                if corners is not None and len(corners) > 0:
+                    key = num if prefix is None else (prefix, num)
+                    rows.append({'framenum': key, 'corners': corners, 'ids': ids})
+            buf.clear()
+            nums.clear()
+
+        it = trange(len(wanted), ncols=70) if progress else range(len(wanted))
+        pos = 0
+        for n in it:
+            target = wanted[n]
+            if target - pos > 30:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                pos = target
+            while pos < target:
+                if not cap.grab():
+                    break
+                pos += 1
+            ret, frame = cap.read()
+            pos += 1
+            if not ret:
+                break
+            buf.append(frame)
+            nums.append(target)
+            if len(buf) >= batch:
+                flush()
+        if buf:
+            flush()
         return rows
 
     def estimate_pose_rows(self, camera, rows):
@@ -402,12 +615,6 @@ class CalibrationObject(ABC):
             if np.sum(good) >= min_points:
                 all_obj.append(np.float32(objp[good]))
                 all_img.append(np.float32(filled_app[good]))
-
-        # all_obj = np.vstack(all_obj)
-        # all_img = np.vstack(all_img)
-
-        # all_obj = np.array(all_obj, dtype='float64')
-        # all_img = np.array(all_img, dtype='float64')
 
         return all_obj, all_img
 
@@ -449,9 +656,23 @@ class Checkerboard(CalibrationObject):
     def get_square_length(self):
         return self.square_length
 
-    # TODO: implement checkerboard draw function
-    def draw(self, size):
-        pass
+    def draw(self, size, margin=0):
+        """Render the checkerboard as a uint8 image of ``size = (width, height)`` pixels.
+
+        The board has ``(squaresX + 1) x (squaresY + 1)`` squares (squaresX/Y count inner
+        corners), centred on a white background, top-left square black."""
+        width, height = int(size[0]), int(size[1])
+        nx, ny = self.squaresX + 1, self.squaresY + 1
+        p = int(min((width - 2 * margin) // nx, (height - 2 * margin) // ny))
+        if p <= 0:
+            raise ValueError('size {} too small for a {}x{} checkerboard'.format(size, nx, ny))
+        img = np.full((height, width), 255, dtype='uint8')
+        x0, y0 = (width - p * nx) // 2, (height - p * ny) // 2
+        for j in range(ny):
+            for i in range(nx):
+                if (i + j) % 2 == 0:
+                    img[y0 + j * p:y0 + (j + 1) * p, x0 + i * p:x0 + (i + 1) * p] = 0
+        return img
 
     def get_empty(self):
         return np.copy(self.empty_detection)
@@ -470,10 +691,7 @@ class Checkerboard(CalibrationObject):
 
     def detect_image(self, image, subpix=True):
 
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        gray = _to_gray(image)
 
         size = self.get_size()
         pattern_was_found, corners = cv2.findChessboardCorners(gray, size, self.DETECT_PARAMS)
@@ -518,8 +736,10 @@ class Checkerboard(CalibrationObject):
         return self.objPoints
 
     def estimate_pose_points(self, camera, points, ids=None):
+        if points is None:
+            return None, None
         ngood = np.sum(~np.isnan(points)) // 2
-        if points is None or ngood < 7:
+        if ngood < 7:
             return None, None
 
         n_points = points.size // 2
@@ -546,16 +766,124 @@ class Checkerboard(CalibrationObject):
                                                              D,
                                                              confidence=0.9,
                                                              reprojectionError=30 * pix_scale)
-            return rvec, tvec
-
-        except:
-            print("W: failed to find checkerboard pose in image")
+        except cv2.error as e:
+            warnings.warn("failed to find checkerboard pose in image: {}".format(e))
             return None, None
+        if not retval:
+            return None, None
+        return rvec, tvec
 
 
+
+ARUCO_DICTS = {
+    (4, 50): cv2.aruco.DICT_4X4_50,
+    (5, 50): cv2.aruco.DICT_5X5_50,
+    (6, 50): cv2.aruco.DICT_6X6_50,
+    (7, 50): cv2.aruco.DICT_7X7_50,
+    (4, 100): cv2.aruco.DICT_4X4_100,
+    (5, 100): cv2.aruco.DICT_5X5_100,
+    (6, 100): cv2.aruco.DICT_6X6_100,
+    (7, 100): cv2.aruco.DICT_7X7_100,
+    (4, 250): cv2.aruco.DICT_4X4_250,
+    (5, 250): cv2.aruco.DICT_5X5_250,
+    (6, 250): cv2.aruco.DICT_6X6_250,
+    (7, 250): cv2.aruco.DICT_7X7_250,
+    (4, 1000): cv2.aruco.DICT_4X4_1000,
+    (5, 1000): cv2.aruco.DICT_5X5_1000,
+    (6, 1000): cv2.aruco.DICT_6X6_1000,
+    (7, 1000): cv2.aruco.DICT_7X7_1000
+}
+
+
+def get_aruco_dictionary(aruco_dict=None, marker_bits=4, dict_size=50):
+    """Resolve an ArUco dictionary.
+
+    ``aruco_dict`` may be a ``cv2.aruco.Dictionary``, a predefined-dictionary constant
+    (e.g. ``cv2.aruco.DICT_APRILTAG_36h11``) or its name (``'DICT_4X4_50'``, ``'4X4_50'``,
+    ``'APRILTAG_36h11'``). If it is None, ``(marker_bits, dict_size)`` picks one of the 16
+    ``DICT_{bits}X{bits}_{size}`` dictionaries."""
+    if aruco_dict is None:
+        key = (int(marker_bits), int(dict_size))
+        if key not in ARUCO_DICTS:
+            raise ValueError(
+                'unsupported (marker_bits, dict_size) = {}; supported pairs are {} '
+                '(or pass aruco_dict=)'.format(key, sorted(ARUCO_DICTS)))
+        return cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[key])
+    if isinstance(aruco_dict, cv2.aruco.Dictionary):
+        return aruco_dict
+    if isinstance(aruco_dict, str):
+        name = aruco_dict.strip()
+        if not name.upper().startswith('DICT_'):
+            name = 'DICT_' + name
+        const = getattr(cv2.aruco, name, None)
+        if const is None:
+            const = getattr(cv2.aruco, name.upper(), None)
+        if const is None or not isinstance(const, int):
+            valid = sorted(n for n in dir(cv2.aruco) if n.startswith('DICT_'))
+            raise ValueError('unknown ArUco dictionary {!r}; valid names: {}'.format(aruco_dict, valid))
+        return cv2.aruco.getPredefinedDictionary(const)
+    if isinstance(aruco_dict, (int, np.integer)):
+        return cv2.aruco.getPredefinedDictionary(int(aruco_dict))
+    raise TypeError('aruco_dict must be a cv2.aruco.Dictionary, an int constant or a name, '
+                    'not {}'.format(type(aruco_dict).__name__))
+
+
+def default_detector_params():
+    """The tuned ``cv2.aruco.DetectorParameters`` used by :class:`CharucoBoard`."""
+    params = cv2.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+    # 3 is OpenCV's default; 0.9.x used 50, which misses small/distant markers
+    params.adaptiveThreshWinSizeMin = 3
+    params.adaptiveThreshWinSizeMax = 700
+    params.adaptiveThreshWinSizeStep = 50
+    params.adaptiveThreshConstant = 0
+    return params
 
 
 class CharucoBoard(CalibrationObject):
+    """A ChArUco board.
+
+    Parameters
+    ----------
+    squaresX, squaresY : int
+        Number of squares **across** (columns) and **down** (rows) the board, in the order
+        ``cv2.aruco.CharucoBoard`` takes them. A board described as "R rows x C columns" is
+        ``CharucoBoard(C, R, ...)``; use :meth:`from_rows_cols` to avoid transposing it.
+    square_length, marker_length : float
+        Side lengths, in the units the calibration should come out in.
+    marker_bits, dict_size : int
+        Pick the predefined ``DICT_{bits}X{bits}_{size}`` dictionary (ignored if
+        ``aruco_dict`` is given).
+    aruco_dict : cv2.aruco.Dictionary, int or str, optional
+        Any ArUco/AprilTag dictionary (see :func:`get_aruco_dictionary`).
+    manually_verify : bool
+        Show each detection and ask to accept or reject it.
+    legacy_pattern : bool
+        Use the checkerboard phase of OpenCV < 4.6 / calib.io boards. It only matters for an
+        even number of rows (``squaresY``); with the wrong setting, few corners are found.
+    detector : 'opencv', 'deepcharuco' or a detector instance
+        How :meth:`detect_image` finds corners. ``'deepcharuco'`` builds a
+        :class:`aniposelib.detectors.DeepCharucoDetector` (``detector_kwargs`` are passed on);
+        an instance needs ``detect(image) -> (corners, ids)`` (and optionally ``detect_batch``).
+    detector_params : cv2.aruco.DetectorParameters or dict, optional
+        OpenCV marker-detection parameters (a dict updates :func:`default_detector_params`).
+    validate : bool, optional
+        Drop detections that fail :meth:`validate_detection`. Default: on for learned
+        detectors, off for ``'opencv'`` (compatibility).
+    max_homography_px : float
+        Threshold of the validation gate.
+
+    Object points
+    -------------
+    :meth:`get_object_points` puts the **first inner corner at the origin**: corner ``id``
+    sits at ``((id % (squaresX-1)) * square_length, (id // (squaresX-1)) * square_length, 0)``.
+    Ids are row-major with x fastest, the same ids ``cv2.aruco.CharucoDetector`` returns.
+    OpenCV's own ``board.getChessboardCorners()`` is this plus ``(square_length,
+    square_length, 0)`` (its origin is the outer corner of the board); pass
+    ``origin='opencv'`` to get those. Board poses (:meth:`estimate_pose_points`) are in the
+    zero-origin frame by default, consistent with ``extract_points``.
+    """
+
     def __init__(self,
                  squaresX,
                  squaresY,
@@ -564,49 +892,115 @@ class CharucoBoard(CalibrationObject):
                  marker_bits=4,
                  dict_size=50,
                  aruco_dict=None,
-                 manually_verify=False):
-        self.squaresX = squaresX
-        self.squaresY = squaresY
+                 manually_verify=False,
+                 *,
+                 legacy_pattern=False,
+                 detector='opencv',
+                 detector_params=None,
+                 detector_kwargs=None,
+                 validate=None,
+                 max_homography_px=3.0):
+        self.squaresX = int(squaresX)
+        self.squaresY = int(squaresY)
         self.square_length = square_length
         self.marker_length = marker_length
         self.manually_verify = manually_verify
+        self.marker_bits = marker_bits
+        self.dict_size = dict_size
+        self.aruco_dict = aruco_dict
+        self.legacy_pattern = bool(legacy_pattern)
 
-        ARUCO_DICTS = {
-            (4, 50): cv2.aruco.DICT_4X4_50,
-            (5, 50): cv2.aruco.DICT_5X5_50,
-            (6, 50): cv2.aruco.DICT_6X6_50,
-            (7, 50): cv2.aruco.DICT_7X7_50,
-            (4, 100): cv2.aruco.DICT_4X4_100,
-            (5, 100): cv2.aruco.DICT_5X5_100,
-            (6, 100): cv2.aruco.DICT_6X6_100,
-            (7, 100): cv2.aruco.DICT_7X7_100,
-            (4, 250): cv2.aruco.DICT_4X4_250,
-            (5, 250): cv2.aruco.DICT_5X5_250,
-            (6, 250): cv2.aruco.DICT_6X6_250,
-            (7, 250): cv2.aruco.DICT_7X7_250,
-            (4, 1000): cv2.aruco.DICT_4X4_1000,
-            (5, 1000): cv2.aruco.DICT_5X5_1000,
-            (6, 1000): cv2.aruco.DICT_6X6_1000,
-            (7, 1000): cv2.aruco.DICT_7X7_1000
-        }
+        self.dictionary = get_aruco_dictionary(aruco_dict, marker_bits, dict_size)
 
-        dkey = (marker_bits, dict_size)
-        self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dkey])
-
-        self.board = cv2.aruco.CharucoBoard([squaresX, squaresY],
+        self.board = cv2.aruco.CharucoBoard((self.squaresX, self.squaresY),
                                             square_length, marker_length,
                                             self.dictionary)
+        self.board.setLegacyPattern(self.legacy_pattern)
 
-        total_size = (squaresX - 1) * (squaresY - 1)
+        if detector_params is None:
+            params = default_detector_params()
+        elif isinstance(detector_params, dict):
+            params = default_detector_params()
+            for key, value in detector_params.items():
+                if not hasattr(params, key):
+                    raise ValueError('unknown cv2.aruco.DetectorParameters field {!r}'.format(key))
+                setattr(params, key, value)
+        else:
+            params = detector_params
+        self.detector_params = params
+        self._aruco_detector = cv2.aruco.ArucoDetector(self.dictionary, params)
+        self._charuco_detector = cv2.aruco.CharucoDetector(self.board)
+
+        self.detector_kwargs = dict(detector_kwargs or {})
+        if isinstance(detector, str):
+            if detector not in ('opencv', 'deepcharuco'):
+                raise ValueError("detector must be 'opencv', 'deepcharuco' or a detector instance")
+            self.detector_name = detector
+            self._detector = None
+        else:
+            if not hasattr(detector, 'detect'):
+                raise TypeError('a detector instance needs a detect(image) method')
+            self.detector_name = type(detector).__name__
+            self._detector = detector
+        if validate is None:
+            validate = self.detector_name != 'opencv'
+        self.validate = bool(validate)
+        self.max_homography_px = float(max_homography_px)
+
+        total_size = (self.squaresX - 1) * (self.squaresY - 1)
 
         objp = np.zeros((total_size, 3), np.float64)
-        objp[:, :2] = np.mgrid[0:(squaresX - 1), 0:(squaresY - 1)].T.reshape(
+        objp[:, :2] = np.mgrid[0:(self.squaresX - 1), 0:(self.squaresY - 1)].T.reshape(
             -1, 2)
         objp *= square_length
         self.objPoints = objp
 
         self.empty_detection = np.zeros((total_size, 1, 2)) * np.nan
         self.total_size = total_size
+
+    @classmethod
+    def from_rows_cols(cls, rows, cols, square_length, marker_length, **kwargs):
+        """Build a board from its number of square **rows** (down) and **columns** (across).
+
+        Equivalent to ``CharucoBoard(squaresX=cols, squaresY=rows, ...)``."""
+        return cls(cols, rows, square_length, marker_length, **kwargs)
+
+    @property
+    def rows(self):
+        """Number of square rows (= squaresY)."""
+        return self.squaresY
+
+    @property
+    def cols(self):
+        """Number of square columns (= squaresX)."""
+        return self.squaresX
+
+    def __repr__(self):
+        return ('CharucoBoard(squaresX={}, squaresY={}, square_length={}, marker_length={}, '
+                'legacy_pattern={}, detector={!r})'.format(
+                    self.squaresX, self.squaresY, self.square_length, self.marker_length,
+                    self.legacy_pattern, self.detector_name))
+
+    def __getstate__(self):
+        # cv2 objects do not pickle; rebuild them on unpickling
+        state = self.__dict__.copy()
+        for key in ('dictionary', 'board', '_aruco_detector', '_charuco_detector',
+                    'detector_params'):
+            state.pop(key, None)
+        if isinstance(state.get('aruco_dict'), cv2.aruco.Dictionary):
+            raise TypeError('a CharucoBoard with a custom cv2.aruco.Dictionary cannot be pickled')
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.dictionary = get_aruco_dictionary(self.aruco_dict, self.marker_bits, self.dict_size)
+        self.board = cv2.aruco.CharucoBoard((self.squaresX, self.squaresY),
+                                            self.square_length, self.marker_length,
+                                            self.dictionary)
+        self.board.setLegacyPattern(self.legacy_pattern)
+        self.detector_params = default_detector_params()
+        self._aruco_detector = cv2.aruco.ArucoDetector(self.dictionary, self.detector_params)
+        self._charuco_detector = cv2.aruco.CharucoDetector(self.board)
 
     def get_size(self):
         size = (self.squaresX, self.squaresY)
@@ -618,42 +1012,52 @@ class CharucoBoard(CalibrationObject):
     def get_empty_detection(self):
         return np.copy(self.empty_detection)
 
-    def draw(self, size):
-        return self.board.draw(size)
+    def draw(self, size, margin=0, border_bits=1):
+        """Render the board as a uint8 image of ``size = (width, height)`` pixels."""
+        return self.board.generateImage(tuple(int(s) for s in size),
+                                        marginSize=int(margin), borderBits=int(border_bits))
 
     def fill_points(self, corners, ids):
         out = self.get_empty_detection()
         if corners is None or len(corners) == 0:
             return out
-        ids = ids.ravel()
+        ids = np.asarray(ids).ravel()
         for i, cxs in zip(ids, corners):
             out[i] = cxs
         return out
 
-    def detect_markers(self, image, camera=None, refine=True):
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+    # ------------------------------------------------------------ detection
 
-        params = cv2.aruco.DetectorParameters()
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-        params.adaptiveThreshWinSizeMin = 50
-        params.adaptiveThreshWinSizeMax = 700
-        params.adaptiveThreshWinSizeStep = 50
-        params.adaptiveThreshConstant = 0
+    @property
+    def detector(self):
+        """The detector instance (None for the built-in OpenCV path)."""
+        if self._detector is None and self.detector_name == 'deepcharuco':
+            from .detectors.deepcharuco import DeepCharucoDetector
+            self._detector = DeepCharucoDetector(self, **self.detector_kwargs)
+        return self._detector
+
+    @property
+    def batch_size(self):
+        det = self.detector
+        return int(getattr(det, 'batch_size', 1) or 1) if det is not None else 1
+
+    def detect_markers(self, image, camera=None, refine=True):
+        """Detect ArUco markers (OpenCV). Returns ``(corners, ids)``, or ``([], [])``."""
+        gray = _to_gray(image)
 
         try:
-            corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(
-                gray, self.dictionary, parameters=params) 
-        except Exception:
-            ids = None
-
-
-        if ids is None:
+            corners, ids, rejectedImgPoints = self._aruco_detector.detectMarkers(gray)
+        except cv2.error as e:
+            warnings.warn('cv2 marker detection failed on this image: {}'.format(e))
             return [], []
 
-        if camera is None or camera.fisheye:
+        if ids is None or len(ids) == 0:
+            return [], []
+
+        if not refine:
+            return corners, ids
+
+        if camera is None or getattr(camera, 'fisheye', False):
             # refineDetectedMarkers has no fisheye variant, and handing it the
             # equidistant coefficients would have it undistort with the wrong
             # model. Refinement is optional, so skip the intrinsics instead.
@@ -662,45 +1066,76 @@ class CharucoBoard(CalibrationObject):
             K = camera.get_camera_matrix().cpu().detach().numpy()
             D = camera.get_distortions().cpu().detach().numpy()
 
-        if refine:
+        try:
             detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
-                cv2.aruco.refineDetectedMarkers(gray, self.board, corners, ids,
-                                            rejectedImgPoints,
-                                            K, D,
-                                            parameters=params)
-        else:
+                self._aruco_detector.refineDetectedMarkers(
+                    gray, self.board, corners, ids, rejectedImgPoints, K, D)
+        except cv2.error as e:
+            warnings.warn('cv2 marker refinement failed on this image: {}'.format(e))
             detectedCorners, detectedIds = corners, ids
 
         return detectedCorners, detectedIds
 
+    def _detect_opencv(self, image, camera=None):
+        gray = _to_gray(image)
+        corners, ids = self.detect_markers(gray, camera, refine=True)
+        if len(corners) == 0:
+            return empty_corners()
+        try:
+            ch_corners, ch_ids, _, _ = self._charuco_detector.detectBoard(
+                gray, markerCorners=corners, markerIds=ids)
+        except cv2.error as e:
+            warnings.warn('cv2 ChArUco corner interpolation failed on this image: {}'.format(e))
+            return empty_corners()
+        if ch_ids is None or len(ch_ids) == 0:
+            return empty_corners()
+        return (np.asarray(ch_corners, dtype='float32').reshape(-1, 1, 2),
+                np.asarray(ch_ids, dtype='int32').reshape(-1, 1))
+
+    def _postprocess(self, image, corners, ids):
+        if self.validate and len(corners) > 0 and \
+                not self.validate_detection(corners, ids):
+            return empty_corners()
+        if len(corners) > 0 and self.manually_verify \
+                and not self.manually_verify_board_detection(_to_gray(image), corners, ids):
+            return empty_corners()
+        return corners, ids
+
     def detect_image(self, image, camera=None):
+        """Detect ChArUco corners in one image (BGR or gray).
 
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        Returns ``(corners, ids)``: corners ``(N, 1, 2)`` float32 in pixels and ids ``(N, 1)``
+        int32. No detection gives shapes ``(0, 1, 2)`` / ``(0, 1)``."""
+        det = self.detector
+        if det is None:
+            corners, ids = self._detect_opencv(image, camera)
         else:
-            gray = image
+            corners, ids = det.detect(image)
+        return self._postprocess(image, corners, ids)
 
-        corners, ids = self.detect_markers(image, camera, refine=True)
-        if len(corners) > 0:
-            ret, detectedCorners, detectedIds = cv2.aruco.interpolateCornersCharuco(
-                corners, ids, gray, self.board)
-            if detectedIds is None:
-                detectedCorners = detectedIds = np.float64([])
-        else:
-            detectedCorners = detectedIds = np.float64([])
+    def detect_frames(self, frames):
+        det = self.detector
+        if det is None or not hasattr(det, 'detect_batch'):
+            return [self.detect_image(f) for f in frames]
+        out = det.detect_batch(list(frames))
+        return [self._postprocess(f, c, i) for f, (c, i) in zip(frames, out)]
 
-        if len(detectedCorners) > 0 \
-            and self.manually_verify \
-            and not self.manually_verify_board_detection(gray, detectedCorners, detectedIds):
-            detectedCorners = detectedIds = np.float64([])
+    def validate_detection(self, corners, ids, max_homography_px=None, min_corners=6):
+        """Check a detection against the board geometry with a homography (planar board).
 
-        return detectedCorners, detectedIds
-
+        Returns a truthy/falsy :class:`DetectionCheck`. ``max_homography_px`` defaults to
+        the board's ``max_homography_px`` (3 px). Strong lens distortion also inflates the
+        residual, so with wide-angle lenses raise the threshold."""
+        if max_homography_px is None:
+            max_homography_px = self.max_homography_px
+        return homography_check(self.objPoints, corners, ids,
+                                max_homography_px=max_homography_px,
+                                min_corners=min_corners)
 
     def manually_verify_board_detection(self, image, corners, ids=None):
 
         height, width = image.shape[:2]
-        image = cv2.aruco.drawDetectedCornersCharuco(image, corners, ids)
+        image = draw_corners(image, corners, ids)
         cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow('verify_detection', image)
         while 1:
@@ -716,26 +1151,71 @@ class CharucoBoard(CalibrationObject):
                 cv2.waitKey(100)
                 return False
 
-    def get_object_points(self):
-        return self.objPoints
+    # ------------------------------------------------------------ geometry / pose
 
-    def estimate_pose_points(self, camera, corners, ids):
-        if corners is None or ids is None or len(corners) < 7:
+    def get_object_points(self, origin='zero'):
+        """Corner positions ``(K, 3)`` indexed by id (see the class docstring).
+
+        ``origin='zero'`` (default): first inner corner at the origin.
+        ``origin='opencv'``: ``board.getChessboardCorners()`` (outer board corner at origin)."""
+        if origin == 'zero':
+            return self.objPoints
+        if origin == 'opencv':
+            return self.objPoints + np.array([self.square_length, self.square_length, 0.0])
+        raise ValueError("origin must be 'zero' or 'opencv'")
+
+    def estimate_pose_points(self, camera, corners, ids, *, min_corners=7, origin='zero'):
+        """Board pose ``(rvec, tvec)`` in the camera frame from detected corners.
+
+        ``solvePnP`` (planar IPPE, refined with LM) on the corners matched to the board's
+        object points by id; a fisheye camera is handled by solving on undistorted points.
+        The pose maps ``get_object_points(origin)`` into the camera frame (zero-origin by
+        default; 0.9.x used OpenCV's origin, ``origin='opencv'``). Returns ``(None, None)``
+        with fewer than ``min_corners`` usable corners, or when they are collinear."""
+        if corners is None or ids is None or len(corners) < min_corners:
             return None, None
 
         n_corners = corners.size // 2
-        corners = np.reshape(corners, (n_corners, 1, 2))
+        corners = np.reshape(np.asarray(corners, dtype='float64'), (n_corners, 1, 2))
+        ids = np.asarray(ids).astype('int64').reshape(-1)
+        if len(ids) != n_corners:
+            return None, None
 
         corners, K, D, _ = pnp_inputs(camera, corners)
 
         # a fisheye undistort returns NaN outside its invertible domain
         good = np.all(np.isfinite(corners), axis=(1, 2))
-        if np.sum(good) < 7:
+        good &= (ids >= 0) & (ids < self.total_size)
+        if np.sum(good) < min_corners:
             return None, None
         corners = corners[good]
-        ids = np.asarray(ids).reshape(-1, 1)[good]
+        ids = ids[good]
 
-        ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            corners, ids, self.board, K, D, None, None)
+        if self.board.checkCharucoCornersCollinear(ids.reshape(-1, 1).astype('int32')):
+            return None, None
 
+        objp = self.get_object_points(origin)[ids].reshape(-1, 1, 3)
+        return solve_board_pnp(objp, corners, K, D)
+
+
+def solve_board_pnp(objp, imgp, K, D):
+    """Planar PnP: IPPE (picks the better of the two planar solutions), then LM refinement.
+
+    Falls back to the iterative solver. Returns ``(rvec, tvec)`` (3x1 each) or ``(None, None)``."""
+    objp = np.ascontiguousarray(objp, dtype='float64').reshape(-1, 1, 3)
+    imgp = np.ascontiguousarray(imgp, dtype='float64').reshape(-1, 1, 2)
+    K = np.asarray(K, dtype='float64')
+    D = np.asarray(D, dtype='float64').ravel()
+    for flags in (cv2.SOLVEPNP_IPPE, cv2.SOLVEPNP_ITERATIVE):
+        try:
+            ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, D, flags=flags)
+        except cv2.error:
+            continue
+        if not ok or not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
+            continue
+        try:
+            rvec, tvec = cv2.solvePnPRefineLM(objp, imgp, K, D, rvec, tvec)
+        except cv2.error:
+            pass
         return rvec, tvec
+    return None, None
