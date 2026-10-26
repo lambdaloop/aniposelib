@@ -322,3 +322,53 @@ def crowd(cgroup, n_people, n_frames, model=PERSON, size=3.5, sep=1.0, spread=0.
         centre = scene_center(cgroup) + sep * s / 3 * (np.cos(a) * x + np.sin(a) * y)
         out.append(p3d - p3d.reshape(-1, 3).mean(0) + centre)
     return np.stack(out)
+
+
+
+# ---------------------------------------------------------------- timed tracks (STBA / stations)
+
+def smooth_tracks(cgroup, n_points=6, amp=0.08, freq=(0.4, 1.6), seed=0):
+    """``f(point, t) -> X [len(t),3]``: smooth 3D tracks (sums of sinusoids, amplitude a fraction of
+    rig scale) around the scene centre, like dancers' joints (disco ``synthetic_problem``)."""
+    rng = np.random.default_rng(seed)
+    c, s = scene_center(cgroup), rig_scale(cgroup)
+    base = c + rng.uniform(-0.12, 0.12, (n_points, 3)) * s
+    a = rng.uniform(0.3, 1.0, (n_points, 3, 3)) * amp * s
+    f = rng.uniform(freq[0], freq[1], (n_points, 3, 3))
+    ph = rng.uniform(0, 2 * np.pi, (n_points, 3, 3))
+
+    def fn(p, t):
+        t = np.asarray(t, float)
+        return base[p] + np.einsum('kd,nkd->nd', a[p], np.sin(2 * np.pi * f[p][None] * t[:, None, None, None][..., 0]
+                                                                + ph[p][None]))
+    return fn
+
+
+def timed_observations(cgroup, n_points=6, duration=3.0, fps=60.0, offsets=None, rates=None, rs=None,
+                       noise=0.5, amp=0.08, seed=0):
+    """Unsynchronised 2D tracks: camera ``c`` records frames at its own times ``tt`` (``fps``, a
+    random sub-frame start) and stamps them ``tt``, but sees the scene at true time
+    ``tt + offsets[c] + rates[c] * (tt - duration/2) + rs[c] * (v/H - 1/2)`` (STBA convention
+    ``true = seed + delta``). Returns ``(obs dict(cam, point, uv, t), track_fn)``."""
+    rng = np.random.default_rng(seed + 1)
+    C = len(cgroup.cameras)
+    fps = np.broadcast_to(np.asarray(fps, float), (C,))
+    offsets = np.zeros(C) if offsets is None else np.asarray(offsets, float)
+    rates = np.zeros(C) if rates is None else np.asarray(rates, float)
+    rs = np.zeros(C) if rs is None else np.asarray(rs, float)
+    fn = smooth_tracks(cgroup, n_points, amp=amp, seed=seed)
+    out = dict(cam=[], point=[], uv=[], t=[])
+    for c in range(C):
+        tt = rng.uniform(0, 1 / fps[c]) + np.arange(0, duration, 1 / fps[c])
+        H = cgroup.cameras[c].get_size()[1]
+        for p in range(n_points):
+            ttrue = tt + offsets[c] + rates[c] * (tt - duration / 2)
+            uv = project(cgroup, fn(p, ttrue))[c]
+            if rs[c]:
+                for _ in range(3):
+                    uv = project(cgroup, fn(p, ttrue + rs[c] * (np.nan_to_num(uv[:, 1]) / H - 0.5)))[c]
+            uv = uv + rng.normal(scale=noise, size=uv.shape)
+            ok = np.all(np.isfinite(uv), axis=1)
+            out['cam'].append(np.full(ok.sum(), c)); out['point'].append(np.full(ok.sum(), p))
+            out['uv'].append(uv[ok]); out['t'].append(tt[ok])
+    return {k: np.concatenate(v) for k, v in out.items()}, fn

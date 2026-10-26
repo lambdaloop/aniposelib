@@ -96,7 +96,10 @@ def test_outlier_exclusion():
     n_outlier = n_points // 2
     p2d[outlier_cam, :n_outlier] += rng.normal(0, 30.0, size=(n_outlier, 2))
 
-    out, picked_vals, _, _ = cgroup.triangulate_ransac(p2d)
+    # 1.0: triangulate_ransac is MSAC with an inlier threshold (tau, px). Some of the N(0, 30)
+    # corruptions move a view by only a few pixels, which is within the default tau=10, so use a
+    # threshold below the corruption (the 0.9 subset search had no threshold)
+    out, picked_vals, _, _ = cgroup.triangulate_ransac(p2d, tau=2.0)
 
     # The outlier camera should be excluded for all corrupted points
     for n in range(n_outlier):

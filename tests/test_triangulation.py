@@ -45,7 +45,7 @@ def test_linear_matches_cameragroup_triangulate(rig):
     X = synth.random_points(cg, 300, seed=1)
     p2d = synth.drop_views(synth.project(cg, X), 0.2, seed=2)
     ok = synth.n_views(p2d) >= 2
-    ref = synth.to_np(cg.triangulate(p2d))
+    ref = synth.to_np(cg.triangulate(p2d, method='svd'))
     lin = T.triangulate_linear(P, p2d)
     assert np.array_equal(np.isfinite(lin).all(-1), ok)
     # noiseless: both are exact; agreement to ~1e-9 of rig scale
@@ -58,7 +58,7 @@ def test_linear_weights_and_blocks(motobs):
     flat = synth.project(true, p3d).reshape(7, -1, 2)   # noiseless: weighted SVD and block DLT agree
     rng = np.random.default_rng(0)
     w = rng.uniform(0.2, 1, size=flat.shape[:2])
-    ref = synth.to_np(true.triangulate(flat, weights=w))
+    ref = synth.to_np(true.triangulate(flat, weights=w, method='svd'))
     lin = T.triangulate_linear(P, flat, weights=w)
     assert np.nanmax(np.linalg.norm(lin - ref, axis=-1)) / synth.rig_scale(true) < 1e-6
     # the DLT of any subset = sum of its blocks
