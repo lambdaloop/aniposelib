@@ -82,9 +82,6 @@ def test_ba_on_keypoints_reduces_reprojection(scene):
     assert after < before / 5
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0: on a small keypoint scene, current BA lowers reprojection error but drifts '
-                          'camera centres (1.9% -> 2.7% of rig scale); robust/LM BA should recover the rig', strict=False)
 def test_ba_on_keypoints_recovers_rig(scene):
     true, p3d, p2d, p2d_decoy, frames = scene
     cg = synth.perturb_extrinsics(true, rot_deg=0.5, trans_frac=0.01, seed=4)
@@ -92,8 +89,6 @@ def test_ba_on_keypoints_recovers_rig(scene):
     assert synth.center_error(cg, true).max() < 0.005
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0: robust BA with structured (camera x frame) rejection should ignore the decoy', strict=False)
 def test_ba_on_keypoints_with_decoy(scene):
     true, p3d, p2d, p2d_decoy, frames = scene
     cg = synth.perturb_extrinsics(true, rot_deg=0.5, trans_frac=0.01, seed=4)
