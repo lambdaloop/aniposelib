@@ -37,6 +37,8 @@ API
     How far the triangulated board is from the real board (board units, scale free).
 ``ray_angles(cgroup, p3d, p2ds=None, min_deg=2.0) -> dict``
     Triangulation angles: per point maximum, per camera pair median; grazing pairs flagged.
+``detect_moves(cgroup, p2ds, times, ...) -> MoveReport``
+    Re-exported from :mod:`aniposelib.stations` (bumped / re-aimed cameras over time).
 ``assess_reuse(cgroup, p2ds, ...) -> ReuseAssessment``
     good / medium / bad from the global median and the worst per-camera LOO median
     (EvoVision ``calib_reuse.assess/classify``).
@@ -55,11 +57,12 @@ import torch
 from . import geometry as G
 from . import triangulation as T
 from . import scale as S
+from .stations import detect_moves, MoveReport  # re-export (camera move QA lives in stations)
 
 __all__ = ['loo_reprojection', 'report', 'paired_bootstrap', 'temporal_split', 'compare', 'sanity',
            'lens_validity', 'coverage', 'board_shape_residual', 'ray_angles', 'assess_reuse',
            'LOOResult', 'CalibrationReport', 'PairedBootstrap', 'TemporalSplit', 'CompareResult',
-           'ReuseAssessment']
+           'ReuseAssessment', 'detect_moves', 'MoveReport']
 
 _builtin = S._builtin
 

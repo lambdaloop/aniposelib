@@ -16,7 +16,9 @@ intervals. ``to_toml_dict()`` / ``from_toml_dict()`` give the optional ``[statio
     t1 = [ 2706.0, 2707.5, inf,]
     name = [ "cam_4", "skip", "cam_4@s1",]
 
-(old readers ignore it). ``CameraGroup(stations=...)`` and the BA station lookup land at merge.
+``CameraGroup(stations=...)`` keeps one; its calibration file stores it as
+``[metadata.stations.<cam>]`` (so aniposelib <= 0.9 readers ignore it), and
+``cgroup.bundle_adjust_lm(obs)`` looks it up with ``obs.time``.
 
 ``detect_moves(cgroup, data, times=None, window_s=4, min_step_deg=0.5) -> MoveReport``: per
 camera, points are triangulated **without** it (robust MSAC on the other cameras), projected

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aniposelib-pytorch"
-version = "0.9.1"
+version = "1.0.0"
 description = "PyTorch/GPU camera calibration and triangulation library for Anipose (torch fork of aniposelib; imports as `aniposelib`)"
 readme = "README.md"
 authors = [
@@ -46,6 +46,10 @@ deepcharuco = ["huggingface_hub", "onnxruntime", "onnx"]
 vggt = ["vggt", "huggingface_hub"]
 # audio decoding for aniposelib.sync.load_audio (an ffmpeg executable also works without it)
 sync = ["soundfile", "av"]
+# aniposelib.io.from_metadata_yaml on hand-written / block-style tracktail metadata.yaml files
+# (files written by aniposelib.io are read without it)
+io = ["pyyaml"]
+all = ["huggingface_hub", "onnxruntime", "onnx", "vggt", "soundfile", "av", "pyyaml"]
 
 [project.urls]
 Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"

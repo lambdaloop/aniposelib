@@ -118,9 +118,33 @@ def _has_extrinsics(cg):
     return not np.allclose(Ms, np.eye(4)[None]) and np.all(np.isfinite(Ms))
 
 
+def _scale_from_reference(cg, ref, align, kw):
+    """Scale (and, if ``align``, the full similarity gauge) from a reference calibration of the
+    same cameras: ``scale.from_reference`` (flags, residuals), then ``scale.align_to``."""
+    from aniposelib import scale as S
+    res = S.from_reference(cg, ref, **kw)
+    if not align:
+        res.apply(cg)
+        return res
+    if res.scale is None or not res.accepted:
+        raise ValueError('scale estimate not accepted: {}'.format(res.reason))
+    al = S.align_to(cg, ref, trim=kw.get('trim', 2.5), min_keep=kw.get('min_keep', 3))
+    md = cg.metadata
+    md['scale_source'] = 'reference'
+    if res.units is not None:
+        md['units'] = str(res.units)
+    q = res.quality()
+    if q:
+        md['scale_quality'] = S._toml_clean(dict(q))
+    res.details['align'] = al.to_dict()
+    return res
+
+
 def _apply_scale(cg, scale, p2ds):
     """``scale``: None, a float (multiply translations), a reference ``CameraGroup``
-    (``scale.from_reference``), ``dict(pairs=, lengths=)`` (``scale.from_lengths`` on
+    (``scale.from_reference``, then the gauge is aligned to the reference with
+    ``scale.align_to``: same scale, rotation and origin; ``dict(reference=ref, align=False)``
+    only rescales), ``dict(pairs=, lengths=)`` (``scale.from_lengths`` on
     ``p2ds [C,N,J,2]``), ``dict(board=, rows=)`` (``scale.from_board``) or a callable
     ``f(cgroup) -> s``."""
     from aniposelib import scale as S
@@ -134,8 +158,11 @@ def _apply_scale(cg, scale, p2ds):
     if isinstance(scale, (int, float)):
         S.rescale(cg, float(scale), source='manual')
         return dict(s=float(scale), source='manual')
+    if isinstance(scale, dict) and 'reference' in scale:
+        kw = {k: v for k, v in scale.items() if k not in ('reference', 'align')}
+        return _scale_from_reference(cg, scale['reference'], scale.get('align', True), kw)
     if isinstance(scale, CameraGroup):
-        res = S.from_reference(cg, scale)
+        return _scale_from_reference(cg, scale, True, {})
     elif isinstance(scale, dict) and 'board' in scale:
         res = S.from_board(cg, scale['rows'], scale['board'],
                            **{k: v for k, v in scale.items() if k not in ('board', 'rows')})
@@ -207,8 +234,10 @@ def calibrate_from_points(p2ds, cam_names=None, sizes=None, intrinsics=None, ini
        cameras, only complete candidates compete unless none is complete.
     4. Refinement (``refine``, see :func:`_refine`; ``robust=False`` turns ``'auto'`` into
        ``'iter'``, the classic Adam BA).
-    5. Scale (``scale``: float | reference group | ``dict(pairs=, lengths=)`` |
-       ``dict(board=, rows=)`` | callable), via :mod:`aniposelib.scale`.
+    5. Scale (``scale``: float | reference group (also aligns the gauge: rotation and origin
+       of the reference; ``dict(reference=ref, align=False)`` only rescales) |
+       ``dict(pairs=, lengths=)`` | ``dict(board=, rows=)`` | callable), via
+       :mod:`aniposelib.scale`.
     6. ``aniposelib.quality.report(cgroup, p2ds, groups=groups)`` if ``report``.
 
     ``p2ds``: ``[C,N,2]`` or ``[C,N,J,2]`` in ``cam_names`` order (NaN = missing).

@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from scipy.sparse import lil_matrix, dok_matrix
 from scipy.linalg import inv
 from scipy import optimize
-from scipy import signal
 from collections import defaultdict, Counter, namedtuple
 import io
 import re
@@ -226,6 +225,7 @@ def resample_points(imgp, extra=None, n_samp=25, rng=None):
 def medfilt_data(values, size=15):
     padsize = size+5
     vpad = np.pad(values, (padsize, padsize), mode='reflect')
+    from scipy import signal
     vpadf = signal.medfilt(vpad, kernel_size=size)
     return vpadf[padsize:-padsize]
 
@@ -995,6 +995,27 @@ class Camera(nn.Module):
 
 
 
+    # -- 1.0 convenience aliases (thin delegates)
+    @classmethod
+    def from_extrinsics_mat(cls, K, E, dist=None, size=None, name=None, **kwargs):
+        """A camera from a 3x3 ``K`` and a 4x4 / 3x4 world->camera matrix ``E``
+        (``x_cam = R X + t``); see :func:`aniposelib.io.camera_from_extrinsics_mat`.
+        ``FisheyeCamera.from_extrinsics_mat`` builds a fisheye camera."""
+        from aniposelib import io as _io
+        kwargs.setdefault('fisheye', issubclass(cls, FisheyeCamera))
+        cam = _io.camera_from_extrinsics_mat(K, E, dist, size, name, **kwargs)
+        if not isinstance(cam, cls):
+            raise TypeError('{} is not a {}'.format(type(cam).__name__, cls.__name__))
+        return cam
+
+    def lens_validity(self, **kwargs):
+        """Is the lens model usable over the whole image (undistort/distort round trip,
+        monotone radial map)? See :func:`aniposelib.quality.lens_validity` (e.g.
+        ``max_nonfinite_frac=`` for a fisheye whose image circle does not fill the frame)."""
+        from aniposelib import quality as _Q
+        return _Q.lens_validity(self, **kwargs)
+
+
 class FisheyeCamera(Camera):
     """OpenCV fisheye (equidistant) camera, differentiable end to end.
 
@@ -1181,8 +1202,12 @@ _FISHEYE_FIX_K = [cv2.fisheye.CALIB_FIX_K1, cv2.fisheye.CALIB_FIX_K2,
                   cv2.fisheye.CALIB_FIX_K3, cv2.fisheye.CALIB_FIX_K4]
 
 
-def init_camera_intrinsics(camera, objp, imgp, size):
+def init_camera_intrinsics(camera, objp, imgp, size, *, guard=False):
     """Seed a camera's intrinsics from board detections, per projection model.
+
+    ``guard=True`` (or a dict of keyword arguments) runs the guarded
+    :func:`aniposelib.init.board.init_camera_intrinsics` instead (plausibility check of the
+    seed with a fallback, returns an ``IntrinsicsSeed``); default False: the classic seed.
 
     The pinhole path gets a camera matrix from cv2.initCameraMatrix2D and starts
     from zero distortion. There is no fisheye equivalent of that, so the fisheye
@@ -1195,6 +1220,10 @@ def init_camera_intrinsics(camera, objp, imgp, size):
     coefficient pinned to zero, which will not reproduce a camera whose frozen
     coefficients are non-zero -- pass init_intrinsics=False for that.
     """
+    if guard:
+        from aniposelib.init import board as _board
+        return _board.init_camera_intrinsics(camera, objp, imgp, size,
+                                             **(guard if isinstance(guard, dict) else {}))
     n_dist = camera.get_n_dist()
     # cv2 overwrites the coefficients it is told to fix with 0 rather than
     # holding them where they were, so keep a copy to restore afterwards
@@ -1325,12 +1354,20 @@ class CameraGroup(nn.Module):
 
     Public read-only methods (project, triangulate*, reprojection_error, undistort_points,
     average_error, optim_points, ...) follow the input type: numpy in -> numpy out, torch in
-    -> detached torch out on the input's device; return_grad=True keeps the autograd graph."""
+    -> detached torch out on the input's device; return_grad=True keeps the autograd graph.
 
-    def __init__(self, cameras, metadata=None, dtype=None):
+    ``stations``: optional :class:`aniposelib.stations.Stations` (time intervals of moved
+    cameras). It is saved in the calibration file (``[metadata.stations]``), kept by
+    ``copy``/``subset_cameras*``, and used by ``bundle_adjust_lm`` for timed observations."""
+
+    def __init__(self, cameras, metadata=None, dtype=None, stations=None):
         super().__init__()
         self.cameras = nn.ModuleList(cameras)
         self.metadata = {} if metadata is None else metadata
+        if stations is not None and not hasattr(stations, 'lookup'):
+            from aniposelib.stations import Stations
+            stations = Stations.from_toml_dict(stations)
+        self.stations = stations
         if dtype is not None:
             self.to(dtype)
 
@@ -1349,22 +1386,40 @@ class CameraGroup(nn.Module):
     def _tensor(self, x):
         return to_tensor(x, device=self.device, dtype=self.dtype)
 
+    def _stations_copy(self):
+        st = getattr(self, 'stations', None)
+        return None if st is None else st.copy()
+
     def subset_cameras(self, indices):
         cams = [self.cameras[ix].copy() for ix in indices]
-        return CameraGroup(cams, deepcopy(self.metadata))
+        return CameraGroup(cams, deepcopy(self.metadata), stations=self._stations_copy())
 
-    def subset_cameras_names(self, names):
+    def subset_cameras_names(self, names, missing='raise'):
+        """A new group with the cameras ``names``, in that order. ``missing='raise'`` (default)
+        raises IndexError for a name not in the group; ``'drop'`` skips it."""
+        if missing not in ('raise', 'drop'):
+            raise ValueError("missing must be 'raise' or 'drop'")
         cur_names = self.get_names()
         cur_names_dict = dict(zip(cur_names, range(len(cur_names))))
         indices = []
         for name in names:
             if name not in cur_names_dict:
+                if missing == 'drop':
+                    continue
                 raise IndexError(
                     "name {} not part of camera names: {}".format(
                         name, cur_names
                     ))
             indices.append(cur_names_dict[name])
         return self.subset_cameras(indices)
+
+    def reorder(self, names):
+        """A new group with the same cameras in the order ``names`` (a permutation of
+        ``get_names()``). Reorder point arrays with :func:`aniposelib.io.reindex_points`."""
+        names = list(names)
+        if sorted(map(str, names)) != sorted(map(str, self.get_names())) or len(names) != len(self.cameras):
+            raise ValueError('reorder needs a permutation of {}, got {}'.format(self.get_names(), names))
+        return self.subset_cameras_names(names)
 
     @contextmanager
     def frozen(self):
@@ -2145,6 +2200,9 @@ class CameraGroup(nn.Module):
         """Schur-complement Levenberg-Marquardt bundle adjustment; see
         :func:`aniposelib.bundle.bundle_adjust_lm` (``return_report=True`` for a BAReport)."""
         from . import bundle as _B
+        st = getattr(self, 'stations', None)
+        if 'stations' not in kwargs and st is not None and getattr(obs_or_p2ds, 'time', None) is not None:
+            kwargs['stations'] = st  # the group's stations, looked up by obs.time
         return _B.bundle_adjust_lm(self, obs_or_p2ds, **kwargs)
 
     def bundle_adjust_robust(self, p2ds, **kwargs):
@@ -2981,7 +3039,7 @@ class CameraGroup(nn.Module):
     def copy(self):
         cameras = [cam.copy() for cam in self.cameras]
         metadata = deepcopy(self.metadata)
-        return CameraGroup(cameras, metadata)
+        return CameraGroup(cameras, metadata, stations=self._stations_copy())
 
     def set_rotations(self, rvecs):
         for cam, rvec in zip(self.cameras, rvecs):
@@ -3260,6 +3318,10 @@ class CameraGroup(nn.Module):
         names = ['cam_{}'.format(i) for i in range(len(dicts))]
         master_dict = dict(zip(names, dicts))
         master_dict['metadata'] = _to_builtin(deepcopy(self.metadata))
+        st = getattr(self, 'stations', None)
+        if st is not None:
+            # under [metadata.stations]: readers <= 0.9 treat every other top-level table as a camera
+            master_dict['metadata']['stations'] = st.to_toml_dict()
         return master_dict
 
     @staticmethod
@@ -3267,11 +3329,18 @@ class CameraGroup(nn.Module):
         """Inverse of to_dict. Camera sections are every key other than 'metadata', ordered
         by `order`: 'natural' (default; cam_2 before cam_10), 'lexical' (aniposelib <= 0.9)
         or 'file' (dict order)."""
-        keys = [k for k in master_dict.keys() if k != 'metadata']
+        keys = [k for k in master_dict.keys() if k not in ('metadata', 'stations')]
         keys = _order_keys(keys, order=order)
         items = [master_dict[k] for k in keys]
         metadata = deepcopy(master_dict.get('metadata', {}))
-        return CameraGroup.from_dicts(items, metadata=metadata, dtype=dtype)
+        st = metadata.pop('stations', None) if isinstance(metadata, dict) else None
+        if st is None:
+            st = master_dict.get('stations')
+        cg = CameraGroup.from_dicts(items, metadata=metadata, dtype=dtype)
+        if st:
+            from aniposelib.stations import Stations
+            cg.stations = Stations.from_toml_dict(st, cameras=cg.get_names())
+        return cg
 
     def dumps(self):
         """The calibration as a TOML string (same content as dump)."""
@@ -3387,6 +3456,57 @@ class CameraGroup(nn.Module):
             good = s < sensitivity_threshold
 
             return all_points[good], s[good]
+
+    # -- 1.0 convenience aliases (thin delegates to aniposelib.scale / quality / init)
+    def rescale(self, s, units=None, source=None, quality=None):
+        """World units *= ``s``, in place; returns self. See :func:`aniposelib.scale.rescale`."""
+        from aniposelib import scale as _S
+        return _S.rescale(self, s, units=units, source=source, quality=quality)
+
+    def apply_similarity(self, s=1.0, R=None, t=None):
+        """Re-express the rig in the world frame ``X' = s R X + t``, in place; returns self.
+        See :func:`aniposelib.scale.apply_similarity`."""
+        from aniposelib import scale as _S
+        return _S.apply_similarity(self, s, R, t)
+
+    def anchor_to(self, camera=0):
+        """Make ``camera`` (index or name) the world frame, in place; returns self.
+        See :func:`aniposelib.scale.anchor_to`."""
+        from aniposelib import scale as _S
+        return _S.anchor_to(self, camera)
+
+    def align_to(self, target, **kwargs):
+        """Trimmed similarity alignment of the camera centres onto ``target`` (a group, matched
+        by name, or ``[C,3]`` centres), in place -> ``AlignResult``.
+        See :func:`aniposelib.scale.align_to`."""
+        from aniposelib import scale as _S
+        return _S.align_to(self, target, **kwargs)
+
+    def align_world(self, ground_points=None, up='z', origin='centroid'):
+        """Rotate the world so the floor normal is ``up``, in place -> ``AlignResult``.
+        See :func:`aniposelib.scale.align_world`."""
+        from aniposelib import scale as _S
+        return _S.align_world(self, ground_points=ground_points, up=up, origin=origin)
+
+    def report(self, p2ds, **kwargs):
+        """Calibration QA (per-camera reprojection + leave-one-camera-out) -> ``CalibrationReport``.
+        See :func:`aniposelib.quality.report`."""
+        from aniposelib import quality as _Q
+        return _Q.report(self, p2ds, **kwargs)
+
+    def loo_reprojection(self, p2ds, **kwargs):
+        """Leave-one-camera-out reprojection -> ``LOOResult``.
+        See :func:`aniposelib.quality.loo_reprojection`."""
+        from aniposelib import quality as _Q
+        return _Q.loo_reprojection(self, p2ds, **kwargs)
+
+    @staticmethod
+    def from_extrinsics(names, Ms, K=None, sizes=None, model='pinhole', **kwargs):
+        """A group from world->camera matrices ``Ms [C,4,4]`` (+ ``K``, ``dist``, ``sizes``,
+        ``model`` or a ``template`` group for the intrinsics).
+        See :func:`aniposelib.init.from_extrinsics`."""
+        from aniposelib.init._common import from_extrinsics as _fe
+        return _fe(names, Ms, K=K, sizes=sizes, model=model, **kwargs)
 
 
 # intrinsics anchoring of bundle_adjust_iter(method='lm') on points (spec=None): sigma of log

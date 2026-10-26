@@ -5,7 +5,6 @@ from scipy.cluster.vq import whiten
 from scipy.linalg import inv
 from collections import defaultdict, Counter
 import queue
-import pandas as pd
 
 
 
@@ -215,7 +214,23 @@ def compute_camera_matrices(rtvecs, pairs):
         extrinsics[b] = np.matmul(ext, extrinsics[a])
     return extrinsics
 
-def get_initial_extrinsics(rtvecs, cam_names=None):
+def get_initial_extrinsics(rtvecs, cam_names=None, disconnected='raise'):
+    """Initial (rvecs, tvecs) [C,3] from per-camera board poses ``rtvecs [C,F,6]``.
+
+    ``disconnected='raise'`` (default, aniposelib <= 0.9): ValueError when some cameras never
+    share a board view with the others. ``'components'``: delegate to
+    :func:`aniposelib.init.board.initial_extrinsics` (one gauge per connected component, robust
+    fallback per edge; a warning lists the components). For the full report use that function."""
+    if disconnected not in ('raise', 'components'):
+        raise ValueError("disconnected must be 'raise' or 'components'")
+    if disconnected == 'components':
+        import warnings
+        from aniposelib.init.board import initial_extrinsics
+        res = initial_extrinsics(rtvecs, cam_names)
+        if len(res.components) > 1:
+            warnings.warn('board graph has {} disconnected components {}; each has its own '
+                          'gauge'.format(len(res.components), res.components))
+        return np.asarray(res.rvecs), np.asarray(res.tvecs)
     graph = get_calibration_graph(rtvecs, cam_names)
     pairs = find_calibration_pairs(graph, source=0)
     extrinsics = compute_camera_matrices(rtvecs, pairs)
@@ -234,6 +249,7 @@ def get_initial_extrinsics(rtvecs, cam_names=None):
 
 ## convenience function to load a set of DeepLabCut pose-2d files
 def load_pose2d_fnames(fname_dict, offsets_dict=None, cam_names=None):
+    import pandas as pd
     if cam_names is None:
         cam_names = sorted(fname_dict.keys())
     pose_names = [fname_dict[cname] for cname in cam_names]
