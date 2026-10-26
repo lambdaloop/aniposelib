@@ -25,9 +25,10 @@ dependencies = [
     "torch>=2.1",
     # OpenCV 5 moved the cv2.fisheye.CALIB_* flags to the top-level cv2 namespace,
     # which breaks the fisheye intrinsics path in cameras.py at import time.
-    # contrib is required: boards.py uses the legacy aruco functions (detectMarkers,
-    # interpolateCornersCharuco, estimatePoseCharucoBoard), which main opencv dropped in 4.7.
-    "opencv-contrib-python>=4.7.0.68,<5",
+    # boards.py uses only the main-module aruco class API (ArucoDetector/CharucoDetector,
+    # stable since 4.8), so contrib is not needed. opencv-contrib-python also provides cv2
+    # and keeps working if it is installed instead.
+    "opencv-python>=4.8,<5",
     "numba",
     "pandas",
     "numpy",
@@ -39,12 +40,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "hypothesis", "build", "twine"]
+# learned ChArUco detector (aniposelib.detectors.deepcharuco): HF weight downloads + ONNX backend.
+# backend='torch' works without these (plain HTTPS download fallback).
+deepcharuco = ["huggingface_hub", "onnxruntime", "onnx"]
 
 [project.urls]
 Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
 
 [tool.setuptools]
-packages = ["aniposelib"]
+packages = ["aniposelib", "aniposelib.detectors"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
