@@ -193,7 +193,7 @@ def test_estimate_pose_exact(fisheye):
         cam = Camera(matrix=K, dist=[-0.2, 0.05, 0.001, -0.001, 0.0], size=SIZE)
     cam.set_rotation(rvec)
     cam.set_translation(tvec)
-    p2d = cam.project(objp).detach().cpu().numpy()
+    p2d = np.asarray(cam.project(objp))
     ids = np.arange(len(objp))[::2].reshape(-1, 1).astype('int32')  # partial view
     r, t = board.estimate_pose_points(cam, p2d[ids.ravel()].reshape(-1, 1, 2), ids)
     assert _angle_deg(r, rvec) < 1e-3

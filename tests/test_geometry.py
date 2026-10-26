@@ -99,7 +99,7 @@ def _rand_cam(rng, fisheye=False):
 def test_skew_and_offset_direct_formula(fisheye):
     rng = np.random.default_rng(1)
     cam = _rand_cam(rng, fisheye)
-    cam.offset = [12.0, -7.0]
+    cam.set_offset([12.0, -7.0])
     P = G.pack([cam])
     np.testing.assert_array_equal(P.offset.numpy(), [[12.0, -7.0]])
     X = rng.uniform(-1, 1, size=(200, 3))
