@@ -60,15 +60,18 @@ def test_leave_one_out_flags_decoy_camera(scene):
     assert loo[DECOY] > 3 * np.median(np.delete(loo, DECOY))
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0 quality.loo_reprojection with robust triangulation: healthy cameras should '
-                          'score near the noise level even while another camera is a decoy', strict=False)
 def test_robust_leave_one_out_isolates_decoy(scene):
-    from aniposelib import quality  # noqa: F401  (1.0 module)
+    """quality.loo_reprojection with robust triangulation: healthy cameras score near the noise
+    level even while another camera is a decoy."""
+    from aniposelib import quality
     true, p3d, p2d, p2d_decoy, frames = scene
     rep = quality.loo_reprojection(true, flat(p2d_decoy))
     med = np.array([rep.per_camera[n]['median_px'] for n in true.get_names()])
     assert np.all(np.delete(med, DECOY) < 3) and med[DECOY] > 50
+    assert rep.overall['worst_camera'] == true.get_names()[DECOY]
+    # fixed denominator: every eligible observation counts; the decoy frames are disagreements
+    agree = rep.per_camera[true.get_names()[DECOY]]['agree@8']
+    assert abs(agree - (1 - frames.mean())) < 0.05
 
 
 def test_ba_on_keypoints_reduces_reprojection(scene):
