@@ -46,10 +46,9 @@ def bone_cv(x, bones):
     return np.median(np.std(L, axis=1) / np.mean(L, axis=1))
 
 
-@pytest.mark.target
-@pytest.mark.xfail(reason='1.0: bone constraints should make bone lengths more consistent than plain '
-                          'triangulation within a short optimisation budget', strict=False)
 def test_optim_points_tightens_bones(scene):
+    """Bone constraints make bone lengths more consistent than plain triangulation within a
+    short optimisation budget (1.0 target, met in 1.1)."""
     true, p3d, p2d, bones = scene
     p2d = synth.drop_views(p2d, frac=0.3, seed=5)
     C, N, J, _ = p2d.shape

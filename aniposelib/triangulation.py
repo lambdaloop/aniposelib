@@ -30,7 +30,12 @@ API
       refit (``n_iter`` rounds, never below ``max(2, min_inliers)`` views).
     ``contrib`` (bool ``[C]``) restricts which cameras may *define* points (passengers are
     still reported in ``errors``/``inliers``); points with fewer than two contributing views
-    fall back to all views. ``mask_out_of_bounds`` treats observations outside the image
+    fall back to all views. ``scores [C,...]`` (1.1) are soft confidence weights (clipped to
+    [0, 1]) on the squared pixel error in the hypothesis cost, the refit and the Gauss-Newton
+    step; they never drop a view by themselves. ``check_invertible=True`` (1.1, default): lens
+    fold / ray-consistency check (observations past the fold of a strong barrel distortion are
+    not fit; inliers whose undistorted ray disagrees with the point are dropped and the point
+    redone), formerly only in the ``CameraGroup`` wrappers. ``mask_out_of_bounds`` treats observations outside the image
     (``P.size``) as missing. ``chunk`` bounds memory (default: automatic from ``max_elems``).
 ``triangulate_possible(P, points, tau=10, min_inliers=2, ...) -> PossibleResult``
     ``points [C,N,K,2]``: up to K candidate detections per camera. Hypotheses are pairs
@@ -347,7 +352,7 @@ def _definers(valid, contrib):
     return torch.where(few[None], valid, d)
 
 
-def _msac_chunk(P, p2, und, valid, defn, B, E, center, tau, n_refine, pa, pb, ridge):
+def _msac_chunk(P, p2, und, valid, defn, B, E, center, tau, n_refine, pa, pb, ridge, sw=None):
     C, n = valid.shape
     dev, dt = P.device, P.dtype
     tau2 = tau * tau
@@ -361,8 +366,10 @@ def _msac_chunk(P, p2, und, valid, defn, B, E, center, tau, n_refine, pa, pb, ri
     eh = G._reproj_err_flat(P, Xh, p2[:, ni], _sub_ext(E, ni))
     vh = valid[:, ni]
     big = torch.full_like(eh, tau2)
-    cost = torch.where(vh, torch.minimum(torch.nan_to_num(eh, nan=tau, posinf=tau) ** 2, big),
-                       torch.zeros_like(eh)).sum(0)
+    capped = torch.minimum(torch.nan_to_num(eh, nan=tau, posinf=tau) ** 2, big)
+    if sw is not None:
+        capped = capped * sw[:, ni]
+    cost = torch.where(vh, capped, torch.zeros_like(eh)).sum(0)
     best = torch.full((n,), float('inf'), dtype=dt, device=dev).scatter_reduce(0, ni, cost, reduce='amin')
     is_best = cost <= best[ni]
     H = ni.numel()
@@ -379,10 +386,11 @@ def _msac_chunk(P, p2, und, valid, defn, B, E, center, tau, n_refine, pa, pb, ri
     pair_mask[pb[si[hsel]], torch.arange(len(pts), device=dev)] = True
     fit = torch.where((fit.sum(0) >= 2)[None], fit, pair_mask)
     Ep = _sub_ext(E, pts)
-    Xp = _solve(torch.einsum('cn,cnij->nij', fit.to(dt), B[:, pts]), _sub_center(center, pts), ridge)
+    sp = torch.ones_like(fit, dtype=dt) if sw is None else sw[:, pts]
+    Xp = _solve(torch.einsum('cn,cnij->nij', fit.to(dt) * sp, B[:, pts]), _sub_center(center, pts), ridge)
     p2s = p2[:, pts]
     for _ in range(n_refine):
-        Xp = _refine_flat(P, Xp, p2s, fit.to(dt), Ep, n_iter=2)
+        Xp = _refine_flat(P, Xp, p2s, fit.to(dt) * sp, Ep, n_iter=2)
         e = G._reproj_err_flat(P, Xp, p2s, Ep)
         inl2 = (e < tau) & valid[:, pts]
         fit2 = inl2 & defn[:, pts]
@@ -404,11 +412,11 @@ def _pixel_weights(P, X, E):
     return torch.where(torch.isfinite(w), w, torch.ones_like(w))
 
 
-def _irls_chunk(P, p2, und, valid, defn, E, center, sigma, n_iter, min_weight, ridge):
+def _irls_chunk(P, p2, und, valid, defn, E, center, sigma, n_iter, min_weight, ridge, sw=None):
     """Cauchy IRLS. The scale starts at the point's median residual and shrinks to ``sigma``
     (graduated), so a start dragged by gross outliers does not trip the single-ray guard."""
     dt = P.dtype
-    base = defn.to(dt)
+    base = defn.to(dt) if sw is None else defn.to(dt) * sw
     w = base.clone()
     X = _linear_flat(P, und, w, E, center, ridge, 2)
     for it in range(n_iter):
@@ -425,10 +433,12 @@ def _irls_chunk(P, p2, und, valid, defn, E, center, sigma, n_iter, min_weight, r
     return X, w
 
 
-def _reject_chunk(P, p2, und, valid, defn, E, center, reject_px, rel_factor, n_iter, min_inliers, ridge):
+def _reject_chunk(P, p2, und, valid, defn, E, center, reject_px, rel_factor, n_iter, min_inliers, ridge,
+                  sw=None):
     dt = P.dtype
+    sc = 1.0 if sw is None else sw
     keep = defn.clone()
-    X = _linear_flat(P, und, keep.to(dt), E, center, ridge, 2)
+    X = _linear_flat(P, und, keep.to(dt) * sc, E, center, ridge, 2)
     floor = max(2, int(min_inliers))
     for _ in range(n_iter):
         e = G._reproj_err_flat(P, X, p2, E)
@@ -457,45 +467,51 @@ def _reject_chunk(P, p2, und, valid, defn, E, center, reject_px, rel_factor, n_i
         if bool((new == keep).all()):
             break
         keep = new
-        X = _linear_flat(P, und, keep.to(dt) * _pixel_weights(P, X, E), E, center, ridge, 2)
+        X = _linear_flat(P, und, keep.to(dt) * sc * _pixel_weights(P, X, E), E, center, ridge, 2)
     return X, keep
 
 
-@returns_like_input(arg=0)
-def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_refine=2,
-                       sigma=8.0, n_iter=None, min_weight=0.1,
-                       reject_px=20.0, rel_factor=5.0,
-                       contrib=None, weights=None, mask_out_of_bounds=True, undistort=True,
-                       extrinsics=None, ridge=1e-12, chunk=None, max_elems=DEFAULT_MAX_ELEMS):
-    """Robust triangulation of pixel observations ``points [C,...,2]`` (see module docstring).
+def _score_weights(scores, C, N, dev, dt):
+    """Soft observation weights from confidences: clipped to [0, 1], NaN -> 0."""
+    if scores is None:
+        return None
+    s = to_torch(scores, device=dev, dtype=dt).reshape(C, N)
+    return torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-    Parameters by method:
-      msac:   ``tau`` (inlier threshold, px), ``n_refine`` (GN rounds with inlier update)
-      irls:   ``sigma`` (Cauchy scale, px), ``n_iter`` (default 6), ``min_weight`` (guard)
-      reject: ``reject_px``, ``rel_factor``, ``n_iter`` (default 4)
-    Common: ``min_inliers`` (points with fewer inlier defining views are NaN), ``contrib``
-    (bool [C], cameras allowed to define points), ``weights [C,...]`` (0 removes an
-    observation; for 'irls' they scale the robust weights), ``mask_out_of_bounds``,
-    ``undistort`` (False: ``points`` are already normalised, errors are then in normalised
-    units), ``extrinsics`` (as in :func:`triangulate_linear`).
-    ``inliers`` are observations with error < ``tau`` (all methods), ``errors`` are reported for
-    every observation, ``weights`` are the final IRLS weights ('irls') or the fit mask.
-    """
-    if method not in ('msac', 'irls', 'reject'):
-        raise ValueError("method must be 'msac', 'irls' or 'reject', got {!r}".format(method))
-    if n_iter is None:
-        n_iter = 6 if method == 'irls' else 4
-    pts, lead = _prep_points(P, points)
+
+def _mask_noninvertible(P, pts):
+    """NaN out pixel observations ``pts [C,N,2]`` where the lens model is not invertible (past
+    the fold of a strong barrel distortion): their undistorted rays are wrong and would bias the
+    linear refit."""
+    und = G._undistort_flat(P, pts, check_invertible=True)
+    bad = ~torch.isfinite(und).all(-1)
+    return torch.where(bad[..., None], torch.full_like(pts, float('nan')), pts)
+
+
+def _ray_inconsistent(P, X, E, pts, tau):
+    """[C,N] True where an observation's undistorted ray disagrees with the direction to the
+    point X (normalised distance > 3 tau / f) although its pixel error may be small: the
+    projection lies past the fold of a strong barrel distortion, where the pixel has a second
+    (central) preimage. Such rays bias the linear refit."""
+    und = G._undistort_flat(P, pts)
+    pc = G._cam_points(E, torch.nan_to_num(X))
+    z = pc[..., 2]
+    zs = torch.where(z.abs() > 1e-12, z, torch.full_like(z, 1e-12))
+    xn = pc[..., :2] / zs[..., None]
+    f = 0.5 * (P.K[:, 0, 0].abs() + P.K[:, 1, 1].abs())
+    d = torch.linalg.norm(und - xn, dim=-1)
+    _, _, (a, b, c, e) = G._distort_norm(P, xn[..., 0], xn[..., 1], jac=True)
+    return (d * f[:, None] > 3 * tau) | ~(a * e - b * c > 0)
+
+
+def _robust_flat(P, pts, E, method, weights, sw, contrib, tau, min_inliers, n_refine, sigma,
+                 n_iter, min_weight, reject_px, rel_factor, mask_out_of_bounds, undistort,
+                 ridge, chunk, max_elems):
+    """Core of :func:`triangulate_robust` on flat ``pts [C,N,2]`` -> (p3d, inliers, errors,
+    weights, n_inliers). ``sw [C,N]`` (or None): soft score weights in [0, 1]."""
     C, N, _ = pts.shape
     dev, dt = P.device, P.dtype
-    E = _prep_ext(P, extrinsics, N)
-    if weights is not None:
-        weights = to_torch(weights, device=dev, dtype=dt).reshape(C, N)
-    if contrib is not None:
-        contrib = torch.as_tensor(np.asarray(contrib) if not isinstance(contrib, torch.Tensor) else contrib,
-                                  device=dev).to(torch.bool).reshape(C)
     Pr = P if undistort else _identity_intrinsics(P)
-
     p3d = torch.full((N, 3), float('nan'), dtype=dt, device=dev)
     inliers = torch.zeros((C, N), dtype=torch.bool, device=dev)
     errors = torch.full((C, N), float('nan'), dtype=dt, device=dev)
@@ -512,27 +528,31 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
         valid = _valid_obs(Pr, p2, und, mask_out_of_bounds and undistort)
         if weights is not None:
             valid = valid & (torch.nan_to_num(weights[:, s0:s1]) > 0)
-        defn = _definers(valid, contrib)
+        s = None if sw is None else sw[:, s0:s1]
+        # zero-score observations are passengers: reported, never used to fit
+        defn = _definers(valid if s is None else valid & (s > 0), contrib)
+        sc = torch.ones_like(p2[..., 0]) if s is None else s
         Es = E if E.ndim == 3 else E[:, s0:s1]
         center = _default_center(Es)
         und0 = torch.where(valid[..., None], und, torch.full_like(und, float('nan')))
         p2v = torch.where(valid[..., None], p2, torch.full_like(p2, float('nan')))
         if method == 'msac':
             B = _blocks(_recentred_rows(Es, center), torch.nan_to_num(und0), defn.to(dt))
-            X, inl = _msac_chunk(Pr, p2v, und0, valid, defn, B, Es, center, tau, n_refine, pa, pb, ridge)
-            fitw = (inl & defn).to(dt)
+            X, inl = _msac_chunk(Pr, p2v, und0, valid, defn, B, Es, center, tau, n_refine, pa, pb,
+                                 ridge, sw=s)
+            fitw = (inl & defn).to(dt) * sc
         elif method == 'irls':
             und_d = torch.where(defn[..., None], und0, torch.full_like(und0, float('nan')))
             X, fitw = _irls_chunk(Pr, p2v, torch.nan_to_num(und_d), valid, defn, Es, center, sigma,
-                                  n_iter, min_weight, ridge)
+                                  n_iter, min_weight, ridge, sw=s)
             if weights is not None:
                 fitw = fitw * torch.nan_to_num(weights[:, s0:s1])
             if n_refine:
                 X = _refine_flat(Pr, X, p2v, fitw, Es, n_iter=2 * n_refine)
         else:
             X, keep = _reject_chunk(Pr, p2v, torch.nan_to_num(und0), valid, defn, Es, center,
-                                    reject_px, rel_factor, n_iter, min_inliers, ridge)
-            fitw = keep.to(dt)
+                                    reject_px, rel_factor, n_iter, min_inliers, ridge, sw=s)
+            fitw = keep.to(dt) * sc
             if n_refine:
                 X = _refine_flat(Pr, X, p2v, fitw, Es, n_iter=2 * n_refine)
         e = G._reproj_err_flat(Pr, torch.nan_to_num(X), p2v, Es)
@@ -546,6 +566,88 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
         inliers[:, s0:s1] = inl & good[None]
         errors[:, s0:s1] = e
         wout[:, s0:s1] = fitw
+    return p3d, inliers, errors, wout
+
+
+@returns_like_input(arg=0)
+def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_refine=2,
+                       sigma=8.0, n_iter=None, min_weight=0.1,
+                       reject_px=20.0, rel_factor=5.0,
+                       contrib=None, weights=None, scores=None, mask_out_of_bounds=True,
+                       undistort=True, check_invertible=True,
+                       extrinsics=None, ridge=1e-12, chunk=None, max_elems=DEFAULT_MAX_ELEMS):
+    """Robust triangulation of pixel observations ``points [C,...,2]`` (see module docstring).
+
+    Parameters by method:
+      msac:   ``tau`` (inlier threshold, px), ``n_refine`` (GN rounds with inlier update)
+      irls:   ``sigma`` (Cauchy scale, px), ``n_iter`` (default 6), ``min_weight`` (guard)
+      reject: ``reject_px``, ``rel_factor``, ``n_iter`` (default 4)
+    Common: ``min_inliers`` (points with fewer inlier defining views are NaN), ``contrib``
+    (bool [C], cameras allowed to define points), ``weights [C,...]`` (0 removes an
+    observation; for 'irls' they scale the robust weights), ``mask_out_of_bounds``,
+    ``undistort`` (False: ``points`` are already normalised, errors are then in normalised
+    units), ``extrinsics`` (as in :func:`triangulate_linear`).
+    ``scores [C,...]``: detection confidences used as **soft weights** (clipped to [0, 1],
+    NaN = 0) on the squared pixel error: in the MSAC hypothesis cost ``sum_c s_c min(e_c^2,
+    tau^2)``, the inlier refit (DLT blocks weighted by ``s``) and the Gauss-Newton refinement
+    (and the IRLS / reject fits). Low-score views count less but are never dropped for their
+    score alone; score-0 views are reported but never fit. Geometric inlier tests (``tau``)
+    ignore the scores.
+    ``check_invertible=True`` (default; skipped when ``undistort=False``): observations where
+    the lens model is not invertible (past the fold of a strong barrel distortion) are not used
+    to fit, and inliers whose undistorted ray disagrees with the fitted point (a second,
+    central preimage of the pixel) are dropped and their points triangulated again. Their
+    errors are still reported. Identical to ``check_invertible=False`` when no lens folds.
+    ``inliers`` are observations with error < ``tau`` (all methods), ``errors`` are reported for
+    every observation, ``weights`` are the final fit weights (IRLS weights or the fit mask,
+    times the scores).
+    """
+    if method not in ('msac', 'irls', 'reject'):
+        raise ValueError("method must be 'msac', 'irls' or 'reject', got {!r}".format(method))
+    if n_iter is None:
+        n_iter = 6 if method == 'irls' else 4
+    raw, lead = _prep_points(P, points)
+    C, N, _ = raw.shape
+    dev, dt = P.device, P.dtype
+    E = _prep_ext(P, extrinsics, N)
+    if weights is not None:
+        weights = to_torch(weights, device=dev, dtype=dt).reshape(C, N)
+    sw = _score_weights(scores, C, N, dev, dt)
+    if contrib is not None:
+        contrib = torch.as_tensor(np.asarray(contrib) if not isinstance(contrib, torch.Tensor) else contrib,
+                                  device=dev).to(torch.bool).reshape(C)
+    check = bool(check_invertible) and undistort
+    pts = _mask_noninvertible(P, raw) if check else raw
+    kw = dict(method=method, contrib=contrib, tau=tau, min_inliers=min_inliers, n_refine=n_refine,
+              sigma=sigma, n_iter=n_iter, min_weight=min_weight, reject_px=reject_px,
+              rel_factor=rel_factor, mask_out_of_bounds=mask_out_of_bounds, undistort=undistort,
+              ridge=ridge, chunk=chunk, max_elems=max_elems)
+    p3d, inliers, errors, wout = _robust_flat(P, pts, E, weights=weights, sw=sw, **kw)
+    if check and N > 0:
+        # an inlier explained by a point past its lens fold had a wrong ray in the linear
+        # refit: drop those observations and triangulate the affected points again
+        fold = _ray_inconsistent(P, p3d, E, pts, float(tau)) & inliers \
+            & torch.isfinite(p3d).all(-1)[None]
+        redo = torch.nonzero(fold.any(0))[:, 0]
+        if redo.numel() > 0:
+            sub = pts[:, redo]
+            sub = torch.where(fold[:, redo, None], torch.full_like(sub, float('nan')), sub)
+            r = _robust_flat(P, sub, _sub_ext(E, redo),
+                             weights=None if weights is None else weights[:, redo],
+                             sw=None if sw is None else sw[:, redo], **kw)
+            p3d[redo] = r[0]
+            inliers[:, redo] = r[1]
+            errors[:, redo] = r[2]
+            wout[:, redo] = r[3]
+        # report errors for every observation, including the masked ones
+        masked = _valid_obs(P, raw, raw, mask_out_of_bounds) & ~torch.isfinite(pts).all(-1)
+        if weights is not None:
+            masked = masked & (torch.nan_to_num(weights) > 0)
+        if bool(masked.any()):
+            Pr = P
+            e = G._reproj_err_flat(Pr, torch.nan_to_num(p3d), raw, E)
+            e = torch.where(torch.isfinite(p3d).all(-1)[None], e, torch.full_like(e, float('nan')))
+            errors = torch.where(masked, e, errors)
     n_inl = inliers.sum(0)
     return TriangulationResult(
         p3d=p3d.reshape(tuple(lead) + (3,)),
@@ -569,21 +671,51 @@ def _identity_intrinsics(P):
 @returns_like_input(arg=0)
 def triangulate_possible(P, points, tau=10.0, min_inliers=2, n_refine=2, undistort=True,
                          contrib=None, extrinsics=None, ridge=1e-12, chunk=None,
-                         max_elems=DEFAULT_MAX_ELEMS):
+                         max_elems=DEFAULT_MAX_ELEMS, check_invertible=True):
     """Triangulate with up to ``K`` candidate detections per camera, ``points [C,N,K,2]``.
 
     Each hypothesis is a camera pair with one candidate each; a camera scores its closest
     candidate (``min_k err``), capped at ``tau`` (MSAC). The winner's inlier candidates are
-    refit and refined by Gauss-Newton. Returns :class:`PossibleResult`."""
+    refit and refined by Gauss-Newton. Returns :class:`PossibleResult`.
+    ``check_invertible`` as in :func:`triangulate_robust`: candidates past a lens fold are not
+    used, and chosen views whose ray disagrees with the point are dropped and the point redone."""
     pts = to_torch(points, device=P.device, dtype=P.dtype)
     if pts.ndim != 4 or pts.shape[0] != P.n_cams:
         raise ValueError('points must be [C,N,K,2], got {}'.format(tuple(pts.shape)))
     C, N, K, _ = pts.shape
-    dev, dt = P.device, P.dtype
     E = _prep_ext(P, extrinsics, N)
     if contrib is not None:
         contrib = torch.as_tensor(np.asarray(contrib) if not isinstance(contrib, torch.Tensor) else contrib,
-                                  device=dev).to(torch.bool).reshape(C)
+                                  device=P.device).to(torch.bool).reshape(C)
+    check = bool(check_invertible) and undistort
+    if check:
+        pts = _mask_noninvertible(P, pts.reshape(C, -1, 2)).reshape(pts.shape)
+    kw = dict(tau=tau, min_inliers=min_inliers, n_refine=n_refine, undistort=undistort,
+              contrib=contrib, ridge=ridge, chunk=chunk, max_elems=max_elems)
+    res = _possible_core(P, pts, E, **kw)
+    if check and N > 0:
+        # chosen views whose ray disagrees with the point (past the lens fold) biased the refit;
+        # drop that camera for those points and redo them
+        chosen = res.picked >= 0
+        bad = _ray_inconsistent(P, res.p3d, E, res.points_2d, float(tau)) & chosen \
+            & torch.isfinite(res.p3d).all(-1)[None]
+        redo = torch.nonzero(bad.any(0))[:, 0]
+        if redo.numel() > 0:
+            sub = pts[:, redo]
+            sub = torch.where(bad[:, redo, None, None], torch.full_like(sub, float('nan')), sub)
+            r2 = _possible_core(P, sub, _sub_ext(E, redo), **kw)
+            res.p3d[redo] = r2.p3d
+            res.picked[:, redo] = r2.picked
+            res.points_2d[:, redo] = r2.points_2d
+            res.errors[:, redo] = r2.errors
+            res.n_inliers[redo] = r2.n_inliers
+    return res
+
+
+def _possible_core(P, pts, E, tau, min_inliers, n_refine, undistort, contrib, ridge, chunk,
+                   max_elems):
+    C, N, K, _ = pts.shape
+    dev, dt = P.device, P.dtype
     Pr = P if undistort else _identity_intrinsics(P)
     pa, pb = _pairs(C, dev)
     # candidate pairs (a, i, b, j) for all camera pairs
