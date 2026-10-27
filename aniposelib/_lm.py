@@ -42,7 +42,7 @@ reduced systems are solved matrix free (PCG with a Jacobi preconditioner).
 """
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List
 
 import numpy as np
 import torch
@@ -118,7 +118,6 @@ class _Lin:
         self.b = b
         dt, dev = b.Js.dtype, b.Js.device
         n, D = b.n, b.D
-        d = b.Js.shape[-1]
         wJs = b.w[:, None, None] * b.Js
         Vo = torch.einsum('mki,mkj->mij', wJs, b.Js)
         go = torch.einsum('mki,mk->mi', wJs, b.r)
@@ -226,7 +225,7 @@ class System:
             for s0 in range(0, L.b.n, step):
                 s1 = min(L.b.n, s0 + step)
                 W = L.W_dense(s0, s1, NC)[..., :NC]
-                Y = sv_slice(sv, L, s0, s1, W)
+                Y = _sv_slice(sv, L, s0, s1, W)
                 Hs = Hs - torch.einsum('nda,ndb->ab', W, Y)
         return Hs
 
@@ -296,7 +295,7 @@ class System:
         return Sm, -b, out
 
 
-def sv_slice(sv, L, s0, s1, W):
+def _sv_slice(sv, L, s0, s1, W):
     """Apply the block solve of blocks [s0, s1) to ``W [s1-s0, D, NC]``."""
     if s0 == 0 and s1 == L.b.n:
         return sv(W)
