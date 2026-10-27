@@ -37,7 +37,7 @@ factor applied), ``scale_quality`` (a dict of the main quality numbers). Only TO
 values are written.
 
 Helpers: ``camera_centers(cgroup)``, ``umeyama(src, dst, with_scale=True)``,
-``fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=None)``.
+``fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=None, robust_init=True)``.
 """
 
 from dataclasses import dataclass, field, fields
@@ -131,39 +131,120 @@ def umeyama(src, dst, with_scale=True):
     return s, R, mu_d - s * R @ mu_s
 
 
-def fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=None):
+def _lmeds_init(src, dst, ok, with_scale, n_subsets=500, seed=0):
+    """Least-median-of-squares hypothesis over minimal 3-point subsets (all of them when there
+    are at most ``n_subsets`` combinations, else a seeded random sample) plus the leave-one-out
+    fits (N <= 50). Collinear subsets are skipped. Returns ``(s, R, t, median residual)`` of the
+    hypothesis with the smallest median residual over the finite points, or None."""
+    import itertools
+    from math import comb
+    idx = np.flatnonzero(ok)
+    n = len(idx)
+    if n < 4:
+        return None
+    S, D = src[idx], dst[idx]
+    if comb(n, 3) <= n_subsets:
+        sub = np.array(list(itertools.combinations(range(n), 3)))
+    else:
+        rng = np.random.default_rng(seed)
+        sub = np.argsort(rng.random((n_subsets, n)), axis=1)[:, :3]
+    # batched Umeyama on the minimal subsets
+    a, b = S[sub], D[sub]                                   # [K, 3, 3]
+    xa, xb = a - a.mean(1, keepdims=True), b - b.mean(1, keepdims=True)
+    sa = np.linalg.svd(xa, compute_uv=False)
+    sb = np.linalg.svd(xb, compute_uv=False)
+    good = (sa[:, 0] > 0) & (sb[:, 0] > 0) & (sa[:, 1] >= 1e-6 * sa[:, 0]) & (sb[:, 1] >= 1e-6 * sb[:, 0])
+    hyps = []
+    if good.any():
+        xa, xb, a, b = xa[good], xb[good], a[good], b[good]
+        U, Sg, Vt = np.linalg.svd(np.einsum('kni,knj->kij', xb, xa) / 3)
+        d = np.sign(np.linalg.det(U @ Vt))
+        d[d == 0] = 1.0
+        Dg = np.ones((len(d), 3))
+        Dg[:, 2] = d
+        R = U @ (Dg[:, :, None] * Vt)
+        var = (xa ** 2).sum(2).mean(1)
+        sc = (Sg * Dg).sum(1) / var if with_scale else np.ones(len(d))
+        t = b.mean(1) - sc[:, None] * np.einsum('kij,kj->ki', R, a.mean(1))
+        res = np.linalg.norm(sc[:, None, None] * np.einsum('kij,nj->kni', R, S) + t[:, None] - D, axis=2)
+        med = np.median(res, axis=1)
+        k = int(np.nanargmin(np.where(np.isfinite(med), med, np.inf)))
+        if np.isfinite(med[k]):
+            hyps.append((float(sc[k]), R[k], t[k], float(med[k])))
+    if n <= 50:
+        for i in range(n):
+            keep = np.arange(n) != i
+            s1, R1, t1 = umeyama(S[keep], D[keep], with_scale)
+            m1 = float(np.median(np.linalg.norm(s1 * S @ R1.T + t1 - D, axis=1)))
+            if np.isfinite(m1):
+                hyps.append((s1, R1, t1, m1))
+    return min(hyps, key=lambda h: h[3]) if hyps else None
+
+
+def fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=None,
+                   robust_init=True):
     """Robust similarity ``dst ~ s R src + t``. Returns ``(s, R, t, residuals [N], used [N])``.
 
     ``trim`` (Emory ``align_to``): repeatedly refit on the points whose residual is at most
     ``trim`` x the median residual of the current fit set, until stable; ``trim=None`` is the
     plain fit. ``inlier_frac`` (EvoVision ``fit_similarity_robust``) instead refits 5 times on
     the best ``inlier_frac`` quantile. Never fits on fewer than ``min(min_keep, N)`` points.
-    Non-finite rows are ignored (residual NaN, ``used`` False)."""
+    Non-finite rows are ignored (residual NaN, ``used`` False).
+
+    ``robust_init`` (default True; ignored for the plain fit): the refinement is also run from a
+    least-median-of-squares start (minimal 3-point subsets + leave-one-out fits; initial fit set =
+    residual <= ``trim`` x the best median, or the ``inlier_frac`` quantile, at least ``min_keep``
+    points), and that result replaces the all-point-start one when its median residual over the
+    finite points is less than half. So a single runaway point (e.g. one camera centre far
+    outside the rig) can no longer drag the fit; on clean data the result is unchanged.
+    ``robust_init=False`` is the pre-1.1 behaviour (all-point start only)."""
     src = np.asarray(src, dtype='float64')
     dst = np.asarray(dst, dtype='float64')
     ok = np.isfinite(src).all(1) & np.isfinite(dst).all(1)
     if ok.sum() < 3:
         raise ValueError('need >= 3 finite correspondences for a similarity fit, got {}'.format(int(ok.sum())))
     min_keep = min(int(min_keep), int(ok.sum()))
-    use = ok.copy()
     # residuals below this floor are numerical noise, never a reason to trim a camera
     floor = 1e-9 * max(_rig_scale(dst[ok]), 1e-300)
-    s, R, t = umeyama(src[use], dst[use], with_scale)
-    for _ in range(len(src) if inlier_frac is None else 5):
+
+    def refine(use, s, R, t):
+        for _ in range(len(src) if inlier_frac is None else 5):
+            r = np.linalg.norm(s * src @ R.T + t - dst, axis=1)
+            if inlier_frac is not None:
+                new = ok & (r <= max(np.quantile(r[ok], inlier_frac), floor))
+            elif trim:
+                new = ok & (r <= max(trim * np.median(r[use]), floor))
+            else:
+                break
+            if new.sum() < max(min_keep, 3) or (new == use).all():
+                break
+            use = new
+            s, R, t = umeyama(src[use], dst[use], with_scale)
         r = np.linalg.norm(s * src @ R.T + t - dst, axis=1)
-        if inlier_frac is not None:
-            new = ok & (r <= max(np.quantile(r[ok], inlier_frac), floor))
-        elif trim:
-            new = ok & (r <= max(trim * np.median(r[use]), floor))
-        else:
-            break
-        if new.sum() < max(min_keep, 3) or (new == use).all():
-            break
-        use = new
-        s, R, t = umeyama(src[use], dst[use], with_scale)
-    r = np.linalg.norm(s * src @ R.T + t - dst, axis=1)
-    r[~ok] = np.nan
-    return s, R, t, r, use
+        r[~ok] = np.nan
+        return s, R, t, r, use
+
+    use = ok.copy()
+    out = refine(use, *umeyama(src[use], dst[use], with_scale))
+    # (trim=inf keeps every point whatever the start: nothing to gain)
+    if robust_init and (inlier_frac is not None or (trim and np.isfinite(trim))):
+        best = _lmeds_init(src, dst, ok, with_scale)
+        if best is not None:
+            s0, R0, t0, med = best
+            r0 = np.linalg.norm(s0 * src @ R0.T + t0 - dst, axis=1)
+            r0[~ok] = np.inf
+            if inlier_frac is not None:
+                thr = np.quantile(r0[ok], inlier_frac)
+            else:
+                thr = trim * med
+            use0 = ok & (r0 <= max(thr, floor))
+            if use0.sum() < max(min_keep, 3):
+                use0 = np.zeros_like(ok)
+                use0[np.argsort(r0)[:max(min_keep, 3)]] = True
+            cand = refine(use0, *umeyama(src[use0], dst[use0], with_scale))
+            if np.median(cand[3][ok]) < 0.5 * np.median(out[3][ok]):
+                out = cand
+    return out
 
 
 def _rig_scale(centers):
@@ -405,7 +486,7 @@ def _board_fit_residual(p3d, objp, min_corners=4):
     if ok.sum() < max(min_corners, 3):
         return float('nan')
     try:
-        _s, _R, _t, r, _u = fit_similarity(p3d[ok], objp[ok], trim=None, inlier_frac=0.8,
+        _s, _R, _t, r, _u = fit_similarity(p3d[ok], objp[ok], trim=None, inlier_frac=0.8, robust_init=False,
                                            min_keep=min_corners)
     except ValueError:
         return float('nan')

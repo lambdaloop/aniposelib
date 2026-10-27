@@ -142,3 +142,51 @@ def test_align_world(rig):
     assert np.allclose(synth.project(cg, f2), synth.project(rig, floor), atol=1e-6, equal_nan=True)
     # the cameras are above the floor
     assert synth.camera_centers(cg)[:, 2].mean() > 0
+
+
+def _runaway(rig, cam=-1, factor=18.0):
+    """Copy of ``rig`` with one camera centre moved ``factor`` x the rig radius from the rig centre."""
+    bad = rig.copy()
+    X = synth.camera_centers(rig)
+    c0 = np.median(X, 0)
+    r = np.median(np.linalg.norm(X - c0, axis=1))
+    c = bad.cameras[cam]
+    R = rotation(synth.to_np(c.rvec).reshape(3))
+    with torch.no_grad():
+        c.set_translation(torch.as_tensor(-R @ (c0 + factor * r * np.array([1.0, 0, 0])), dtype=torch.float64))
+    return bad
+
+
+def test_fit_similarity_runaway_point():
+    rig = synth.load_rig('outdoor_12cam')
+    src = synth.camera_centers(_runaway(rig))
+    dst = synth.camera_centers(rig)
+    dst = 0.5 * dst @ rotation([0.3, -0.2, 0.1]).T + [10.0, -5.0, 2.0]
+    s, R, t, r, use = scale.fit_similarity(src, dst)
+    assert not use[-1] and use[:-1].all()
+    assert r[:-1].max() < 1e-9 * synth.rig_scale(rig) and r[-1] > synth.rig_scale(rig)
+    assert abs(s - 0.5) < 1e-9
+    s2, R2, t2, r2, use2 = scale.fit_similarity(src, dst, trim=None, inlier_frac=0.8)
+    assert not use2[-1] and r2[:-1].max() < 1e-9 * synth.rig_scale(rig)
+    # pre-1.1 behaviour: the all-point start is dragged and never recovers
+    _s, _R, _t, r3, use3 = scale.fit_similarity(src, dst, robust_init=False)
+    assert use3[-1]
+    # clean (noisy) data: identical to the all-point start; collinear subsets are skipped
+    rng = np.random.default_rng(0)
+    for X in [dst, np.c_[np.linspace(0, 1, 6), np.zeros(6), np.zeros(6)]
+              + rng.normal(0, [0, 1e-3, 1e-3], (6, 3))]:
+        Y = X + rng.normal(0, 0.01 * synth.rig_scale(rig), X.shape)
+        for kw in [{}, {'inlier_frac': 0.8, 'trim': None}]:
+            a, b = scale.fit_similarity(X, Y, **kw), scale.fit_similarity(X, Y, robust_init=False, **kw)
+            assert all(np.allclose(u, v, atol=1e-9, equal_nan=True) for u, v in zip(a, b))
+
+
+def test_compare_runaway_camera():
+    from aniposelib import quality
+    rig = synth.load_rig('outdoor_12cam')
+    c = quality.compare(_runaway(rig), rig)
+    assert c.overall['center_residual_median'] < 1e-6 * c.overall['rig_scale']
+    names = rig.get_names()
+    assert not c.per_camera[names[-1]]['in_gauge']
+    assert all(c.per_camera[n]['in_gauge'] and c.per_camera[n]['center_residual'] < 1e-6 * c.overall['rig_scale']
+               for n in names[:-1])
