@@ -2206,9 +2206,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
-    - ``bad_windows_frac``: share of time windows in which some camera's LOO agreement (among its
-      supported points) is below ``bad_window_ratio`` x that camera's median window (desync / broken
-      data; warn above 5 %);
+    - ``bad_windows_frac``: share of time windows in which some camera's LOO coverage, or its LOO
+      agreement among the supported points, is below ``bad_window_ratio`` x that camera's median
+      window (desync / broken data; warn above 5 %);
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
       warn 1 % (warn only: a reference is often rougher than the calibration under test);
     - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
@@ -2328,11 +2328,22 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             # agreement among the supported points (as the projects' hourly LOO tables): a window of
             # false / unmatched detections lowers the coverage, not the agreement
             ag = np.where(sup > 0, hit / np.maximum(sup, 1), np.nan)
+            cv = np.where(den > 0, sup / np.maximum(den, 1), np.nan)
+        # a window is judged on its eligible observations; it is bad for a camera when the share of
+        # its held-out points the others can triangulate (coverage) or the agreement among those
+        # collapses relative to that camera's typical window (desync breaks both)
         min_cw = max(10.0, opts['min_window_obs'] / C)
-        judged = (sup >= min_cw)
-        cam_med = np.array([np.median(ag[c, judged[c]]) if judged[c].any() else np.nan for c in range(C)])
-        badcw = judged & (ag < opts['bad_window_ratio'] * cam_med[:, None])
-        okw = judged.any(0) & (sup.sum(0) >= opts['min_window_obs'])
+        judged = (den >= min_cw)
+        r_ = opts['bad_window_ratio']
+
+        def cmed(a, m):
+            return np.array([np.median(a[c, m[c]]) if m[c].any() else np.nan for c in range(C)])
+        cov_med = cmed(cv, judged)
+        jag = judged & (sup >= min_cw)
+        cam_med = cmed(ag, jag)
+        with np.errstate(invalid='ignore'):
+            badcw = judged & ((cv < r_ * cov_med[:, None]) | (jag & (ag < r_ * cam_med[:, None])))
+        okw = judged.any(0) & (den.sum(0) >= opts['min_window_obs'])
         for k, lab in enumerate(labs):
             key = '{:.6g}'.format(t0 + int(lab) * ws)
             gd = qr.per_group.get(str(lab), {})
@@ -2342,7 +2353,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 loo_agree=float(hit[:, k].sum() / tot) if tot else None,
                 loo_agree_supported=float(hit[:, k].sum() / sup[:, k].sum()) if sup[:, k].sum() else None,
                 loo_median_px=gd.get('loo_median_px'), loo_coverage=float(sup[:, k].sum() / tot) if tot else None,
-                per_camera={n: (None if not np.isfinite(ag[c, k]) else float(ag[c, k])) for c, n in enumerate(names)},
+                per_camera={n: dict(agree=None if not np.isfinite(ag[c, k]) else float(ag[c, k]),
+                                    coverage=None if not np.isfinite(cv[c, k]) else float(cv[c, k]))
+                            for c, n in enumerate(names)},
                 bad_cameras=[n for c, n in enumerate(names) if badcw[c, k]], judged=bool(okw[k]))
             per_window[key]['bad'] = bool(okw[k] and badcw[:, k].any())
         if okw.sum() >= 3:
@@ -2351,6 +2364,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             report['windows'] = dict(window_s=ws, n_windows=len(per_window), n_judged=int(okw.sum()),
                                      camera_median_agree={n: (None if not np.isfinite(v) else float(v))
                                                           for n, v in zip(names, cam_med)},
+                                     camera_median_coverage={n: (None if not np.isfinite(v) else float(v))
+                                                             for n, v in zip(names, cov_med)},
                                      bad=bad_windows, agree_px=agree_t)
     if reference is not None:
         with timer('compare'):
@@ -2415,7 +2430,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         Rule('center_residual_frac', center_frac, 0.01, None, 'aligned centre residual vs reference / rig scale'),
         Rule('board_shape_rel', shape_rel, 0.005, 0.02, 'board shape residual / object size'),
         Rule('bad_windows_frac', bad_frac, 0.05, None,
-             'time windows where a camera\'s LOO agreement is < {} x its median window: {}'.format(
+             'time windows where a camera\'s LOO coverage or agreement is < {} x its median window: {}'.format(
                  opts['bad_window_ratio'], bad_windows[:10]) if bad_windows else ''),
     ]
     if missing:
