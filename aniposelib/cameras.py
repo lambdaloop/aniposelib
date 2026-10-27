@@ -2382,7 +2382,8 @@ class CameraGroup(nn.Module):
                      max_lr=0.1,
                      n_iters=800,
                      fill='interior',
-                     normalize=True):
+                     normalize=True,
+                     segments=None):
         """
         Take in an array of 2D points of shape CxNxJx2,
         an array of 3D points of shape NxJx3,
@@ -2402,6 +2403,8 @@ class CameraGroup(nn.Module):
           score (soft weights, use values in [0, 1]).
         scale_length: bone weight, a float or one weight per strong constraint (array of length
           K).
+        segments: optional ``[N]`` segment ids (clips): the smoothness term never links frames of
+          different segments (a new segment starts wherever the id changes).
         normalize: True (default since 1.1): the optimisation runs in *pixel-equivalent*
           units, so it does not depend on the units of the rig (mm or m give the same result).
           The 3D points are parametrised as ``center + u * q`` with ``u`` the median world
@@ -2434,7 +2437,7 @@ class CameraGroup(nn.Module):
                                   reproj_loss=reproj_loss, n_deriv_smooth=n_deriv_smooth,
                                   scores=scores, verbose=verbose, n_fixed=n_fixed,
                                   max_lr=max_lr, n_iters=n_iters, fill=fill,
-                                  normalize=normalize)
+                                  normalize=normalize, segments=segments)
 
     def _optim_unit(self, p3ds, points):
         """(u, center): median world length per pixel at the points (z / f over the finite
@@ -2474,7 +2477,8 @@ class CameraGroup(nn.Module):
                       max_lr=0.1,
                       n_iters=800,
                       fill='interior',
-                      normalize=True):
+                      normalize=True,
+                      segments=None):
         if fill not in ('interior', 'none', 'all'):
             raise ValueError("fill must be 'interior', 'none' or 'all', got {!r}".format(fill))
         assert points.shape[0] == len(self.cameras), \
@@ -2540,6 +2544,15 @@ class CameraGroup(nn.Module):
 
         points_tensor = to_tensor(points, device=device, dtype=dtype)
         scores = to_tensor(scores, device=device, dtype=dtype)
+        smooth_mask = None
+        if segments is not None and n_frames > n_deriv_smooth:
+            seg = np.asarray(segments).reshape(-1)
+            if len(seg) != n_frames:
+                raise ValueError('segments must have one id per frame ({}), got {}'.format(n_frames, len(seg)))
+            same = seg[n_deriv_smooth:] == seg[:-n_deriv_smooth]
+            for k in range(1, n_deriv_smooth):
+                same &= seg[k:k + len(same)] == seg[:len(same)]
+            smooth_mask = to_tensor(same.astype('float64'), device=device, dtype=dtype)
         if np.ndim(scale_length) > 0:
             # one weight per strong bone (e.g. from each bone's measured length spread)
             scale_length = to_tensor(np.asarray(scale_length, dtype='float64').reshape(-1),
@@ -2598,7 +2611,8 @@ class CameraGroup(nn.Module):
                                                      reproj_loss=reproj_loss,
                                                      n_deriv_smooth=n_deriv_smooth,
                                                      p3ds_fixed=p3ds_fixed,
-                                                     unit=unit, center=center
+                                                     unit=unit, center=center,
+                                                     smooth_mask=smooth_mask
                                                      )
 
                 # snapshot best params before stepping; pure GPU ops, no host sync
@@ -2731,7 +2745,7 @@ class CameraGroup(nn.Module):
                                  reproj_loss='soft_l1',
                                  n_deriv_smooth=1,
                                  p3ds_fixed=None, unit=None, center=None, proj_fn=None,
-                                 obs_idx=None):
+                                 obs_idx=None, smooth_mask=None):
         """optim_points loss. ``proj_fn``: world points [M,3] -> pixels [C,M,2] (default
         ``self._project``); ``obs_idx``: flat indices of the finite entries of ``p2ds``.
         With ``unit``/``center`` (normalised mode) ``params['p3d']`` are
@@ -2789,6 +2803,8 @@ class CameraGroup(nn.Module):
 
         # temporal constraint
         errors_smooth = torch.diff(p3ds, n=n_deriv_smooth, dim=0)
+        if smooth_mask is not None:     # no smoothing across segment boundaries
+            errors_smooth = errors_smooth * smooth_mask[:, None, None]
         sum_smooth = torch.sum(torch.square(errors_smooth)) * scale_smooth
         total_error += sum_smooth
 

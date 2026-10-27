@@ -317,7 +317,7 @@ def _chunks(N, chunk, overlap):
 
 
 def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep, bone_w=None,
-                   med_err=None, max_rise=None, base=None):
+                   med_err=None, max_rise=None, base=None, segments=None):
     """optim_points over overlapping chunks, blended linearly in the overlaps. keep [N,J]:
     cells to return (the rest NaN). ``med_err(X, s, e)``: median inlier error of chunk points;
     a chunk whose refinement raises it by more than ``max_rise`` px is replaced by ``base``
@@ -337,7 +337,8 @@ def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep, bone
             scale_length=(BONE_WEIGHT_MAX if bone_w is None else bone_w),
             reproj_error_threshold=tau,
             scores=None if sw is None else np.sqrt(sw[:, s:e]),
-            n_iters=int(opts['n_iters']), max_lr=opts['max_lr'], fill='all', normalize=True))
+            n_iters=int(opts['n_iters']), max_lr=opts['max_lr'], fill='all', normalize=True,
+            segments=None if segments is None else segments[s:e]))
         if med_err is not None and max_rise is not None:
             before, after = med_err(X0, s, e), med_err(X, s, e)
             if np.isfinite(before) and np.isfinite(after) and after > before + max_rise:
@@ -657,15 +658,18 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                 m = inl[:, s:e] & have[None, s:e]
                 return float(np.median(ee[m])) if m.any() else float('nan')
             Xo = np.full((N, J, 3), np.nan)
-            # bones and reprojection terms are per frame: only smoothing must be split by
-            # segment (filled cells are always inside a segment, see _fill_keep)
-            for s0, e0 in (runs if smooth is not None else [(0, N)]):
+            # bones and reprojection terms are per frame; smoothing is masked at segment boundaries
+            # (optim_points segments=) and filled cells are always inside a segment (_fill_keep)
+            seg_ids = np.zeros(N, int)
+            for k, (s0, e0) in enumerate(runs):
+                seg_ids[s0:e0] = k
+            for s0, e0 in [(0, N)]:
                 if not have[s0:e0].any():
                     continue
                 Xs, nc, nr = _optim_chunked(
                     cg_o, obs_in[:, s0:e0], X[s0:e0], None if sw is None else sw[:, s0:e0], bones,
                     0.0 if smooth is None else float(smooth), opts, tau_o, keep[s0:e0],
-                    bone_w=bone_w,
+                    bone_w=bone_w, segments=seg_ids[s0:e0] if len(runs) > 1 else None,
                     med_err=(lambda Xc, s, e, s0=s0: med_err(Xc, s0 + s, s0 + e)),
                     max_rise=rise, base=base[s0:e0])
                 Xo[s0:e0] = Xs

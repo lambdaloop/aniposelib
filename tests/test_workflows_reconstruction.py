@@ -485,3 +485,17 @@ def test_offsets_self_F_seed_and_refine_rate(sync_scene):
     r3 = W.estimate_offsets(st, cgroup=cg, drift=False, options={'stream_camera': {'clipA': names[0]},
                                                                    'epipolar_boot': 0})
     assert any(p.get('note') == 'F calibrated' for p in r3.pairs)
+
+
+def test_reconstruct_smooth_segments_no_crosstalk(person):
+    """Smoothing never links frames of different segments (one optim_points call, masked term)."""
+    true, p3d, _, _ = person
+    q = p3d.copy()
+    q[50:] += 0.3 * synth.rig_scale(true) * np.array([1.0, 0.0, 0.0])     # a cut between two clips
+    obs = synth.add_noise(synth.project(true, q), 0.5, seed=2)
+    seg = (np.arange(len(q)) >= 50).astype(int)
+    kw = dict(smooth=50.0, fill='none', options={'n_iters': 150})
+    a = W.reconstruct_3d(true, obs, **kw)
+    b = W.reconstruct_3d(true, obs, segments=seg, **kw)
+    e = lambda r: np.nanmedian(np.linalg.norm(r.points3d[48:52] - q[48:52], axis=-1)) / synth.rig_scale(true)
+    assert e(b) < 0.5 * e(a)
