@@ -276,3 +276,42 @@ def test_detect_and_pose_rendered_fisheye():
     r, t = board.estimate_pose_points(cam, corners, ids)
     assert _angle_deg(r, rvec) < 1.0
     assert np.linalg.norm(t.ravel() - tvec) < 0.02 * np.linalg.norm(tvec)
+
+
+def _write_video(fname, frames):
+    w = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'MJPG'), 10, SIZE)
+    if not w.isOpened():
+        pytest.skip('no MJPG video writer')
+    for f in frames:
+        w.write(f)
+    w.release()
+
+
+def test_detect_videos_frame_major(tmp_path):
+    from aniposelib.boards import detect_videos
+    board = make_board()
+    img = cv2.cvtColor(view(board)[0], cv2.COLOR_GRAY2BGR)
+    blank = np.full_like(img, 128)
+    # cam a: board on even frames; cam b: board on frames divisible by 4; cam c: shorter, never
+    a, bb, c = (str(tmp_path / n) for n in ('a.avi', 'b.avi', 'c.avi'))
+    _write_video(a, [img if k % 2 == 0 else blank for k in range(20)])
+    _write_video(bb, [img if k % 4 == 0 else blank for k in range(20)])
+    _write_video(c, [blank] * 8)
+    info = {}
+    rows = detect_videos(board, [a, bb, c], skip=2, info=info)
+    assert [r['framenum'] for r in rows[0]] == list(range(0, 20, 2))
+    assert [r['framenum'] for r in rows[1]] == list(range(0, 20, 4))
+    assert rows[2] == [] and info['stopped'] == 'end' and info['n_sampled'] == 10
+    assert info['n_covisible'] == 5 and rows[0][0]['filled'].shape == (board.total_size, 1, 2)
+    # exact frames, no seeking; prefix; a missing camera
+    rows = detect_videos(board, [a, None, bb], frame_indices=[8, 3, 4], prefix=1)
+    assert [r['framenum'] for r in rows[0]] == [(1, 4), (1, 8)] and rows[1] == []
+    assert [r['framenum'] for r in rows[2]] == [(1, 4), (1, 8)]
+    # early exit: 2 frames with >= 2 cameras -> stops at frame 4; threads give the same rows
+    info = {}
+    rows = detect_videos(board, [a, bb], skip=2, max_frames=2, n_workers=2, info=info)
+    assert info['stopped'] == 'max_frames' and info['last_frame'] == 4
+    assert [r['framenum'] for r in rows[1]] == [0, 4]
+    info = {}
+    rows = detect_videos(board, [a, bb], skip=1, max_boards=3, info=info)
+    assert info['stopped'] == 'max_boards' and [r['framenum'] for r in rows[1]] == [0, 4, 8]
