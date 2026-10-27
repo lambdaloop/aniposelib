@@ -22,6 +22,34 @@ returns a result with a noise-relative verdict (`'ok' | 'warn' | 'fail'`), reaso
 - `aniposelib.workflows._common`: `Rule` / `evaluate_rules` (declarative verdicts, overridable with
   `options={'verdict': {rule: (warn_at, fail_at) | None}}`), `noise_floor`, `WorkflowResult`.
 
+### Performance (1.1, perf pass)
+
+Same results (bitwise, or within float rounding where noted), less time and memory:
+
+- **Thread guard:** every workflow caps torch's intra-op threads for the call at `ANIPOSELIB_NUM_THREADS`, else
+  `OMP_NUM_THREADS`, else 8 (never above the CPUs the process may use; an explicit lower
+  `torch.set_num_threads` is kept, the previous count is restored afterwards). Torch's default (one thread per core)
+  made the workflows 10-40x slower on a shared machine. Old behaviour: `ANIPOSELIB_NUM_THREADS=<cores>`.
+- **`device=`** on `evaluate_calibration` (keyword) and `estimate_offsets` (STBA refinement), default `'auto'`
+  (cuda when available; a copy of the group is moved, results stay numpy). `calibrate_from_points` now runs its
+  quality report on `device` too (it ran on the CPU). Old behaviour: `device='cpu'`. On a GPU W4/W5 results agree
+  with the CPU to float rounding.
+- Undistortion runs on the finite observations only, per lens model, in bounded batches; distortion terms with a
+  zero coefficient are skipped (exact). `triangulate_robust` undistorts once (fold mask, fit and ray check share
+  it), the LOO evaluation undistorts every observation once for all held-out cameras and triangulates in batches of
+  1M columns (no more OOM at 12 x 2M points); MSAC hypothesis errors are computed only where a point is observed;
+  on a GPU MSAC chunks are sized by the actual hypotheses (CPU chunks unchanged).
+- `init.sfm`: pairwise essential matrices on a thread pool (same per-pair seeds); vectorised frame grouping.
+- `optim_points` packs the fixed cameras once per call (the cameras no longer accumulate `.grad` during it), has no
+  host syncs in its loop and evaluates all bone terms in one op (float rounding). `reconstruct_3d(device='auto')`
+  runs `optim_points` chunks smaller than 50k frame x joint cells on the CPU (a GPU was 3-7x slower there); pass
+  `device='cuda'` for the old behaviour.
+- `bundle_adjust_lm` and the lens ladder compute rotations (and their Jacobians) once per station / board view.
+- `matching.associate_points_frames` batches frames (new `batch_frames=256`); `associate_views` (per-frame mode)
+  uses it and only associates frames that have detections (frame ids around 1e5 no longer cost minutes).
+- `sync.audio_offset(method='spectrogram')`: batched per-frequency correlations; `_lm` Schur blocks via a flat
+  `index_add_`.
+
 ### Removed
 
 - **`aniposelib.io`.** The file formats are gone: MATLAB (`from/to_matlab`), OpenCV YAML
