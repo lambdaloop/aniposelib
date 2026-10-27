@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **`optim_points(normalize=True)` default (plan 04 decision 24, plan 05 §6.3).** The optimisation runs in pixel-equivalent units (points parametrised as `center + u * q`, `u` = median z/f at the points), so its result no longer depends on the rig's units (mm vs m vs km give the same answer; before, the Adam step `max_lr` and the bone/smoothness weights were in world units). Bone targets are fixed at a robust per-bone median (frames where both joints are triangulated) instead of free parameters clipped across bones, and the bone term is a squared pixel-equivalent residual (`10 * scale_length`), so bone constraints now tighten bone lengths within a short budget (the 1.0 target `test_optim_points_tightens_bones` passes). Smoothness is `0.01 * scale_smooth / mean|diff|` on pixel-equivalent differences (a light default). `normalize=False` restores the 1.0 loss and parametrisation exactly.
 - Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av, pyyaml); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
 

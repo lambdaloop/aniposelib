@@ -2474,7 +2474,8 @@ class CameraGroup(nn.Module):
                      n_fixed=0,
                      max_lr=0.1,
                      n_iters=800,
-                     fill='interior'):
+                     fill='interior',
+                     normalize=True):
         """
         Take in an array of 2D points of shape CxNxJx2,
         an array of 3D points of shape NxJx3,
@@ -2490,6 +2491,22 @@ class CameraGroup(nn.Module):
         constraints = [[0, 1], [1, 2], [2, 3]]
         (meaning that lengths of segments 0->1, 1->2, 2->3 are all constant)
 
+        scores: optional CxNxJ confidences; each reprojection residual is multiplied by its
+          score (soft weights, use values in [0, 1]).
+        normalize: True (default since 1.1): the optimisation runs in *pixel-equivalent*
+          units, so it does not depend on the units of the rig (mm or m give the same result).
+          The 3D points are parametrised as ``center + u * q`` with ``u`` the median world
+          length per pixel at the points (median of z / f over the observations), the Adam
+          step ``max_lr`` is in pixels, and the smoothness and bone terms are squared
+          pixel-equivalent residuals: smoothness ``0.01 * scale_smooth * |diff_q|^2 /
+          mean|diff_q|``,
+          bones ``scale_length * 10 * (L_q - l_q)^2`` (strong) and ``scale_length_weak * 10 *
+          ...`` (weak), with ``L_q`` a bone length and ``l_q`` its target length in pixel
+          units, fixed at the robust estimate (median over the frames where both joints are
+          triangulated in ``p3ds``; NaN cells of ``p3ds`` are not used). The bone terms then
+          tighten bone lengths within a short budget.
+          False: the aniposelib <= 1.0 loss and parametrisation (world units; the effective
+          weights and the Adam step depend on the units of the rig).
         fill: what to return where a joint is not seen by at least 2 cameras.
           'interior' (default): gaps between the first and last observed frame of each joint
             are filled by the optimisation; frames before the first / after the last
@@ -2507,7 +2524,35 @@ class CameraGroup(nn.Module):
                                   reproj_error_threshold=reproj_error_threshold,
                                   reproj_loss=reproj_loss, n_deriv_smooth=n_deriv_smooth,
                                   scores=scores, verbose=verbose, n_fixed=n_fixed,
-                                  max_lr=max_lr, n_iters=n_iters, fill=fill)
+                                  max_lr=max_lr, n_iters=n_iters, fill=fill,
+                                  normalize=normalize)
+
+    def _optim_unit(self, p3ds, points):
+        """(u, center): median world length per pixel at the points (z / f over the finite
+        observations) and the median point, for the unit-free optim_points parametrisation."""
+        X = to_tensor(np.asarray(p3ds, dtype='float64').reshape(-1, 3), device=self.device,
+                      dtype=self.dtype)
+        okX = torch.isfinite(X).all(-1)
+        center = torch.nanmedian(X[okX], dim=0).values.detach() if bool(okX.any()) else \
+            torch.zeros(3, dtype=self.dtype, device=self.device)
+        pts = to_tensor(points, device=self.device, dtype=self.dtype).reshape(len(self.cameras), -1, 2)
+        vals = []
+        for ci, cam in enumerate(self.cameras):
+            E = cam.get_extrinsics_mat().to(self.dtype)
+            K = cam.get_camera_matrix().to(self.dtype)
+            f = 0.5 * (K[0, 0].abs() + K[1, 1].abs())
+            z = (torch.nan_to_num(X) @ E[:3, :3].T + E[:3, 3])[:, 2]
+            ok = okX & (z > 0) & torch.isfinite(pts[ci]).all(-1)
+            if bool(ok.any()):
+                vals.append(z[ok] / f)
+        if vals:
+            u = float(torch.median(torch.cat(vals)).detach())
+        else:
+            d = X[okX] - center
+            u = float(d.norm(dim=-1).median()) / 1000.0 if d.shape[0] else 1.0
+        if not np.isfinite(u) or u <= 0:
+            u = 1.0
+        return u, center
 
     def _optim_points(self, points, p3ds,
                       constraints=[],
@@ -2519,7 +2564,8 @@ class CameraGroup(nn.Module):
                       n_fixed=0,
                       max_lr=0.1,
                       n_iters=800,
-                      fill='interior'):
+                      fill='interior',
+                      normalize=True):
         if fill not in ('interior', 'none', 'all'):
             raise ValueError("fill must be 'interior', 'none' or 'all', got {!r}".format(fill))
         assert points.shape[0] == len(self.cameras), \
@@ -2545,27 +2591,49 @@ class CameraGroup(nn.Module):
             keep = interior_span(observed) if fill == 'interior' else observed
         else:
             keep = None
-        
+
         p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
 
-        p3ds_med = np.apply_along_axis(medfilt_data, 0, p3ds_intp, size=7)
-        default_smooth = 1.0/np.mean(np.abs(np.diff(p3ds_med, axis=0)))
+        if normalize:
+            unit, center = self._optim_unit(p3ds_intp, points)
+            center_np = center.detach().cpu().numpy()
+            q_intp = (p3ds_intp - center_np) / unit
+        else:
+            unit, center = None, None
+            q_intp = p3ds_intp
+
+        p3ds_med = np.apply_along_axis(medfilt_data, 0, q_intp, size=7)
+        motion = np.mean(np.abs(np.diff(p3ds_med, axis=0))) if n_frames > 1 else 0.0
+        if normalize:
+            motion = max(motion, 1e-3)  # pixel units: a static scene does not blow up
+        default_smooth = 1.0/motion
         scale_smooth_full = scale_smooth * default_smooth
+        if normalize:
+            # pixel-equivalent smoothness: scale_smooth=4 is a light regulariser that does not
+            # bias a moving subject (see optim_points)
+            scale_smooth_full = 0.01 * scale_smooth_full
 
         t1 = time.time()
 
         params = self._initialize_params_triangulation(
-            p3ds_intp, constraints, constraints_weak, device=device)
+            q_intp, constraints, constraints_weak, device=device,
+            p3ds_lengths=((p3ds - center_np) / unit) if normalize else None)
 
         if n_fixed > 0:
-            p3ds_fixed = to_tensor(p3ds_intp[:n_fixed], device=device, dtype=dtype)
+            p3ds_fixed = to_tensor(q_intp[:n_fixed], device=device, dtype=dtype)
         else:
             p3ds_fixed = None
 
         points_tensor = to_tensor(points, device=device, dtype=dtype)
         scores = to_tensor(scores, device=device, dtype=dtype)
+        if normalize:
+            # squared pixel-equivalent bone residuals (see optim_points)
+            scale_length_eff = 10.0 * scale_length
+            scale_length_weak_eff = 10.0 * scale_length_weak
+        else:
+            scale_length_eff, scale_length_weak_eff = scale_length, scale_length_weak
 
-        all_params = list(params.values())
+        all_params = [v for v in params.values() if isinstance(v, nn.Parameter)]
         optimizer = optim.Adam(all_params, lr=1e-2, weight_decay=0, amsgrad=True)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=max_lr, total_steps=n_iters,
@@ -2588,12 +2656,13 @@ class CameraGroup(nn.Module):
                                                      constraints_weak=constraints_weak,
                                                      scores=scores,
                                                      scale_smooth=scale_smooth_full,
-                                                     scale_length=scale_length,
-                                                     scale_length_weak=scale_length_weak,
+                                                     scale_length=scale_length_eff,
+                                                     scale_length_weak=scale_length_weak_eff,
                                                      reproj_error_threshold=reproj_error_threshold,
                                                      reproj_loss=reproj_loss,
                                                      n_deriv_smooth=n_deriv_smooth,
-                                                     p3ds_fixed=p3ds_fixed
+                                                     p3ds_fixed=p3ds_fixed,
+                                                     unit=unit, center=center
                                                      )
 
                 # snapshot best params before stepping; pure GPU ops, no host sync
@@ -2624,6 +2693,10 @@ class CameraGroup(nn.Module):
             print('optimization took {:.2f} seconds'.format(t2 - t1))
 
         out = params['p3d'].detach()
+        if p3ds_fixed is not None:
+            out = torch.vstack([p3ds_fixed, out[p3ds_fixed.shape[0]:]])
+        if normalize:
+            out = center + unit * out
         if keep is not None:
             out = out.clone()
             out[~torch.as_tensor(keep, device=out.device)] = float('nan')
@@ -2721,7 +2794,10 @@ class CameraGroup(nn.Module):
                                  reproj_error_threshold=100,
                                  reproj_loss='soft_l1',
                                  n_deriv_smooth=1,
-                                 p3ds_fixed=None):
+                                 p3ds_fixed=None, unit=None, center=None):
+        """optim_points loss. With ``unit``/``center`` (normalised mode) ``params['p3d']`` are
+        pixel-equivalent coordinates ``q`` (world = center + unit * q); smoothness and bone
+        terms are then on ``q``, and the bone term is a plain squared difference."""
         n_cams, n_frames, n_joints, _ = p2ds.shape
 
         n_3d = n_frames * n_joints * 3
@@ -2742,6 +2818,8 @@ class CameraGroup(nn.Module):
 
         # reprojection errors
         p3ds_flat = p3ds.reshape(-1, 3)
+        if unit is not None:
+            p3ds_flat = center + unit * p3ds_flat
         p2ds_flat = p2ds.reshape((n_cams, -1, 2))
         errors = self._reprojection_error(p3ds_flat, p2ds_flat)
         if scores is not None:
@@ -2774,16 +2852,22 @@ class CameraGroup(nn.Module):
         for cix, (a, b) in enumerate(constraints):
             lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
             expected = torch.abs(joint_lengths[cix])
-            error_lengths += torch.sum(torch.square(lengths - expected))/expected
-        sum_lengths = error_lengths * scale_length * 100 
+            if unit is None:
+                error_lengths += torch.sum(torch.square(lengths - expected))/expected
+            else:
+                error_lengths += torch.sum(torch.square(lengths - expected))
+        sum_lengths = error_lengths * scale_length * (100 if unit is None else 1)
         total_error += sum_lengths
 
         error_lengths_weak = 0
         for cix, (a, b) in enumerate(constraints_weak):
             lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
             expected = torch.abs(joint_lengths_weak[cix])
-            error_lengths_weak += torch.sum(torch.square(lengths - expected))/expected 
-        sum_lengths_weak = error_lengths_weak * scale_length_weak * 100
+            if unit is None:
+                error_lengths_weak += torch.sum(torch.square(lengths - expected))/expected
+            else:
+                error_lengths_weak += torch.sum(torch.square(lengths - expected))
+        sum_lengths_weak = error_lengths_weak * scale_length_weak * (100 if unit is None else 1)
         total_error += sum_lengths_weak
 
         # print("reproj: {:.2f}   smooth: {:.2f}   len: {:.2f}  len_weak: {:.2f}".format(
@@ -2794,7 +2878,29 @@ class CameraGroup(nn.Module):
  
 
 
-    def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[], device=None):
+    def _initialize_params_triangulation(self, p3ds, constraints=[], constraints_weak=[], device=None,
+                                         p3ds_lengths=None):
+        """Parameters of optim_points. ``p3ds_lengths`` (normalised mode): the points (NaN =
+        not triangulated) from which each bone's target length is estimated robustly, as the
+        median over the frames where both joints are triangulated (no cross-bone clipping)."""
+        if p3ds_lengths is not None:
+            def _robust(pairs):
+                out = np.empty(len(pairs), dtype='float64')
+                for cix, (a, b) in enumerate(pairs):
+                    L = np.linalg.norm(p3ds_lengths[:, a] - p3ds_lengths[:, b], axis=1)
+                    L = L[np.isfinite(L)]
+                    if L.size == 0:
+                        L = np.linalg.norm(p3ds[:, a] - p3ds[:, b], axis=1)
+                    out[cix] = np.median(L) if L.size else 1.0
+                return out
+            return {
+                'p3d': nn.Parameter(to_tensor(p3ds, device=device, dtype=self.dtype)),
+                # fixed targets: free lengths drift towards gap-filled frames (shrinking the
+                # skeleton); the robust median is the estimate
+                'joint_lengths': to_tensor(_robust(constraints), device=device, dtype=self.dtype),
+                'joint_lengths_weak': to_tensor(_robust(constraints_weak), device=device,
+                                                dtype=self.dtype)
+            }
         joint_lengths = np.empty(len(constraints), dtype='float64')
         joint_lengths_weak = np.empty(len(constraints_weak), dtype='float64')
 
