@@ -156,6 +156,13 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   - Default MSAC threshold `tau = clip(3 x noise floor, 10 px, 1 % of the diagonal)` (`tau_noise_mult` 5 -> 3;
     motor observatory median reprojection 3.75 -> 3.31 px vs 3.07 px for the project's IRLS, EvoVision/Panoptic
     MPJPE unchanged to better, other datasets sit at the 10 px floor). Old: `options={'tau_noise_mult': 5}`.
+  - New default `options['inlier_refit']='auto'`: when the MSAC inlier errors are heavier-tailed than Gaussian
+    noise (score-weighted share of inlier errors above 2 x their median > `refit_tail_frac=0.12`; Gaussian noise
+    gives 0.06-0.10, real keypoints 0.15-0.25), the inliers are refit with Cauchy weights (scale
+    `refit_sigma_mult=1.5` x noise floor, 4 reweightings of Gauss-Newton). Motor observatory held-out median
+    reprojection 3.29 -> 2.94 px (project IRLS 3.06), p90 28.6 px (project 37.0). Gaussian data are unchanged.
+    `settings['inlier_tail_frac']` / `['inlier_refit_applied']` say what happened. Old: `options={'inlier_refit': False}`
+    (`True` always refits).
   - `fill='interior'` fills gaps of at most `options['max_gap']=10` frames (it filled 90 % of a sparse outdoor
     trajectory, runs up to 4 minutes). New `times=` (interpolate on time; `options['max_gap_s']`). Old:
     `options={'max_gap': None}`. For label frames that are not consecutive, use `fill='none'` (or pass `times=`).

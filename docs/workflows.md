@@ -330,7 +330,9 @@ points3d = result.points3d       # (frames, keypoints, 3), NaN where there weren
 ```
 
 For every point it picks the cameras that agree with each other and ignores ones that don't, so a single bad
-detection doesn't drag the 3D point away.
+detection doesn't drag the 3D point away. Real keypoints often have many detections that are a few pixels off. When
+the errors show that, the cameras that agree closely get more say in the final position than the ones that are only
+roughly right. With clean, even noise this step is skipped. `options={'inlier_refit': False}` turns it off.
 
 If your pose model gives a confidence for each keypoint, pass it as `scores=`. Confident detections count more and
 unsure ones count less, but nothing is thrown out just for having a low score. You don't need to pick a cutoff. If you
