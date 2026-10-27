@@ -178,7 +178,14 @@ def lm_board_adjust(model, intr0, poses0, obj, img, view, fix_intr=False, max_it
         def apply(self, st, dth, dv):
             return (st[0] + dth if n_i else st[0], st[1] + dv[0])
 
-    res = _lm.levenberg_marquardt(_P(), (_tt(intr0), _tt(poses)), n_iter=max_iter, tol=tol, lam_up=10.0, max_tries=12)
+    def damp(V, lam):
+        # Marquardt damping scaled by lam only (an undamped ridge biases the pose steps of
+        # boards far from the camera and slows convergence ~5x)
+        eye = torch.eye(V.shape[-1], dtype=V.dtype, device=V.device)
+        return V + lam * (V.diagonal(dim1=-2, dim2=-1)[..., None] + 1e-12) * eye
+
+    res = _lm.levenberg_marquardt(_P(), (_tt(intr0), _tt(poses)), n_iter=max_iter, tol=tol, lam_up=10.0,
+                                  max_tries=12, damp_blocks=damp)
     intr, poses = (s.numpy() for s in res.state)
     status = {'no_decrease': 'converged_no_decrease', 'tol': 'converged'}.get(res.reason, 'max_iter')
     return intr, poses, {'status': status, 'iterations': len(res.history) - 1, 'cost': res.cost,
