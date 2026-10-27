@@ -26,7 +26,9 @@ into it, and a rotation offset (rotation about the camera centre, camera frame) 
 time window by robust Gauss-Newton. Weighted binary segmentation of the offset series finds the
 steps (disco ``pose_ba_stations.detect_steps``); each step time is refined to the frame. The
 report holds the series, the change points, proposed :class:`Stations` and each station's
-rotation, plus :meth:`MoveReport.corrected_extrinsics`. Nothing is applied to the group.
+rotation, plus :meth:`MoveReport.corrected_extrinsics`. Nothing is applied to the group
+Windows with less than ``min_support_frac`` of the median window support are ignored, and with
+``retest`` cameras flagged in the first pass are re-tested without the stronger moved cameras.
 """
 
 import dataclasses
@@ -417,7 +419,8 @@ def _dense_from_obs(obs, time_tol):
 
 def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_windows=3, z_thr=6.0,
                  sharp=1.5, tau=10.0, min_points=20, huber_px=3.0, cameras=None, refine=True,
-                 skip_s=0.0, max_cp=10, fps=None, time_tol=1e-3, min_other=2, device=None):
+                 skip_s=0.0, max_cp=10, fps=None, time_tol=1e-3, min_other=2, device=None,
+                 min_support_frac=0.25, retest=True):
     """Detect camera bumps / re-aims (see module docstring).
 
     Args:
@@ -431,6 +434,16 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
         min_step_deg, z_thr, sharp, max_cp: change-point acceptance (:func:`detect_steps`).
         tau: MSAC threshold (px) of the leave-one-out triangulation; ``min_other`` other views.
         huber_px, min_points: rotation fit robustness and minimum points per window.
+        min_support_frac: a window counts only if its point count is >= ``max(min_points,
+            min_support_frac * median)``, the median over the camera's windows with >=
+            ``min_points`` points; sparser windows are NaN in ``delta_deg`` (listed in
+            ``info['low_support']``) so a fit on a handful of points cannot form a change point.
+            ``None`` / 0: only ``min_points`` (<= 1.0 behaviour).
+        retest: after the first pass, flagged cameras are re-tested in order of decreasing z
+            with the already-confirmed moved cameras removed from the triangulating views; a
+            camera stays flagged only if it is still flagged without them (the strongest one is
+            always kept). If the re-test lacks support (``min_points`` / ``min_other``), the
+            first-pass result is kept. Details in ``info['retest']``. ``False``: one pass.
         cameras: indices to test (default all). refine: refine step times to the frame.
         skip_s: mark ``[t - skip_s/2, t + skip_s/2)`` around each step as ``'skip'``.
 
@@ -456,36 +469,84 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
     win = np.floor((t - t0) / window_s).astype(int)
     W = int(win.max()) + 1
     cams = list(range(C)) if cameras is None else [int(c) for c in cameras]
+    flat = p2d.reshape(C, N * J, 2)
+    tf = np.repeat(t, J)
+    wf = np.repeat(win, J)
+
+    def test(c, exclude=()):
+        others = [o for o in range(C) if o != c and o not in exclude]
+        if len(others) < max(min_other, 2):
+            return None
+        nv = np.isfinite(flat[others]).all(-1).sum(0)
+        sel = np.flatnonzero((nv >= min_other) & np.isfinite(flat[c]).all(-1))
+        if len(sel) < min_points:
+            return None
+        res = T.triangulate_robust(P.subset(others), flat[others][:, sel], method='msac', tau=tau)
+        X = np.asarray(res.p3d)
+        ok = np.isfinite(X).all(1)
+        sel, X = sel[ok], X[ok]
+        if len(sel) < min_points:
+            return None
+        rv, med, cnt, _ = fit_rotation_offsets(P, c, X, flat[c, sel], wf[sel], n_groups=W,
+                                               huber_px=huber_px, min_points=min_points)
+        d = np.degrees(rv)
+        low = np.zeros(W, bool)
+        if min_support_frac:
+            valid = cnt >= min_points
+            if valid.any():
+                thr = max(min_points, min_support_frac * float(np.median(cnt[valid])))
+                low = valid & (cnt < thr)
+                d[low] = np.nan
+                med = med.copy()
+                med[low] = np.nan
+        cps = detect_steps(d, np.sqrt(np.maximum(cnt, 0)) * np.isfinite(d).all(1),
+                           min_step=min_step_deg, min_seg=min_windows, z_thr=z_thr, sharp=sharp, max_cp=max_cp)
+        return dict(delta=d, cnt=cnt, med=med, cps=cps, X=X, sel=sel, low=low, others=others)
+
+    out = {c: test(c) for c in cams}
+    retest_info = {}
+    if retest:
+        flagged = [c for c in cams if out[c] is not None and out[c]['cps']]
+        flagged.sort(key=lambda c: -max(cp['z'] for cp in out[c]['cps']))
+        confirmed = []
+        for c in flagged:
+            if not confirmed:
+                confirmed.append(c)
+                retest_info[names[c]] = dict(result='kept', excluded=[], z_first=max(cp['z'] for cp in out[c]['cps']))
+                continue
+            excl = [o for o in confirmed if o != c]
+            r = test(c, exclude=excl)
+            z1 = max(cp['z'] for cp in out[c]['cps'])
+            if r is None:
+                retest_info[names[c]] = dict(result='insufficient support (first pass kept)',
+                                             excluded=[names[o] for o in excl], z_first=z1)
+                confirmed.append(c)
+                continue
+            out[c] = r
+            if r['cps']:
+                confirmed.append(c)
+                retest_info[names[c]] = dict(result='kept', excluded=[names[o] for o in excl], z_first=z1,
+                                             z_retest=max(cp['z'] for cp in r['cps']))
+            else:
+                retest_info[names[c]] = dict(result='cleared', excluded=[names[o] for o in excl], z_first=z1)
+
     delta = np.full((C, W, 3), np.nan)
     npts = np.zeros((C, W), int)
     resid = np.full((C, W), np.nan)
     cps_all = []
     stations = Stations(cameras=names)
     rots = {}
-    flat = p2d.reshape(C, N * J, 2)
-    tf = np.repeat(t, J)
-    wf = np.repeat(win, J)
+    low_support = {}
     for c in cams:
-        others = [o for o in range(C) if o != c]
-        nv = np.isfinite(flat[others]).all(-1).sum(0)
-        sel = np.flatnonzero((nv >= min_other) & np.isfinite(flat[c]).all(-1))
-        if len(sel) < min_points:
+        r = out[c]
+        if r is None:
             continue
-        res = T.triangulate_robust(P.subset(others), flat[others][:, sel], method='msac', tau=tau)
-        X = np.asarray(res.p3d)
-        ok = np.isfinite(X).all(1)
-        sel, X = sel[ok], X[ok]
-        if len(sel) < min_points:
-            continue
-        rv, med, cnt, _ = fit_rotation_offsets(P, c, X, flat[c, sel], wf[sel], n_groups=W,
-                                               huber_px=huber_px, min_points=min_points)
-        delta[c] = np.degrees(rv)
-        npts[c] = cnt
-        resid[c] = med
-        cps = detect_steps(delta[c], np.sqrt(np.maximum(cnt, 0)) * np.isfinite(delta[c]).all(1),
-                           min_step=min_step_deg, min_seg=min_windows, z_thr=z_thr, sharp=sharp, max_cp=max_cp)
+        delta[c], npts[c], resid[c] = r['delta'], r['cnt'], r['med']
+        if r['low'].any():
+            low_support[names[c]] = np.flatnonzero(r['low']).tolist()
+        X, sel = r['X'], r['sel']
         times_c = []
-        for cp in cps:
+        for cp in r['cps']:
             k = cp['index']
             # previous valid window
             kv = np.flatnonzero(np.isfinite(delta[c, :k]).all(1))
@@ -515,7 +576,9 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
                       delta_deg=delta, n_points=npts, resid_px=resid,
                       change_points=sorted(cps_all, key=lambda d: (d['time'], d['camera'])),
                       stations=stations, station_rotations=rots,
-                      info=dict(min_step_deg=min_step_deg, z_thr=z_thr, tested=[names[c] for c in cams]))
+                      info=dict(min_step_deg=min_step_deg, z_thr=z_thr, tested=[names[c] for c in cams],
+                                min_support_frac=min_support_frac, low_support=low_support,
+                                retest=retest_info))
 
 
 def _refine_step(P, c, X, uv, t, w, kl, kr, rl, rr, huber_px, t_default):
