@@ -251,6 +251,8 @@ The board can also be found directly in the videos: `board_points={'cam1': 'cam1
 videos must be in sync (frame 100 in one camera is frame 100 in all of them). As in `calibrate_from_board`, every 20th
 frame is checked, and it stops once 200 frames show the board in at least two cameras (`options={'max_frames': 200}`).
 `options={'n_frames': 60}` looks at only 60 evenly spaced frames instead.
+The corners the learned (DeepCharuco) detector finds are then sharpened on the full-size frame, because it looks at
+a shrunken copy of the frame to find the board. To turn that off, pass `options={'detector_kwargs': {'subpix': False}}`.
 
 ## Checking a calibration: `evaluate_calibration`
 

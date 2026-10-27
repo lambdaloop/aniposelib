@@ -147,6 +147,13 @@ dancing). Behaviour changes say how to get the previous behaviour.
   detections 0.27 % -> 0.16 % off the reference (the project's own 0.18 %); with the same rig and detections W3 now
   gives exactly the project's number. Old: `options={'board_kwargs': {'min_pair_dist': None}}` (W3),
   `scale.from_board(..., min_pair_dist=None)` (1.0 API).
+- W3 `board_points={camera: video}` with DeepCharuco: corners refined with `cv2.cornerSubPix` on the full-resolution
+  frame (`detector_kwargs` default `subpix=True`; RefineNet works on the frame downscaled by `scale='auto'`, 1/4 px
+  steps at 1440x1080). Motobs W2 rig, same 148 frames: 0.27 % -> 0.17 % off the reference (the project's own
+  full-resolution detector on those frames: 0.20 %; its final calibration: 0.18 %). W1 is unchanged (its rig moved
+  further from the reference with it). Old: `options={'detector_kwargs': {'subpix': False}}`.
+  `DeepCharucoDetector(subpix=True)` no longer raises on corners decoded just outside the image (they keep the
+  RefineNet position).
 - W4: `options['cam_names']` (points in another camera order; `report['cameras_missing' / 'cameras_dropped']`),
   `tau_px` / `tau_tri_px` / `thresholds_px` (absolute pixels), time-blocked LOO with `times=` (`loo_window_s='auto'`
   ~ 20 windows, `res.per_window`, rule `bad_windows_frac`; `loo_window_s=None` = off), `compare_to={name: cgroup}` +
