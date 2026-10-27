@@ -244,6 +244,33 @@ def solve_blocks(B, center=None, ridge=1e-12):
 
 # ------------------------------------------------------------------ linear triangulation
 
+def _chunk_bounds(pts, method, n_pairs, chunk, max_elems):
+    """``[(s0, s1)]`` point chunks of :func:`_robust_flat`. MSAC chunks are sized by the pair
+    hypotheses the points actually have on a GPU (``v (v - 1) / 2`` for ``v`` observing cameras,
+    not all camera pairs), so sparse observations get few large chunks; at most ``4 max_elems / 16C``
+    points per chunk (the ``[C,n,4,4]`` DLT blocks). Points are independent, so the chunking
+    never changes the result."""
+    C, N = pts.shape[:2]
+    if N == 0:
+        return []
+    # on the CPU small chunks stay in cache (and are what 1.1.0 did); adaptive chunks are for
+    # GPUs, where every chunk costs a few hundred kernel launches
+    if chunk is not None or method != 'msac' or pts.device.type == 'cpu':
+        step = _auto_chunk(C * max(1, n_pairs) if method == 'msac' else C * 16, chunk, max_elems)
+        return [(s0, min(N, s0 + step)) for s0 in range(0, N, step)]
+    v = torch.isfinite(pts).all(-1).sum(0)
+    cost = (C * torch.clamp(v * (v - 1) // 2, min=1)).cpu().numpy().astype(np.int64)
+    cap = max(1, int(4 * max_elems // (16 * C)))
+    out, s0, cum = [], 0, np.cumsum(cost)
+    while s0 < N:
+        base = cum[s0 - 1] if s0 > 0 else 0
+        s1 = int(np.searchsorted(cum, base + max_elems, side='right'))
+        s1 = min(N, max(s1, s0 + 1), s0 + cap)
+        out.append((s0, s1))
+        s0 = s1
+    return out
+
+
 def _auto_chunk(n_per_point, chunk, max_elems):
     if chunk is not None:
         return max(1, int(chunk))
@@ -363,8 +390,9 @@ def _msac_chunk(P, p2, und, valid, defn, B, E, center, tau, n_refine, pa, pb, ri
         return X, inl
     cen_h = _sub_center(center, ni)
     Xh = _solve(B[pa[si], ni] + B[pb[si], ni], cen_h, ridge)
-    eh = G._reproj_err_flat(P, Xh, p2[:, ni], _sub_ext(E, ni))
     vh = valid[:, ni]
+    # errors are only needed where the point is observed (the rest is ignored below)
+    eh = G._reproj_err_masked(P, Xh, p2[:, ni], _sub_ext(E, ni), vh)
     big = torch.full_like(eh, tau2)
     capped = torch.minimum(torch.nan_to_num(eh, nan=tau, posinf=tau) ** 2, big)
     if sw is not None:
@@ -479,21 +507,25 @@ def _score_weights(scores, C, N, dev, dt):
     return torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
 
-def _mask_noninvertible(P, pts):
+def _mask_noninvertible(P, pts, return_und=False):
     """NaN out pixel observations ``pts [C,N,2]`` where the lens model is not invertible (past
     the fold of a strong barrel distortion): their undistorted rays are wrong and would bias the
-    linear refit."""
+    linear refit. ``return_und=True`` also returns the undistorted points (NaN where masked),
+    which are the undistortion of the masked points."""
     und = G._undistort_flat(P, pts, check_invertible=True)
     bad = ~torch.isfinite(und).all(-1)
-    return torch.where(bad[..., None], torch.full_like(pts, float('nan')), pts)
+    out = torch.where(bad[..., None], torch.full_like(pts, float('nan')), pts)
+    return (out, und) if return_und else out
 
 
-def _ray_inconsistent(P, X, E, pts, tau):
+def _ray_inconsistent(P, X, E, pts, tau, und=None):
     """[C,N] True where an observation's undistorted ray disagrees with the direction to the
     point X (normalised distance > 3 tau / f) although its pixel error may be small: the
     projection lies past the fold of a strong barrel distortion, where the pixel has a second
-    (central) preimage. Such rays bias the linear refit."""
-    und = G._undistort_flat(P, pts)
+    (central) preimage. Such rays bias the linear refit. ``und``: the undistorted ``pts`` if
+    already known."""
+    if und is None:
+        und = G._undistort_flat(P, pts)
     pc = G._cam_points(E, torch.nan_to_num(X))
     z = pc[..., 2]
     zs = torch.where(z.abs() > 1e-12, z, torch.full_like(z, 1e-12))
@@ -506,9 +538,10 @@ def _ray_inconsistent(P, X, E, pts, tau):
 
 def _robust_flat(P, pts, E, method, weights, sw, contrib, tau, min_inliers, n_refine, sigma,
                  n_iter, min_weight, reject_px, rel_factor, mask_out_of_bounds, undistort,
-                 ridge, chunk, max_elems):
+                 ridge, chunk, max_elems, und_all=None):
     """Core of :func:`triangulate_robust` on flat ``pts [C,N,2]`` -> (p3d, inliers, errors,
-    weights, n_inliers). ``sw [C,N]`` (or None): soft score weights in [0, 1]."""
+    weights, n_inliers). ``sw [C,N]`` (or None): soft score weights in [0, 1]. ``und_all``:
+    the undistorted ``pts`` if already known (else computed per chunk)."""
     C, N, _ = pts.shape
     dev, dt = P.device, P.dtype
     Pr = P if undistort else _identity_intrinsics(P)
@@ -518,13 +551,15 @@ def _robust_flat(P, pts, E, method, weights, sw, contrib, tau, min_inliers, n_re
     wout = torch.zeros((C, N), dtype=dt, device=dev)
 
     pa, pb = _pairs(C, dev)
-    per_point = C * max(1, len(pa)) if method == 'msac' else C * 16
-    step = _auto_chunk(per_point, chunk, max_elems)
     floor = max(2, int(min_inliers))
-    for s0 in range(0, N, step):
-        s1 = min(N, s0 + step)
+    for s0, s1 in _chunk_bounds(pts, method, len(pa), chunk, max_elems):
         p2 = pts[:, s0:s1]
-        und = G._undistort_flat(P, p2) if undistort else p2
+        if not undistort:
+            und = p2
+        elif und_all is not None:
+            und = und_all[:, s0:s1]
+        else:
+            und = G._undistort_flat(P, p2)
         valid = _valid_obs(Pr, p2, und, mask_out_of_bounds and undistort)
         if weights is not None:
             valid = valid & (torch.nan_to_num(weights[:, s0:s1]) > 0)
@@ -575,7 +610,8 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
                        reject_px=20.0, rel_factor=5.0,
                        contrib=None, weights=None, scores=None, mask_out_of_bounds=True,
                        undistort=True, check_invertible=True,
-                       extrinsics=None, ridge=1e-12, chunk=None, max_elems=DEFAULT_MAX_ELEMS):
+                       extrinsics=None, ridge=1e-12, chunk=None, max_elems=DEFAULT_MAX_ELEMS,
+                       _und=None):
     """Robust triangulation of pixel observations ``points [C,...,2]`` (see module docstring).
 
     Parameters by method:
@@ -617,24 +653,36 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
         contrib = torch.as_tensor(np.asarray(contrib) if not isinstance(contrib, torch.Tensor) else contrib,
                                   device=dev).to(torch.bool).reshape(C)
     check = bool(check_invertible) and undistort
-    pts = _mask_noninvertible(P, raw) if check else raw
+    # ``_und`` (internal): the undistorted points, computed by the caller (with
+    # ``check_invertible`` as here), e.g. once for all the subsets of a LOO evaluation
+    und = None if _und is None or not undistort else to_torch(_und, device=dev, dtype=dt).reshape(C, N, 2)
+    if check:
+        # one undistortion, shared by the fold mask, the fit and the ray check
+        if und is None:
+            pts, und = _mask_noninvertible(P, raw, return_und=True)
+        else:
+            pts = torch.where(torch.isfinite(und).all(-1)[..., None], raw, torch.full_like(raw, float('nan')))
+    else:
+        pts = raw
     kw = dict(method=method, contrib=contrib, tau=tau, min_inliers=min_inliers, n_refine=n_refine,
               sigma=sigma, n_iter=n_iter, min_weight=min_weight, reject_px=reject_px,
               rel_factor=rel_factor, mask_out_of_bounds=mask_out_of_bounds, undistort=undistort,
               ridge=ridge, chunk=chunk, max_elems=max_elems)
-    p3d, inliers, errors, wout = _robust_flat(P, pts, E, weights=weights, sw=sw, **kw)
+    p3d, inliers, errors, wout = _robust_flat(P, pts, E, weights=weights, sw=sw, und_all=und, **kw)
     if check and N > 0:
         # an inlier explained by a point past its lens fold had a wrong ray in the linear
         # refit: drop those observations and triangulate the affected points again
-        fold = _ray_inconsistent(P, p3d, E, pts, float(tau)) & inliers \
+        fold = _ray_inconsistent(P, p3d, E, pts, float(tau), und=und) & inliers \
             & torch.isfinite(p3d).all(-1)[None]
         redo = torch.nonzero(fold.any(0))[:, 0]
         if redo.numel() > 0:
             sub = pts[:, redo]
             sub = torch.where(fold[:, redo, None], torch.full_like(sub, float('nan')), sub)
+            usub = und[:, redo]
+            usub = torch.where(fold[:, redo, None], torch.full_like(usub, float('nan')), usub)
             r = _robust_flat(P, sub, _sub_ext(E, redo),
                              weights=None if weights is None else weights[:, redo],
-                             sw=None if sw is None else sw[:, redo], **kw)
+                             sw=None if sw is None else sw[:, redo], und_all=usub, **kw)
             p3d[redo] = r[0]
             inliers[:, redo] = r[1]
             errors[:, redo] = r[2]

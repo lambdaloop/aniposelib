@@ -182,7 +182,15 @@ def loo_errors(cgroup, p2ds, tau_tri=5.0, min_others=3, robust=True, chunk=None)
     held_t = torch.as_tensor(held, dtype=P.dtype, device=P.device)
     with torch.no_grad():
         if robust:
-            tr = T.triangulate_robust(P, held_t, tau=tau_tri, min_inliers=min_others, chunk=chunk)
+            # undistort every observation once, not once per held-out camera
+            und = G._undistort_flat(P, torch.as_tensor(pts, dtype=P.dtype, device=P.device),
+                                    check_invertible=True)
+            cols = torch.as_tensor(np.concatenate(idxs), device=P.device)
+            held_u = und[:, cols]
+            heldc = torch.as_tensor(np.repeat(cams, [len(i) for i in idxs]), device=P.device)
+            held_u[heldc, torch.arange(len(cols), device=P.device)] = float('nan')
+            tr = T.triangulate_robust(P, held_t, tau=tau_tri, min_inliers=min_others, chunk=chunk,
+                                      _und=held_u)
             X = tr.p3d
             support = (tr.errors < tau_tri).sum(0)   # recompute support after refinement (Emory)
             good = (support >= min_others) & torch.isfinite(X).all(-1)
