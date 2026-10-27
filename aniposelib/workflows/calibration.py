@@ -908,6 +908,7 @@ W2_DEFAULTS = dict(
     coarse=(0.12, 0.06, 0.03),                    # first-round MSAC thresholds, fraction of the diagonal
     fine=((40, 20, 10, 5), (20, 10, 5)),          # later rounds (px at 0.5 px noise) x noise unit
     resect=True,
+    reject='auto',            # structured frame / keypoint rejection in the fine rounds ('auto', noise-scaled) or None
     ba_kwargs=None, sfm_kwargs=None, vggt_kwargs=None, select_kwargs=None, people_kwargs=None,
     track_ids=None,           # C x F x P track ids of 5D points (init='people' / 'vggt' / a CameraGroup)
     intrinsics_free=('f', 'k1'),                  # refine_intrinsics: parameters freed
@@ -1089,7 +1090,7 @@ def _robust_ba(cg, pc, gr, diag, opts, rng):
     u = _noise_unit(nf, opts['noise_unit'])
     fine = _fine_schedule(opts['fine'], u, coarse[-1])
     rej = B.RejectSchedule()
-    rej = B.RejectSchedule(frame=tuple(u * t for t in rej.frame), keypoint=tuple(u * t for t in rej.keypoint),
+    rej = None if opts['reject'] is None else B.RejectSchedule(frame=tuple(u * t for t in rej.frame), keypoint=tuple(u * t for t in rej.keypoint),
                            obs=tuple(u * t for t in rej.obs), min_frame_pts=rej.min_frame_pts,
                            min_kpt_obs=rej.min_kpt_obs, protect_kpts=rej.protect_kpts, max_kpt_frac=rej.max_kpt_frac)
     rkw = dict(tau_tri=5.0 * u, tau_pnp=8.0 * u)
@@ -1100,7 +1101,7 @@ def _robust_ba(cg, pc, gr, diag, opts, rng):
     fit = ~np.asarray(r2.excluded.get('fit', np.zeros(e.shape, bool)), bool)
     nf2 = noise_floor(e, fit & (np.nan_to_num(e, nan=np.inf) < fine[-1][-1]), diag=diag)
     settings = dict(coarse_px=list(coarse), noise_floor_coarse_px=nf, noise_unit=u, fine_px=[list(f) for f in fine],
-                    reject_px=rej.to_dict(), resect_px=rkw, report_tau_px=fine[-1][-1], noise_floor_px=nf2)
+                    reject_px=None if rej is None else rej.to_dict(), resect_px=rkw, report_tau_px=fine[-1][-1], noise_floor_px=nf2)
     return r2, dict(method='bundle_adjust_robust', before_px=r1.error_before, after_px=r2.error,
                     kept=not (r1.reverted and r2.reverted), result=r2), settings
 

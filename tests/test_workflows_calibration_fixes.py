@@ -370,3 +370,24 @@ def test_w2_stations_poses_in_the_group():
     S.rescale(ref2, 2.0)
     assert np.abs(E(late) - E(tgt))[:3, :3].max() < 2e-3
     assert np.abs(E(early) - E(ref2))[:3, :3].max() < 2e-3
+
+
+# ------------------------------------------------------------------ init.sfm seed robustness
+
+def test_sfm_seed_skips_a_pair_that_triangulates_nothing(mo):
+    """A pair can top the essential-matrix inlier count and still give no two-view points (seen on
+    the cluster: then every other camera stayed unplaced); the next pair is tried."""
+    from aniposelib.init import sfm
+    true, _, _, p2 = mo
+    base = WC_no_extrinsics(true)
+    u, f = sfm.ideal_points(base, p2.reshape(p2.shape[0], -1, 2))
+    pairs = sfm.pairwise_poses(u, f, thresh=2.0, min_points=30, rng=0)
+    top = max(pairs, key=lambda k: pairs[k]['n_in'])
+    bad = dict(pairs[top])
+    bad['n_in'] = 10 ** 6
+    bad['t'] = -np.asarray(bad['t'])            # wrong twisted-pair solution: points behind the cameras
+    bad['R'] = np.asarray(bad['R']).T
+    pairs[top] = bad
+    cg, rep = sfm.from_correspondences(base, p2, pairs=pairs, rng=0)
+    assert len(rep.placed) == 7, rep
+    assert len(rep.stats['seed_tried']) >= 2 and rep.stats['seed_tried'][0][2] < 30

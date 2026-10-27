@@ -485,20 +485,35 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
     if not pairs:
         raise RuntimeError('from_correspondences: no camera pair shares enough correspondences '
                            '(min_pair_points={}) for an essential-matrix seed'.format(min_pair_points))
-    (i0, j0), r0 = max(pairs.items(), key=lambda kv: kv[1]['n_in'])
-    ext = {i0: np.eye(4), j0: make_M(r0['R'], r0['t'])}
-    drivers = {i0, j0}
     passengers, rejected, cam_stats = {}, {}, {}
     priors = _prior_table(rotation_priors, names)
     log = print if verbose else (lambda *a, **k: None)
-    log('sfm: seed pair {}/{} ({} inliers)'.format(names[i0], names[j0], r0['n_in']))
 
-    def retri(e=None):
+    def retri(e=None, drv=None):
         e = ext if e is None else e
         ks = sorted(e)
-        p3d, good, err, work = _retriangulate(u, f, np.stack([e[k] for k in ks]), ks, drivers, fid,
+        p3d, good, err, work = _retriangulate(u, f, np.stack([e[k] for k in ks]), ks,
+                                              drivers if drv is None else drv, fid,
                                               decoy_thresh, point_max_err, min_frame_pts=mfp)
         return p3d, good, err, ks
+
+    # seed: the pair with the most essential-matrix inliers whose two-view reconstruction keeps
+    # enough points (a near-degenerate pair can top the inlier count by a hair and triangulate
+    # nothing, which left every other camera unplaced)
+    ranked = sorted(pairs.items(), key=lambda kv: -kv[1]['n_in'])
+    seed_tried = []
+    for (i0, j0), r0 in ranked[:8]:
+        ext = {i0: np.eye(4), j0: make_M(r0['R'], r0['t'])}
+        drivers = {i0, j0}
+        n_good = int(retri()[1].sum())
+        seed_tried.append(([names[i0], names[j0]], int(r0['n_in']), n_good))
+        if n_good >= min_pair_points:
+            break
+    else:
+        (i0, j0), r0 = ranked[0]
+        ext = {i0: np.eye(4), j0: make_M(r0['R'], r0['t'])}
+        drivers = {i0, j0}
+    log('sfm: seed pair {}/{} ({} inliers; tried {})'.format(names[i0], names[j0], r0['n_in'], seed_tried))
 
     def implausible(M, p3d, good):
         pts = p3d[good]
@@ -633,7 +648,7 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         method='sfm', placed=placed, drivers=[names[k] for k in sorted(drivers)],
         passengers=passengers, rejected=rejected,
         missing=[n for i, n in enumerate(names) if i not in ext and n not in rejected],
-        stats=dict(seed_pair=[names[i0], names[j0]], seed_inliers=int(r0['n_in']),
+        stats=dict(seed_pair=[names[i0], names[j0]], seed_inliers=int(r0['n_in']), seed_tried=seed_tried,
                    n_pairs=len(pairs), cameras=cam_stats, median_px=_med(err), per_camera_px=per_cam,
                    n_points=int(good.sum()), gauge='seed camera {} = identity, seed baseline = 1'.format(names[i0])))
     return out, report
