@@ -109,6 +109,13 @@ dancing). Behaviour changes say how to get the previous behaviour.
   = 3 %). Old: `options={'lengths_kwargs': {'tau': 10 * u}}`. `lengths=` / `board=` together with `reference=` and
   `align='reference'`: scale from the lengths / board, frame from the reference (`details['reference_scale']`).
   `board_points={camera: video}` detects the board in the (synchronised) videos as W1 does (see below).
+- W3 board / `scale.from_board`: `min_pair_dist` default `'auto'` (was None = every corner pair): only pairs more than
+  two square lengths apart (capped at half the longest corner distance; boards without a square length keep every
+  pair), the motor observatory's `scale_from_charuco` gate (50 mm on its 24 mm board). Short pairs inflate the
+  triangulated distance under corner noise, so the scale came out low: motobs W2 rig + the project's DeepCharuco
+  detections 0.27 % -> 0.16 % off the reference (the project's own 0.18 %); with the same rig and detections W3 now
+  gives exactly the project's number. Old: `options={'board_kwargs': {'min_pair_dist': None}}` (W3),
+  `scale.from_board(..., min_pair_dist=None)` (1.0 API).
 - W4: `options['cam_names']` (points in another camera order; `report['cameras_missing' / 'cameras_dropped']`),
   `tau_px` / `tau_tri_px` / `thresholds_px` (absolute pixels), time-blocked LOO with `times=` (`loo_window_s='auto'`
   ~ 20 windows, `res.per_window`, rule `bad_windows_frac`; `loo_window_s=None` = off), `compare_to={name: cgroup}` +

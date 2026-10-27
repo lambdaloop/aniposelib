@@ -493,15 +493,27 @@ def _board_fit_residual(p3d, objp, min_corners=4):
     return float(np.median(r))
 
 
-def from_board(cgroup, rows_or_corners, board, min_frames=5, min_pairs=30, min_pair_dist=None,
+def _auto_min_pair_dist(board, td):
+    """``min_pair_dist='auto'``: pairs longer than two square lengths (capped at half the longest
+    corner distance so small boards keep pairs); None (all pairs) without a square length."""
+    sq = getattr(board, 'square_length', None)
+    if sq is None or not np.isfinite(float(sq)) or float(sq) <= 0 or not len(td):
+        return None
+    return min(2.0 * float(sq) * (1 + 1e-6), 0.5 * float(np.max(td)))
+
+
+def from_board(cgroup, rows_or_corners, board, min_frames=5, min_pairs=30, min_pair_dist='auto',
                max_frame_mad=0.05, min_cams=2, min_corners=4, max_pair_mad=0.05,
                max_frame_spread=0.025, max_board_resid=None, robust=False, units=None):
     """Metric scale from board corners triangulated by ``cgroup`` (EvoVision ``scale_from_charuco``).
 
     Per frame with >= ``min_corners`` corners seen by >= ``min_cams`` cameras: the ratio of the
-    known to the triangulated distance of every corner pair at least ``min_pair_dist`` apart
-    (board units; None = all pairs), median per frame; ``scale`` is the median over frames
-    (frames, not pairs, are the independent measurements).
+    known to the triangulated distance of every corner pair more than ``min_pair_dist`` apart
+    (board units; None = all pairs; ``'auto'`` (default) = more than two square lengths, capped
+    at half the longest corner distance, for boards with a square length, else all pairs: the
+    short pairs carry the largest relative corner noise and bias the ratio, as in the motor
+    observatory's ``scale_from_charuco`` 50 mm gate on its 24 mm board), median per frame;
+    ``scale`` is the median over frames (frames, not pairs, are the independent measurements).
 
     Accepted when there are >= ``min_frames`` frames, >= ``min_pairs`` pairs and the relative
     frame MAD is <= ``max_frame_mad``. Flags (never rejects): ``board_pair_mad`` (relative pair
@@ -518,6 +530,10 @@ def from_board(cgroup, rows_or_corners, board, min_frames=5, min_pairs=30, min_p
     true_d = np.linalg.norm(objp[:, None] - objp[None], axis=-1)
     iu = np.triu_indices(K, 1)
     td = true_d[iu]
+    if isinstance(min_pair_dist, str):
+        if min_pair_dist != 'auto':
+            raise ValueError("min_pair_dist must be a number, None or 'auto'")
+        min_pair_dist = _auto_min_pair_dist(board, td)
     long_enough = td > (0 if min_pair_dist is None else float(min_pair_dist))
     long_enough &= td > 0
     seen = np.isfinite(corners).all(-1).sum(0)  # [F,K]
