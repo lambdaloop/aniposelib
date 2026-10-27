@@ -181,25 +181,6 @@ def test_not_inplace_returns_copy(outdoor):
     assert synth.center_error(rep.cgroup, true).max() < 4e-3
 
 
-def test_time_offsets_recovered():
-    """F3: per-camera time offsets from a smooth trajectory (first order, prior anchored)."""
-    true = synth.load_rig('outdoor_9cam')
-    cen, s = synth.scene_center(true), synth.rig_scale(true)
-    t = np.arange(400) / 30.0
-    X = lambda tt: cen + 0.2 * s * np.stack([np.sin(1.3 * tt), np.cos(0.9 * tt), 0.3 * np.sin(2.1 * tt)], -1)
-    delta = np.zeros(9)
-    delta[[2, 5]] = [0.01, -0.02]
-    p2d = np.stack([synth.project(true, X(t + delta[c]))[c] for c in range(9)])
-    p2d = synth.add_noise(p2d, 0.3, seed=1)
-    obs = Observations.from_dense(p2d, time=t)
-    cg = deepcopy(true)
-    rep = bundle_adjust_lm(cg, obs, spec=ParamSpec.extrinsics_only(time_offset=0.05), return_report=True,
-                           loss='linear')
-    est = np.array([rep.time_offsets[n] for n in true.get_names()])
-    assert np.abs(est - delta).max() < 2e-3
-    assert synth.center_error(cg, true).max() < 1e-3
-
-
 def test_stations_give_a_moved_camera_its_own_extrinsics():
     """F5: a camera bumped half way gets a second station; intrinsics stay shared."""
     from aniposelib.stations import Stations

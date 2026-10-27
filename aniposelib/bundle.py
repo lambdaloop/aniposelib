@@ -11,8 +11,9 @@ API
     Torch Schur-complement LM over camera parameters (selected by a
     :class:`~aniposelib.params.ParamSpec`) and 3D points (or rigid board poses with ``extra=``),
     with robust IRLS weights (``'linear' | 'huber' | 'cauchy' | 'soft_l1'``), priors, gauge
-    (``fixed_cameras``) and scale (``scale_constraint``) control, per-camera time offsets (F3) and
-    stations (F5: several extrinsic segments of one camera sharing its intrinsics).
+    (``fixed_cameras``) and scale (``scale_constraint``) control, and stations (F5: several
+    extrinsic segments of one camera sharing its intrinsics). Time offsets live in
+    :mod:`aniposelib.stba`.
 ``bundle_adjust_robust(cgroup, p2ds, groups=None, schedule=..., reject=RejectSchedule(), resect=True,
                        min_inliers=3, final=('extrinsics', 'intrinsics'), ...) -> BAReport | float``
     The converged recipe: robust (MSAC) triangulation -> inlier observations -> LM, annealing the
@@ -29,11 +30,6 @@ Conventions
 * Gauge: by default (``fixed_cameras='auto'``) the extrinsics of the first camera are held fixed,
   and (``scale_constraint='auto'``) the rig scale (RMS distance of camera centres from their
   centroid) is kept unless the problem has rigid boards (whose geometry fixes the scale).
-* Time offsets (F3, ``ParamSpec(time_offset=sigma)``): an observation of camera ``c`` labelled
-  ``time = t`` shows the scene at ``t + delta_c``; the model is first order,
-  ``X(t + delta) ~ X(t) + delta * dX/dt``, with velocities from the triangulated tracks
-  (``group['track']``, else ``group['keypoint']``, else one track). Units of ``obs.time``.
-  ``delta`` of the gauge camera(s) is 0; the others have a zero-mean prior of the given sigma.
 * Stations (F5): ``obs.station`` (index into ``stations['station_cam']``) selects the extrinsics
   of a camera segment; intrinsics are shared by all stations of a camera. The camera's own
   extrinsics are written from its first station.
@@ -63,8 +59,7 @@ LOSSES = ('linear', 'huber', 'cauchy', 'soft_l1')
 _EXT = slice(0, 6)
 _FX, _FY, _CX, _CY, _SKEW = 6, 7, 8, 9, 10
 _D0 = 11            # 8 distortion slots 11..18
-_DELTA = 19
-N_LOCAL = 20
+N_LOCAL = 19
 _MAT_SLOT = {'fx': _FX, 'fy': _FY, 'cx': _CX, 'cy': _CY, 'skew': _SKEW}
 
 
@@ -102,9 +97,9 @@ class Observations:
     """Sparse 2D observations.
 
     ``cam_idx [M]`` camera index (group order), ``point_idx [M]`` point index, ``uv [M,2]`` pixels,
-    ``weight [M]`` (confidence, default 1), ``time [M]`` (frame time, for time offsets / stations),
+    ``weight [M]`` (confidence, default 1), ``time [M]`` (frame time, for stations),
     ``group`` dict of ``[M]`` integer arrays (e.g. ``frame``, ``keypoint``, ``track``; used for
-    structured rejection and velocities), ``station [M]`` (index of the extrinsic station, F5).
+    structured rejection), ``station [M]`` (index of the extrinsic station, F5).
     ``n_points`` defaults to ``max(point_idx) + 1``; ``point_shape`` remembers the dense shape.
     """
     cam_idx: Any
@@ -229,7 +224,7 @@ class BAReport:
     per-iteration (LM) or per-stage (robust) dicts; ``per_camera``: ``{name: {...}}`` with
     observation counts and before/after median/p90 errors; ``excluded``: masks that were applied
     to the *fit* (reports always use all observations); ``gauge``: rig scale before/after and
-    their ratio, fixed cameras, scale constraint; ``time_offsets`` (F3); ``stations`` (F5).
+    their ratio, fixed cameras, scale constraint; ``stations`` (F5).
     """
     method: str = 'lm'
     error: float = float('nan')
@@ -244,7 +239,6 @@ class BAReport:
     excluded: Dict[str, Any] = field(default_factory=dict)
     gauge: Dict[str, Any] = field(default_factory=dict)
     frozen_cameras: List[str] = field(default_factory=list)
-    time_offsets: Optional[Dict[str, float]] = None
     stations: Optional[Dict[str, Any]] = None
     reverted: bool = False
     seed: Any = None
@@ -330,7 +324,7 @@ def _rob(e2, loss, f):
 
 
 def _project_local(L, Xw, k10, off, is_kb, has_b, has_k):
-    """Per-observation projection. L [M,20] local camera vectors, Xw [M,3] world points."""
+    """Per-observation projection. L [M,19] local camera vectors, Xw [M,3] world points."""
     R = G.rodrigues(L[:, 0:3])
     pc = torch.einsum('mij,mj->mi', R, Xw) + L[:, 3:6]
     z = pc[:, 2]
@@ -413,7 +407,7 @@ def _dist_coef_jac(x, y, d, is_kb, has_b, has_k):
 
 
 def _project_local_jac(L, Xw, k10, off, is_kb, has_b, has_k):
-    """Projection and analytic Jacobians: uv [M,2], z [M], dL [M,2,20] (slot 19 = 0), dX [M,2,3]."""
+    """Projection and analytic Jacobians: uv [M,2], z [M], dL [M,2,19], dX [M,2,3]."""
     R, Jr = _rot_and_jac(L[:, 0:3])
     pc = torch.einsum('mij,mj->mi', R, Xw) + L[:, 3:6]
     z = pc[:, 2]
@@ -485,39 +479,6 @@ def _share_groups(cgroup, share):
     return groups, groups
 
 
-def _velocities(obs, X, st_valid):
-    """Per-point velocity [N,3] from tracks (group 'track' > 'keypoint' > one track) and times."""
-    N = X.shape[0]
-    t_pt = np.full(N, np.nan)
-    # point time: mean of its observation times
-    cnt = np.bincount(obs.point_idx, minlength=N)
-    tsum = np.bincount(obs.point_idx, weights=obs.time, minlength=N)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        t_pt = tsum / cnt
-    track = np.zeros(N, dtype=np.int64)
-    if obs.group is not None:
-        key = 'track' if 'track' in obs.group else ('keypoint' if 'keypoint' in obs.group else None)
-        if key is not None:
-            track[obs.point_idx] = obs.group[key]
-    Xn = X.detach().cpu().numpy()
-    V = np.zeros((N, 3))
-    ok = np.isfinite(t_pt) & np.isfinite(Xn).all(1)
-    for tr in np.unique(track[ok]):
-        idx = np.nonzero(ok & (track == tr))[0]
-        if len(idx) < 2:
-            continue
-        idx = idx[np.argsort(t_pt[idx], kind='stable')]
-        tt, xx = t_pt[idx], Xn[idx]
-        g = np.zeros_like(xx)
-        # central differences where possible
-        for i in range(len(idx)):
-            lo, hi = max(i - 1, 0), min(i + 1, len(idx) - 1)
-            if tt[hi] > tt[lo]:
-                g[i] = (xx[hi] - xx[lo]) / (tt[hi] - tt[lo])
-        V[idx] = g
-    return torch.as_tensor(V, dtype=X.dtype, device=X.device)
-
-
 class _Problem:
     """Parameter tables, state and per-observation data of one LM problem."""
 
@@ -568,7 +529,6 @@ class _Problem:
         intr[:, 4] = P.K[:, 0, 1]
         intr[:, 5:13] = P.dist
         self.intr = intr
-        self.delta = torch.zeros(C, dtype=dtype, device=device)
         self.k10 = P.K[:, 1, 0].clone()
         self.off = P.offset.clone()
         self.is_kb = (P.model == 1)
@@ -629,8 +589,8 @@ class _Problem:
         for s in range(S):
             if self.ext_free[s]:
                 idx_ext[s] = np.arange(n, n + 6); n += 6
-        idx_cam = -np.ones((C, 14), np.int64)
-        coef_cam = np.zeros((C, 14))
+        idx_cam = -np.ones((C, 13), np.int64)
+        coef_cam = np.zeros((C, 13))
         gk, gd = _share_groups(self.cgroup, spec.share)
         rep_k = list(range(C)); rep_d = list(range(C))
         for g in gk:
@@ -676,19 +636,9 @@ class _Problem:
                 idx_cam[c, 5 + j] = slot_of[key]; coef_cam[c, 5 + j] = 1.0
                 names.append(DIST_NAMES[self.models[c]][j])
             self.free_names[self.names[c]] = names
-        # time offsets
-        self.use_delta = spec.time_offset is not None
-        if self.use_delta:
-            if self.obs.time is None:
-                raise ValueError('ParamSpec(time_offset=...) needs Observations.time')
-            gauge_cams = set(int(self.station_cam[s]) for s in self.gauge_stations) or {0}
-            for c in range(C):
-                if c in gauge_cams or c in self.frozen_cams:
-                    continue
-                idx_cam[c, 13] = n; coef_cam[c, 13] = 1.0; n += 1
         self.NC = n
         self.idx_ext, self.idx_cam, self.coef_cam = idx_ext, idx_cam, coef_cam
-        idx_loc = np.concatenate([idx_ext, idx_cam[self.station_cam]], 1)          # [S,20]
+        idx_loc = np.concatenate([idx_ext, idx_cam[self.station_cam]], 1)          # [S,19]
         coef_loc = np.concatenate([np.ones((S, 6)), coef_cam[self.station_cam]], 1)
         active = np.nonzero((idx_loc >= 0).any(0))[0]
         self.active = torch.as_tensor(active, device=dev, dtype=torch.long)
@@ -738,19 +688,18 @@ class _Problem:
         return out
 
     # ------------------------------------------------------------------ state
-    def local(self, ext, intr, delta):
+    def local(self, ext, intr):
         cs = torch.as_tensor(self.station_cam, device=self.device)
-        return torch.cat([ext, intr[cs], delta[cs][:, None]], 1)       # [S,20]
+        return torch.cat([ext, intr[cs]], 1)       # [S,19]
 
-    def apply_step(self, ext, intr, delta, dth):
+    def apply_step(self, ext, intr, dth):
         dthp = torch.cat([dth, dth.new_zeros(1)])
         ie = torch.where(self.t_idx_ext >= 0, self.t_idx_ext, torch.full_like(self.t_idx_ext, self.NC))
         ext = ext + dthp[ie]
         ic = torch.where(self.t_idx_cam >= 0, self.t_idx_cam, torch.full_like(self.t_idx_cam, self.NC))
         dc = dthp[ic] * self.t_coef_cam
-        intr = intr + dc[:, :13]
-        delta = delta + dc[:, 13]
-        return ext, intr, delta
+        intr = intr + dc
+        return ext, intr
 
     def centers(self, ext):
         R = G.rodrigues(ext[:, :3])
@@ -762,24 +711,21 @@ class _Problem:
 class _Kind:
     """Observations of one structure type: free 3D points (D=3) or rigid point sets (D=6)."""
 
-    def __init__(self, name, D, sel, sidx, values, objp=None, vel=None):
+    def __init__(self, name, D, sel, sidx, values, objp=None):
         self.name, self.D = name, D
         self.sel = sel            # [m] indices into the problem's observations
         self.sidx = sidx          # [m] structure index
         self.values = values      # [Ns, D]
         self.objp = objp          # [m, 3] (rigid)
-        self.vel = vel            # [Ns, 3] (points with time offsets)
 
     @property
     def n(self):
         return self.values.shape[0]
 
-    def world(self, Sv, delta_o):
+    def world(self, Sv):
         if self.name == 'rigid':
             R = G.rodrigues(Sv[:, :3])
             return torch.einsum('mij,mj->mi', R, self.objp) + Sv[:, 3:6]
-        if self.vel is not None:
-            return Sv + delta_o[:, None] * self.vel[self.sidx]
         return Sv
 
 
@@ -787,7 +733,7 @@ def _kind_residual(prob, kind, Lst, Sv):
     st = prob.st_o[kind.sel]
     cam = prob.cam_o[kind.sel]
     Lo = Lst[st]
-    uvp, z = _project_local(Lo, kind.world(Sv[kind.sidx], Lo[:, _DELTA]), prob.k10[cam], prob.off[cam],
+    uvp, z = _project_local(Lo, kind.world(Sv[kind.sidx]), prob.k10[cam], prob.off[cam],
                             prob.is_kb[cam], prob.has_b, prob.has_k)
     return uvp - prob.uv[kind.sel], z
 
@@ -798,7 +744,7 @@ def _kind_linearize(prob, kind, Lst, Sv):
     cam = prob.cam_o[kind.sel]
     Lo = Lst[st]
     So = Sv[kind.sidx]
-    Xw = kind.world(So, Lo[:, _DELTA])
+    Xw = kind.world(So)
     uvp, z, dL, dX = _project_local_jac(Lo, Xw, prob.k10[cam], prob.off[cam], prob.is_kb[cam],
                                         prob.has_b, prob.has_k)
     r = uvp - prob.uv[kind.sel]
@@ -808,8 +754,6 @@ def _kind_linearize(prob, kind, Lst, Sv):
         Js = torch.cat([dX @ dw, dX], -1)                                           # [m,2,6]
     else:
         Js = dX
-        if kind.vel is not None:
-            dL[:, :, _DELTA] = (dX @ kind.vel[kind.sidx][..., None])[..., 0]
     Jc = dL[:, :, prob.active]
     return r, z, Jc, Js
 
@@ -835,7 +779,7 @@ def _bad_penalty(loss, f):
 
 def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=1e-7,
               scale_mode=None, scale_pair=None, solver='auto', max_elems=1 << 24, verbose=False):
-    """Schur-complement LM. Returns (ext, intr, delta, values list, history, converged)."""
+    """Schur-complement LM. Returns (ext, intr, values list, history, converged)."""
     dev, dt = prob.device, prob.dtype
     S, Q, NC = prob.S, prob.Q, prob.NC
     Pm2 = prob.Pm.reshape(S * Q, -1)
@@ -889,7 +833,7 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
         return ext, out
     prob.ext_fixed_ref = prob.ext.clone()
 
-    def prior_terms(ext, intr, delta):
+    def prior_terms(ext, intr):
         """(cost, H [NC,NC], g [NC]) of the priors in theta space."""
         H = torch.zeros(NC, NC, dtype=dt, device=dev)
         g = torch.zeros(NC, dtype=dt, device=dev)
@@ -906,15 +850,6 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             cost += float(r * r)
             H[i, i] += J * J
             g[i] += J * r
-        if prob.use_delta:
-            sig = float(sp.time_offset)
-            for c in range(prob.C):
-                i = int(prob.idx_cam[c, 13])
-                if i >= 0:
-                    r = delta[c] / sig
-                    cost += float(r * r)
-                    H[i, i] += 1.0 / sig ** 2
-                    g[i] += r / sig
         if pair_idx is not None and pair_idx[3] is not None:
             ia, ib, d0, sig = pair_idx
 
@@ -934,8 +869,8 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             g += Jt * r
         return cost, H, g
 
-    def total_cost(ext, intr, delta, values):
-        Lst = prob.local(ext, intr, delta)
+    def total_cost(ext, intr, values):
+        Lst = prob.local(ext, intr)
         cst = 0.0
         for k, v, cf in zip(kinds, values, conf_k):
             r, z = _kind_residual(prob, k, Lst, v)
@@ -943,15 +878,15 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             ok = (z > 0) & torch.isfinite(e2)
             rho = _rob(torch.where(ok, e2, torch.zeros_like(e2)), loss, f_scale)[0]
             cst += float((cf * torch.where(ok, rho, torch.full_like(rho, bad_pen))).sum())
-        return cst + prior_terms(ext, intr, delta)[0]
+        return cst + prior_terms(ext, intr)[0]
 
-    ext, intr, delta = prob.ext.clone(), prob.intr.clone(), prob.delta.clone()
+    ext, intr = prob.ext.clone(), prob.intr.clone()
     values = [k.values.clone() for k in kinds]
-    cost = total_cost(ext, intr, delta, values)
+    cost = total_cost(ext, intr, values)
     history = [dict(iter=0, cost=cost, lam=lam, accepted=True)]
     converged = False
     for it in range(n_iter):
-        Lst = prob.local(ext, intr, delta)
+        Lst = prob.local(ext, intr)
         U_loc = torch.zeros(S, Q, Q, dtype=dt, device=dev)
         g_loc = torch.zeros(S, Q, dtype=dt, device=dev)
         lin = []
@@ -972,7 +907,7 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             lin.append((Hcs, V, gs, st))
         Uth = torch.einsum('sqa,sqr,srb->ab', prob.Pm, U_loc, prob.Pm)[:NC, :NC]
         gth = torch.einsum('sqa,sq->a', prob.Pm, g_loc)[:NC]
-        pc, pH, pg = prior_terms(ext, intr, delta)
+        pc, pH, pg = prior_terms(ext, intr)
         Uth = Uth + pH
         gth = gth + pg
         dU = Uth.diagonal().clone()
@@ -1026,12 +961,12 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
                     y.index_add_(0, k.sidx, torch.einsum('mqd,mq->md', Hcs, dl[st]))
                 ds = -(Vinv @ (gs + y)[..., None])[..., 0]
                 new_values.append(v + ds)
-            ext_n, intr_n, delta_n = prob.apply_step(ext, intr, delta, dth)
+            ext_n, intr_n = prob.apply_step(ext, intr, dth)
             ext_n, new_values = renorm(ext_n, new_values)
-            new_cost = total_cost(ext_n, intr_n, delta_n, new_values)
+            new_cost = total_cost(ext_n, intr_n, new_values)
             if np.isfinite(new_cost) and new_cost < cost:
                 rel = (cost - new_cost) / max(abs(cost), 1e-300)
-                ext, intr, delta, values, cost = ext_n, intr_n, delta_n, new_values, new_cost
+                ext, intr, values, cost = ext_n, intr_n, new_values, new_cost
                 lam = max(lam / 3, 1e-9)
                 improved = True
                 break
@@ -1045,7 +980,7 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
         if rel < tol:
             converged = True
             break
-    return ext, intr, delta, values, history, converged
+    return ext, intr, values, history, converged
 
 
 def _pcg(prob, lin, kinds, Vinvs, Hc, b, Pm2, max_iter=500, rtol=1e-10):
@@ -1101,7 +1036,7 @@ def _resolve_spec(cgroup, spec, only_extrinsics=False):
     elif not isinstance(spec, ParamSpec):
         raise TypeError('spec must be a ParamSpec, got {}'.format(type(spec).__name__))
     if only_extrinsics:
-        spec = spec.replace(intrinsics=(), n_dist=0, time_offset=spec.time_offset)
+        spec = spec.replace(intrinsics=(), n_dist=0)
     return spec
 
 
@@ -1335,7 +1270,7 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
         bp = B[torch.as_tensor(bmap[set_idx[obs.point_idx[ro]]], device=device)]
         op = torch.as_tensor(objp[obs.point_idx[ro]], dtype=dtype, device=device)
         Xw[torch.as_tensor(ro, device=device)] = torch.einsum('mij,mj->mi', G.rodrigues(bp[:, :3]), op) + bp[:, 3:]
-    Lst0 = prob.local(prob.ext, prob.intr, prob.delta)
+    Lst0 = prob.local(prob.ext, prob.intr)
     uvp, z = _project_local(Lst0[prob.st_o], torch.nan_to_num(Xw), prob.k10[prob.cam_o], prob.off[prob.cam_o],
                             prob.is_kb[prob.cam_o], prob.has_b, prob.has_k)
     e0 = torch.linalg.norm(uvp - prob.uv, dim=-1)
@@ -1368,11 +1303,8 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
     sel_p = np.nonzero(ok & ~is_rigid_o)[0]
     if len(sel_p):
         upts, inv = np.unique(obs.point_idx[sel_p], return_inverse=True)
-        vel = None
-        if prob.use_delta:
-            vel = _velocities(obs, X_all, None)[torch.as_tensor(upts, device=device)]
         kinds.append(_Kind('point', 3, torch.as_tensor(sel_p, device=device), torch.as_tensor(inv, device=device),
-                           X_all[torch.as_tensor(upts, device=device)].clone(), vel=vel))
+                           X_all[torch.as_tensor(upts, device=device)].clone()))
         kinds[-1].ids = upts
     sel_r = np.nonzero(ok & is_rigid_o)[0]
     if len(sel_r):
@@ -1401,21 +1333,21 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
     scale_before = rig_scale_from_centers(centers0)
 
     # ---- errors before
-    def obs_errors(ext, intr, delta, values):
-        Lst = prob.local(ext, intr, delta)
+    def obs_errors(ext, intr, values):
+        Lst = prob.local(ext, intr)
         e = torch.full((len(obs),), float('nan'), dtype=dtype, device=device)
         for k, v in zip(kinds, values):
             r, z = _kind_residual(prob, k, Lst, v)
             ek = torch.linalg.norm(r, dim=-1)
             e[k.sel] = torch.where(z > 0, ek, torch.full_like(ek, float('inf')))
         return e.cpu().numpy()
-    e_before = obs_errors(prob.ext, prob.intr, prob.delta, [k.values for k in kinds])
+    e_before = obs_errors(prob.ext, prob.intr, [k.values for k in kinds])
 
     with torch.no_grad():
-        ext, intr, delta, values, hist, conv = _lm_solve(
+        ext, intr, values, hist, conv = _lm_solve(
             prob, kinds, loss=loss, f_scale=float(f_scale), n_iter=int(n_iter), lam=lam, tol=tol,
             scale_mode=scale_mode, scale_pair=scale_pair, solver=solver, verbose=verbose)
-        e_after = obs_errors(ext, intr, delta, values)
+        e_after = obs_errors(ext, intr, values)
 
     report.history = hist
     report.converged = bool(conv)
@@ -1436,8 +1368,6 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
                         scale_ratio=scale_after / scale_before if scale_before > 0 else float('nan'),
                         fixed_stations=[prob.station_names[s] for s in prob.fixed_stations],
                         scale_constraint=scale_mode or (list(scale_pair) if scale_pair else None))
-    if prob.use_delta:
-        report.time_offsets = {n: float(delta[c]) for c, n in enumerate(prob.names)}
     if obs.station is not None:
         report.stations = dict(names=prob.station_names, station_cam=prob.station_cam.tolist(),
                                rvec=ext[:, :3].cpu().numpy(), tvec=ext[:, 3:].cpu().numpy())

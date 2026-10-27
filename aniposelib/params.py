@@ -19,8 +19,7 @@ Two layers live here:
            priors={'cam_3': {'f': (1820, 0.05, 'log'), 'k1': (-0.14, 0.1)}},  # or IntrinsicsPrior(ref)
            fixed_cameras='auto',                 # gauge: extrinsics held fixed ('auto' = first camera)
            scale_constraint='auto',              # 'keep' | None | (camA, camB, dist, sigma) | 'auto'
-           skew='fixed', aspect='free',
-           time_offset=None)                     # F3: per-camera time offset prior sigma (None = off)
+           skew='fixed', aspect='free')
 
    Intrinsic names: ``'fx', 'fy', 'cx', 'cy', 'skew'`` (camera-matrix entries), ``'f'`` (one focal
    parameter moving fx and fy together at a fixed aspect ratio), and distortion names. For the
@@ -170,7 +169,6 @@ class ParamSpec:
     scale_constraint: Any = 'auto'
     skew: str = 'fixed'
     aspect: str = 'free'
-    time_offset: Optional[float] = None
 
     def __post_init__(self):
         if self.intrinsics is not None:
