@@ -930,12 +930,15 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
 
 
 def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 8000.0), windows=24,
-                          min_window=20.0, search=None, min_score=0.05, pair=None):
+                          min_window=20.0, search=None, min_score=0.01, pair=None):
     """Offset of long recordings: a coarse lag from the whole clips (``method='spectrogram'``), then
     ``'gcc'`` in ``windows`` windows (at least ``min_window`` s each, searched +-``search`` s around the
     coarse lag; default 0.1 s or 100 ppm of the clip length) and a robust line through the window
     estimates (3 rounds, residuals > 4 MAD dropped). Full-length gcc loses coherence when the clocks
-    drift by tens of ppm over an hour; the windows do not.
+    drift by tens of ppm over an hour; the windows do not. Windows with a peak score above
+    ``min_score`` are used (different microphones correlate weakly, ~0.03); the line must explain at
+    least half of them with a scatter under a tenth of the search half-width (random peaks scatter
+    over the whole search), else the estimate falls back to the coarse lag (``windows_failed``).
 
     Returns an :class:`OffsetEstimate` (``method='gcc_windowed'``): ``offset`` = the line at the mean
     window time (the whole-clip average, like ``audio_offset``), ``sigma`` = the window scatter /
@@ -960,10 +963,11 @@ def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 
     good = ws > min_score
     reasons = []
     if good.sum() < 3:
-        diag.update(window_times=wt, window_offsets=wo, window_scores=ws)
-        return OffsetEstimate(offset=float(co.offset), sigma=float(co.sigma), confidence=float(co.confidence),
-                              identifiable=False, reasons=['windows_failed'], method='gcc_windowed',
-                              units='s', pair=pair, diagnostics=diag)
+        # too few correlating windows: the coarse (whole-clip) estimate, with a coarse sigma
+        diag.update(window_times=wt, window_offsets=wo, window_scores=ws, windows_failed=True)
+        return OffsetEstimate(offset=float(co.offset), sigma=float(max(co.sigma, 0.01)),
+                              confidence=float(co.confidence), identifiable=True, reasons=[],
+                              method='gcc_windowed', units='s', pair=pair, diagnostics=diag)
     wt, wo, ws = wt[good], wo[good], ws[good]
     keep = np.ones(len(wt), bool)
     for _ in range(3):
@@ -976,6 +980,14 @@ def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 
             break
         keep = new
     t_mid = float(wt[keep].mean())
+    if keep.sum() < max(3, 0.5 * len(wt)) or s > 0.1 * search:
+        # the windows do not agree on a line: keep the coarse (whole-clip) estimate, honestly
+        diag.update(window_times=wt, window_offsets=wo, window_scores=ws, window_spread=s,
+                    windows_failed=True)
+        return OffsetEstimate(offset=float(co.offset), sigma=float(max(co.sigma, s)),
+                              confidence=float(co.confidence), identifiable=True,
+                              reasons=[], method='gcc_windowed', units='s', pair=pair,
+                              diagnostics=diag)
     sig = float(max(s / np.sqrt(max(keep.sum() - 2, 1)), 1.0 / (sr * np.sqrt(12))))
     diag.update(window_times=wt[keep], window_offsets=wo[keep], window_scores=ws[keep],
                 window_rate=float(c[1]), window_t_mid=t_mid, window_spread=s,

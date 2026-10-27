@@ -1507,6 +1507,8 @@ def _timemap_parts(tm):
 
 
 def _windows_of(est):
+    if est.diagnostics.get('windows_failed'):
+        return None
     wt, wo = est.diagnostics.get('window_times'), est.diagnostics.get('window_offsets')
     if wt is None or wo is None or len(wo) < 3:
         return None
