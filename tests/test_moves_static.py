@@ -203,3 +203,25 @@ def test_w4_camera_lost_from_the_start_is_placed_per_window(lost_camera):
     assert abs(cp['time'] - tb) <= 4.0 + 1e-9 and abs(cp['step_deg'] - np.linalg.norm([3.0, -4.5, 2.0])) < 0.15
     assert ev.moves.stations.lookup_name(name, [1.0])[0] == name
     assert np.isfinite(ev.points[cb, t < tb - 4]).mean() > 0.9
+
+
+def test_w4_translated_camera_station_has_the_translation():
+    """A camera shifted (no rotation): detect_moves sees it as a rotation step of the right camera,
+    recovery re-places it with the translation (PnP) in the station pose."""
+    rig = synth.load_rig('motobs_7cam')
+    t = np.arange(0, 40, 1 / 15.0)
+    fn = synth.smooth_tracks(rig, n_points=10, amp=0.1, seed=1)
+    X = np.stack([fn(k, t) for k in range(10)], 1)
+    s = synth.rig_scale(rig)
+    rb = _bumped(rig, 3, [0, 0, 0], shift=[0.05 * s, 0, 0])
+    p2 = synth.project(rig, X)
+    p2[3, t >= 20] = synth.project(rb, X)[3, t >= 20]
+    p2 = synth.add_noise(p2, 0.5, seed=2)
+    ev = W.evaluate_calibration(rig, p2, times=t)
+    name = rig.get_names()[3]
+    assert ev.moves.moved == [name]
+    (r,) = ev.report['recovered_moves'][name]
+    assert r['status'] == 'recovered' and r['translation'] and r['step_deg'] < 0.05
+    sn = ev.moves.stations.lookup_name(name, [30.0])[0]
+    E = ev.moves.corrected_extrinsics(rig)[name][sn]
+    np.testing.assert_allclose(E[:3, 3], synth.to_np(rb.cameras[3].get_extrinsics_mat())[:3, 3], atol=0.003 * s)
