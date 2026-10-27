@@ -2079,7 +2079,8 @@ W4_DEFAULTS = dict(
     thresholds_px=None,       # LOO agreement thresholds (default (5, 8, 10) noise units)
     loo_window_s='auto',      # time-blocked LOO with times=: window (s); 'auto' ~ 20 windows; None = off
     min_window_obs=50,        # ... windows with fewer eligible observations are not judged
-    bad_window_ratio=0.5,     # ... a window is bad when its LOO agreement < this x the median window
+    bad_window_ratio=0.5,     # ... a camera is bad in a window when its LOO coverage / agreement < this x its median
+    min_bad_cameras=None,     # ... a window is bad when this many cameras are (None: max(2, 25 % of the cameras))
     compare_to=None,          # {name: CameraGroup}: paired LOO agreement vs other calibrations
     clusters=None,            # [N] bootstrap cluster per point (default: the LOO windows / 100 frame blocks)
     n_boot=1000,              # bootstrap resamples of the paired comparison
@@ -2206,9 +2207,10 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
-    - ``bad_windows_frac``: share of time windows in which some camera's LOO coverage, or its LOO
-      agreement among the supported points, is below ``bad_window_ratio`` x that camera's median
-      window (desync / broken data; warn above 5 %);
+    - ``bad_windows_frac``: share of time windows in which at least ``min_bad_cameras`` (default
+      max(2, 25 % of the cameras)) cameras have a LOO coverage, or a LOO agreement among the
+      supported points, below ``bad_window_ratio`` x their median window (desync / broken data;
+      warn above 5 %);
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
       warn 1 % (warn only: a reference is often rougher than the calibration under test);
     - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
@@ -2344,6 +2346,10 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         with np.errstate(invalid='ignore'):
             badcw = judged & ((cv < r_ * cov_med[:, None]) | (jag & (ag < r_ * cam_med[:, None])))
         okw = judged.any(0) & (den.sum(0) >= opts['min_window_obs'])
+        # a window-wide problem (desync, broken data) hits several cameras; one camera dipping in
+        # one window is not reported (it shows up in its per-camera LOO)
+        min_bad = opts['min_bad_cameras'] or max(2, int(np.ceil(0.25 * C)))
+        settings['min_bad_cameras'] = min_bad
         for k, lab in enumerate(labs):
             key = '{:.6g}'.format(t0 + int(lab) * ws)
             gd = qr.per_group.get(str(lab), {})
@@ -2357,7 +2363,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                                     coverage=None if not np.isfinite(cv[c, k]) else float(cv[c, k]))
                             for c, n in enumerate(names)},
                 bad_cameras=[n for c, n in enumerate(names) if badcw[c, k]], judged=bool(okw[k]))
-            per_window[key]['bad'] = bool(okw[k] and badcw[:, k].any())
+            per_window[key]['bad'] = bool(okw[k] and badcw[:, k].sum() >= min_bad)
         if okw.sum() >= 3:
             bad_windows = [k for k, v in per_window.items() if v['bad']]
             bad_frac = len(bad_windows) / int(okw.sum())
@@ -2430,8 +2436,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         Rule('center_residual_frac', center_frac, 0.01, None, 'aligned centre residual vs reference / rig scale'),
         Rule('board_shape_rel', shape_rel, 0.005, 0.02, 'board shape residual / object size'),
         Rule('bad_windows_frac', bad_frac, 0.05, None,
-             'time windows where a camera\'s LOO coverage or agreement is < {} x its median window: {}'.format(
-                 opts['bad_window_ratio'], bad_windows[:10]) if bad_windows else ''),
+             'time windows where >= {} cameras\' LOO coverage or agreement is < {} x their median window: {}'.format(
+                 min_bad, opts['bad_window_ratio'], bad_windows[:10]) if bad_windows else ''),
     ]
     if missing:
         rules.append(Rule('cameras_missing', len(missing), 0, None, 'group cameras without points: {}'.format(missing)))
