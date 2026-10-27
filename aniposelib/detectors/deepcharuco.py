@@ -571,6 +571,14 @@ class DeepCharucoDetector:
         d[d == 0] = np.inf
         win = int(np.clip(np.min(d) / 3.0, 2, 11))
         crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-        pts = np.ascontiguousarray(xy, dtype=np.float32).reshape(-1, 1, 2)
+        h, w = gray.shape[:2]
+        # cornerSubPix asserts the point is inside the image (corners in the padding can decode
+        # just outside it): those keep the RefineNet position
+        inside = (xy[:, 0] >= 0) & (xy[:, 0] <= w - 1) & (xy[:, 1] >= 0) & (xy[:, 1] <= h - 1)
+        if not inside.any():
+            return xy
+        pts = np.ascontiguousarray(xy[inside], dtype=np.float32).reshape(-1, 1, 2)
         pts = cv2.cornerSubPix(gray, pts, (win, win), (-1, -1), crit)
-        return pts.reshape(-1, 2).astype(np.float64)
+        out = np.array(xy, dtype=np.float64)
+        out[inside] = pts.reshape(-1, 2)
+        return out

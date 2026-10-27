@@ -287,7 +287,8 @@ def _n_workers(n):
     return max(1, int(n))
 
 
-def _detect_videos(videos, board, det, opts, names, *, max_boards=None, max_frames=None, min_cameras=2):
+def _detect_videos(videos, board, det, opts, names, *, max_boards=None, max_frames=None, min_cameras=2,
+                   subpix=False):
     """W1 / W3 board detection in videos: ``videos`` one list of paths per camera (video j of
     every camera = one synchronised segment). Frame-major sequential sampling
     (:func:`aniposelib.boards.detect_videos`): every ``skip``-th frame, or ``n_frames`` evenly
@@ -302,6 +303,11 @@ def _detect_videos(videos, board, det, opts, names, *, max_boards=None, max_fram
         # input scale from the frame size unless given (scale 1 misses most boards in >= 1080p)
         dkw = dict(getattr(board, 'detector_kwargs', None) or {}) if dkw is None else dict(dkw)
         dkw.setdefault('scale', 'auto')
+        if subpix:
+            # W3: cv2.cornerSubPix on the full-resolution frame (at scale 'auto' RefineNet works on
+            # the downscaled frame: 1/4 px steps at 1440x1080); motobs scale 0.27 -> 0.17 % off the
+            # reference. W1 keeps the RefineNet corners (its rig moved further from the reference).
+            dkw.setdefault('subpix', True)
     b = board if det is None else _board_with_detector(board, det, dkw)
     nw = _n_workers(opts.get('n_workers'))
     fi = opts.get('frame_indices')
@@ -2012,7 +2018,9 @@ def _board_rows_from_videos(cgroup, videos, board, opts):
     """``{camera name: video | [videos]}`` -> per-camera rows (W1's frame-major detection: the
     same frames in every camera, the videos are assumed synchronised). ``options['n_frames']``:
     that many evenly spaced frames of the shortest video, else every ``skip``-th frame; reading
-    stops once ``max_frames`` sampled frames show the board in at least two cameras."""
+    stops once ``max_frames`` sampled frames show the board in at least two cameras. DeepCharuco
+    corners are refined with ``cv2.cornerSubPix`` on the full-resolution frame
+    (``options['detector_kwargs'] = {'subpix': False}`` = the RefineNet corners)."""
     names = cgroup.get_names()
     unknown = [k for k in videos if str(k) not in names]
     if unknown:
@@ -2022,7 +2030,8 @@ def _board_rows_from_videos(cgroup, videos, board, opts):
         v = videos.get(n, [])
         per.append([v] if isinstance(v, (str, os.PathLike)) else list(v))
     det = _resolve_detector(board, opts['detector'])
-    rows, summary = _detect_videos(per, board, det, opts, names, max_frames=opts['max_frames'], min_cameras=2)
+    rows, summary = _detect_videos(per, board, det, opts, names, max_frames=opts['max_frames'], min_cameras=2,
+                                   subpix=True)
     idx = [s.get('frame_indices') for s in summary['segments']]
     summary.update(detector=det if isinstance(det, (str, type(None))) else type(det).__name__,
                    n_videos=sum(len(v) for v in per), frame_indices=idx[0] if len(idx) == 1 else idx)
@@ -2040,7 +2049,9 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
       | [videos]}``, detected as in W1: synchronised videos read front to back together, every
       ``options['skip']``-th frame (20) or ``options['n_frames']`` evenly spaced frames (the same
       indices in every camera), stopping once ``options['max_frames']`` (200; None = no limit)
-      frames show the board in at least two cameras; ``report['detection']`` says what was read;
+      frames show the board in at least two cameras; DeepCharuco corners refined with
+      ``cv2.cornerSubPix`` on the full-resolution frame, ``detector_kwargs={'subpix': False}`` = off;
+      ``report['detection']`` says what was read;
       also ``object=`` + ``object_points=`` for a
       :class:`~aniposelib.boards.PointObject`): ``scale.from_board`` (corner pairs more than two squares
       apart; ``options={'board_kwargs': {'min_pair_dist': None}}`` = every pair, the 1.1 pre-release);

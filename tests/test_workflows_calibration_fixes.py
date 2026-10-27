@@ -128,14 +128,36 @@ def test_w3_board_points_from_videos(monkeypatch, tmp_path):
     det = res.report['detection']
     assert det['sampling'] == 'sequential' and det['frame_indices'] == seen['frame_indices']
     estimate_scale(true, board=board, board_points=vids, options={'detector': 'deepcharuco'})
-    assert seen['name'] == 'deepcharuco' and seen['kwargs'] == {'scale': 'auto'}     # frame-size input scale
+    assert seen['name'] == 'deepcharuco' and seen['kwargs'] == {'scale': 'auto', 'subpix': True}     # frame-size input scale, cornerSubPix
     estimate_scale(true, board=board, board_points=vids,
                    options={'detector': 'deepcharuco', 'detector_kwargs': {'scale': 0.3}})
-    assert seen['kwargs'] == {'scale': 0.3}
+    assert seen['kwargs'] == {'scale': 0.3, 'subpix': True}
+    estimate_scale(true, board=board, board_points=vids,
+                   options={'detector': 'deepcharuco', 'detector_kwargs': {'subpix': False}})
+    assert seen['kwargs'] == {'scale': 'auto', 'subpix': False}                     # the old behaviour
+    names = true.get_names()                                                         # W1 path: no cornerSubPix
+    WC._detect_videos([[vids[n]] for n in names], board, 'deepcharuco', dict(WC.W3_DEFAULTS), names)
+    assert seen['kwargs'] == {'scale': 'auto'}
     with pytest.raises(ValueError):
         estimate_scale(true, board=board, board_points={'nope': 'x.mp4'})
     with pytest.raises(FileNotFoundError):
         estimate_scale(true, board=board, board_points={true.get_names()[0]: str(tmp_path / 'missing.mp4')})
+
+
+def test_deepcharuco_subpix_keeps_corners_outside_the_image():
+    """cornerSubPix asserts its points are inside the image; DeepCharuco corners decoded in the
+    padding (just outside) keep their RefineNet position instead of raising."""
+    import cv2
+    from aniposelib.detectors.deepcharuco import DeepCharucoDetector
+    img = np.full((60, 80), 255, np.uint8)
+    img[:30, :40] = 0
+    img[30:, 40:] = 0                                       # one checker saddle at (39.5, 29.5)
+    img = cv2.GaussianBlur(img, (0, 0), 1.0)
+    det = DeepCharucoDetector.__new__(DeepCharucoDetector)
+    xy = np.array([[38.0, 31.0], [-0.6, 10.0], [20.0, 60.4]])
+    out = det._subpix(img, xy)
+    assert np.allclose(out[1:], xy[1:])
+    assert np.linalg.norm(out[0] - [39.5, 29.5]) < 0.3
 
 
 def test_w3_board_short_pairs_dropped_by_default():
