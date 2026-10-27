@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aniposelib-pytorch"
-version = "1.0.0"
+version = "1.1.0"
 description = "PyTorch/GPU camera calibration and triangulation library for Anipose (torch fork of aniposelib; imports as `aniposelib`)"
 readme = "README.md"
 authors = [

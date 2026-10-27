@@ -33,25 +33,45 @@ Do not `pip install aniposelib==0.8.x` into an environment with aniposelib-pytor
 the package files. Classic aniposelib is still available with `pip install aniposelib` in a
 separate environment.
 
-## 1.0 API overview
+## Quick start: the seven workflows
+
+Each workflow is one function, re-exported at the top level. Each returns a result with `.verdict` (`'ok'` |
+`'warn'` | `'fail'`), `.reasons`, `.report`, `.settings` (every derived threshold), `.summary()` and `.to_json()`.
+Thresholds come from the measured pixel noise and the rig scale, so the defaults work at any unit scale without
+tuning. A bad result is a `'fail'` with reasons, not an exception. Full guide: [docs/workflows.md](docs/workflows.md).
+
+```python
+import aniposelib as al
+
+board = al.CharucoBoard(7, 5, square_length=25, marker_length=18.75, units='mm')
+
+cgroup, res = al.calibrate_from_board(videos, board, out='calibration.toml')         # W1 board (or al.PointObject)
+cgroup, res = al.calibrate_from_points(p2d, intrinsics=lab_cgroup)                  # W2 from keypoints / people
+res = al.estimate_scale(cgroup, board=board, board_points=rows)                     # W3 metric scale, world frame
+res = al.evaluate_calibration(cgroup, p2d, times=t, reference=old_cgroup)           # W4 QA, reuse, moved cameras
+res = al.estimate_offsets({'cam1': 'cam1.mp4', 'cam2': 'cam2.mov'}, cgroup=cgroup)  # W5 unsynchronised cameras
+res = al.reconstruct_3d(cgroup, p2d, scores=scores, bones=[(0, 1), (1, 2)])          # W6 2D -> 3D
+res = al.associate_views(cgroup, detections)                                        # W7 several animals / people
+print(res.summary())
+```
 
 Optional extras: `[deepcharuco]` (learned ChArUco detector: `huggingface_hub`, `onnxruntime`, `onnx`), `[vggt]`
 (VGGT initialisation: `vggt`, `huggingface_hub`), `[sync]` (audio decoding: `soundfile`, `av`; an `ffmpeg` executable
-also works), `[io]` (`pyyaml`, for hand-written tracktail `metadata.yaml`), `[all]`. `import aniposelib` imports none
-of them; sub-modules (`aniposelib.quality`, `.scale`, `.sync`, `.init`, ...) load on first access.
+also works), `[all]`. `import aniposelib` imports none of them; sub-modules (`aniposelib.quality`, `.scale`, `.sync`,
+`.init`, ...) load on first access.
 
 **Types.** Points are `C x N x 2` (or `C x N x J x 2`) in camera order, NaN = missing; 3D points are `N x 3`.
 Public methods accept numpy or torch: **numpy in gives numpy out, torch in gives detached torch out** (on the
 input's device), and `return_grad=True` keeps the autograd graph. Computation is float64 torch, on the cameras'
-device (`cgroup.to('cuda')`). Result objects are dataclasses with `to_dict()`.
+device (`cgroup.to('cuda')`).
 
-### Board calibration
+## Advanced: the backend
+
+The workflows only compose these; use them directly when you need finer control.
+
+### Board calibration (anipose CLI API)
 ```python
-import aniposelib
 from aniposelib import CameraGroup, CharucoBoard
-
-board = CharucoBoard(7, 5, square_length=25, marker_length=18.75, marker_bits=4, dict_size=50, units='mm')
-# board = CharucoBoard(..., detector='deepcharuco')   # learned detector, [deepcharuco] extra
 cgroup = CameraGroup.from_names(['A', 'B', 'C'], fisheye=False)
 error, rows = cgroup.calibrate_videos([['A.mp4'], ['B.mp4'], ['C.mp4']], board)   # LM bundle adjustment
 cgroup.dump('calibration.toml')
@@ -61,48 +81,37 @@ cgroup = CameraGroup.load('calibration.toml')     # numeric camera order: cam_2 
 ### Triangulation
 ```python
 p3d = cgroup.triangulate(p2d)                       # p2d [C,N,2] -> [N,3], linear block DLT
-res = cgroup.triangulate_robust(p2d, tau=10)        # MSAC: res.p3d, res.inliers, res.errors, res.n_inliers
+res = cgroup.triangulate_robust(p2d, tau=10, scores=scores)   # MSAC: res.p3d, res.inliers, res.errors
 err = cgroup.reprojection_error(p3d, p2d)           # [C,N,2]
-p3d = cgroup.optim_points(p2d_joints, p3d_joints)   # smoothed / constrained refinement
+p3d = cgroup.optim_points(p2d_joints, p3d_joints)   # smoothed / bone-constrained refinement (unit-free)
 ```
 
-### Keypoint self-calibration (no board)
+### Bundle adjustment, quality, scale, gauge
 ```python
-from aniposelib.init import calibrate_from_points
-cgroup, rep = calibrate_from_points(p2d, intrinsics=intrinsics_group)   # [C,N,2] or [C,N,J,2]
-# candidates (reference / SfM / VGGT with frames=...), selection, bundle_adjust_robust, quality report
-print(rep.init, rep.quality.table())
 cgroup.bundle_adjust_robust(p2d)                    # robust LM BA -> BAReport (resection, rejection)
-```
-
-### Quality, scale, gauge
-```python
-rep = cgroup.report(p2d)                # per-camera + leave-one-camera-out reprojection (CalibrationReport)
-rep.passes(), rep.failures(), rep.to_json('qa.json')
+rep = cgroup.report(p2d)                            # per-camera + leave-one-camera-out reprojection
 from aniposelib import scale
 s, res = scale.from_board(cgroup, rows, board)      # or scale.from_lengths / scale.from_reference
-res.apply(cgroup)                                   # rescales, writes metadata['units'] / provenance
 cgroup.align_to(reference_group)                    # trimmed similarity onto another calibration
 cgroup.align_world(ground_points, up='z')           # floor -> z = 0
-cgroup.anchor_to('A')                               # camera A is the world frame
 ```
 
 ### Synchronisation and moving cameras
 ```python
 from aniposelib import sync
-est = sync.audio_offset(audio_a, audio_b, sr)       # est.offset (s), est.sigma, est.identifiable, est.reasons
+est = sync.audio_offset(audio_a, audio_b, sr)       # est.offset (s), est.sigma, est.identifiable
 graph = sync.solve_offset_graph(edges)              # per-stream offsets from pairwise estimates
 from aniposelib.stba import SpatiotemporalBA         # sub-frame offsets, clock rate, rolling shutter
 moves = aniposelib.quality.detect_moves(cgroup, p2d, times)   # bumped cameras -> Stations
-cgroup.stations = moves.stations                     # saved in the TOML ([metadata.stations])
 ```
 
-Other modules: `aniposelib.io` (MATLAB, OpenCV YAML, DLT/P matrices, tracktail `metadata.yaml`, JSON rigs),
-`aniposelib.matching` (cross-camera tracklet / multi-animal association), `aniposelib.intrinsics` (model ladder),
-`aniposelib.params.ParamSpec` (which parameters BA may change, priors, sharing), `aniposelib.geometry` /
-`aniposelib.triangulation` (batched kernels on `PackedCameras`).
+Other modules: `aniposelib.init` (board graph, keypoint SfM, VGGT, candidate selection),
+`aniposelib.matching` (cross-camera association), `aniposelib.intrinsics` (lens-model ladder),
+`aniposelib.params.ParamSpec` (which parameters BA may change, priors, sharing), `aniposelib.geometry`
+(batched camera kernels on `PackedCameras`, plus `camera_from_extrinsics_mat`, `reindex_points`, projection-matrix /
+DLT conversion), `aniposelib.triangulation`, `aniposelib.affine`.
 
-**Upgrading from 0.9:** 1.0 changes several defaults (numpy-out returns, LM bundle adjustment with a fixed gauge
+**Upgrading:** 1.1 removes the file-format importers (`aniposelib.io`) and a few project-specific helpers (see CHANGELOG, "Removed in 1.1"). 1.0 changes several defaults (numpy-out returns, LM bundle adjustment with a fixed gauge
 instead of Adam, numeric camera order on load, linear triangulation, full-K projection). Every change and how to get
 the old behaviour is in [CHANGELOG.md](CHANGELOG.md).
 

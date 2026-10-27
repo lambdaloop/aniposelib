@@ -1,18 +1,57 @@
 # Changelog (aniposelib-pytorch)
 
-## Unreleased
+## 1.1.0 (unreleased)
 
-- **Workflows W5-W7** (`aniposelib.workflows`, plan 05): `estimate_offsets` (audio gcc with spectrogram/onset cross-checks, motion, epipolar; offset graph, drift, optional STBA refinement; returns time maps, applies nothing), `reconstruct_3d` (noise-derived MSAC tau, soft score weights, optional bones/smoothing through `optim_points` with chunking, `fill='interior'` never extrapolates) and `associate_views` (tracklets or per-frame association, dense `C x F x P x J x 2` output; gates from the noise floor and image diagonal), with `OffsetEstimation`, `Reconstruction` and `Association` results.
-- `optim_points(normalize=True)`: joints that are never triangulated start at the scene centre instead of the world origin.
-- **`triangulation.triangulate_robust` / `triangulate_possible` do the lens-fold / ray-consistency check** (`check_invertible=True`, plan 04 decision 24), formerly only in the `CameraGroup` wrappers; function and method now agree. Results are unchanged where no lens folds; for strongly barrel-distorted lenses the function results change like the method's did in 1.0. `check_invertible=False` restores the 1.0 function behaviour.
-- `triangulate_robust(scores=...)`: confidences as soft weights (clipped to [0, 1]) in the MSAC hypothesis cost, the inlier refit and the Gauss-Newton refinement (and the IRLS / reject fits). New keyword; no default change.
-- **`optim_points(normalize=True)` default (plan 04 decision 24, plan 05 §6.3).** The optimisation runs in pixel-equivalent units (points parametrised as `center + u * q`, `u` = median z/f at the points), so its result no longer depends on the rig's units (mm vs m vs km give the same answer; before, the Adam step `max_lr` and the bone/smoothness weights were in world units). Bone targets are fixed at a robust per-bone median (frames where both joints are triangulated) instead of free parameters clipped across bones, and the bone term is a squared pixel-equivalent residual (`10 * scale_length`), so bone constraints now tighten bone lengths within a short budget (the 1.0 target `test_optim_points_tightens_bones` passes). Smoothness is `0.01 * scale_smooth / mean|diff|` on pixel-equivalent differences (a light default). `normalize=False` restores the 1.0 loss and parametrisation exactly.
+Plans 04 (scope trim, one LM core) and 05 (one entry point per workflow). Upgrade notes: everything under
+**Removed** is gone without a deprecation cycle (verbatim copies for downstream projects are kept outside the
+package); everything under **Changed** says how to get the 1.0 behaviour.
+
+### Workflows (new)
+
+Seven entry points, re-exported at the top level, documented in [docs/workflows.md](docs/workflows.md). Each
+returns a result with a noise-relative verdict (`'ok' | 'warn' | 'fail'`), reasons, every derived threshold in
+`.settings`, `.to_json()` and `.summary()`; `out=` saves the calibration TOML / arrays plus a report JSON.
+
 - **Calibration workflows (1.1, plan 05 W1-W4):** `aniposelib.calibrate_from_board` (boards and the new
   `boards.PointObject`: known-3D-points objects, moving wands with per-view DLT intrinsics or static landmarks that
   define the world frame), `calibrate_from_points`, `estimate_scale`, `evaluate_calibration`. Results carry a
   noise-relative verdict (`'ok' | 'warn' | 'fail'`) with reasons and every derived threshold in `.settings`;
   calibrations unpack as `cgroup, result = ...`. A disconnected board graph is a `'fail'` with per-component groups;
   `bridge_points=` solves one 6-DoF pose per extra component.
+- **Workflows W5-W7** (`aniposelib.workflows`, plan 05): `estimate_offsets` (audio gcc with spectrogram/onset cross-checks, motion, epipolar; offset graph, drift, optional STBA refinement; returns time maps, applies nothing), `reconstruct_3d` (noise-derived MSAC tau, soft score weights, optional bones/smoothing through `optim_points` with chunking, `fill='interior'` never extrapolates) and `associate_views` (tracklets or per-frame association, dense `C x F x P x J x 2` output; gates from the noise floor and image diagonal), with `OffsetEstimation`, `Reconstruction` and `Association` results.
+- `aniposelib.workflows._common`: `Rule` / `evaluate_rules` (declarative verdicts, overridable with
+  `options={'verdict': {rule: (warn_at, fail_at) | None}}`), `noise_floor`, `WorkflowResult`.
+
+### Removed
+
+- **`aniposelib.io`.** The file formats are gone: MATLAB (`from/to_matlab`), OpenCV YAML
+  (`read/write/from/to_opencv_yaml`), tracktail `metadata.yaml` (`read/from/to_metadata_yaml`) and the disco JSON rig
+  (`to/from_json_rig`), with the `[io]` extra (pyyaml). The geometry helpers moved to `aniposelib.geometry`:
+  `camera_from_extrinsics_mat`, `reindex_points`, `decompose_projection`, `from/to_projection_matrix`, `from/to_dlt`
+  (`Camera.from_extrinsics_mat` still works).
+- `quality.paired_bootstrap`, `quality.temporal_split`, `quality.assess_reuse` (and their result classes):
+  project statistics / policy, back to Emory and EvoVision.
+- `cameras.triangulate_simple`, `cameras.triangulate_simple_batch`; `triangulate(method='svd')` stays.
+- **The per-camera slow path.** Groups the packed kernels cannot represent (custom `Camera` subclasses that override
+  projection, pinhole cameras with > 8 distortion coefficients) now raise `NotImplementedError` in `project`,
+  `undistort_points`, `triangulate*` instead of falling back to a per-camera loop.
+- **Manual board verification:** the `manually_verify` argument of `Checkerboard` / `CharucoBoard` and
+  `manually_verify_board_detection` (the `cv2.imshow` popup). Passing `manually_verify=` is now a `TypeError`.
+- **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
+  (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
+  (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite
+  differences). Stations (`stations=`) stay in `bundle_adjust_lm`.
+
+### Changed
+
+- **One LM core (1.1, plan 04 §3):** a shared Levenberg-Marquardt engine (`aniposelib._lm`: IRLS losses, Marquardt
+  damping with acceptance on the true cost, Schur complement over generic point-like blocks, dense Cholesky or PCG
+  reduced solve). `bundle_adjust_lm` (cost histories unchanged to ~1e-11 relative), `stba.SpatiotemporalBA`
+  (unchanged to ~1e-12, about 2x faster; it now uses the bundle projection kernel), `init.sfm.refine_extrinsics`
+  (now `bundle_adjust_lm` on ideal pinhole cameras; observations behind a camera are pruned) and
+  `intrinsics.lm_board_adjust` (analytic instead of numeric Jacobians; ladder fits agree to ~1e-6 px, same
+  iteration counts) all run on it. `method='adam'` is unchanged.
+
 - **`utils.get_initial_extrinsics` / `CameraGroup.calibrate_rows` route through `init.board` (decision 22):**
   connected graphs give exactly the 1.0 result (same spanning tree and per-edge estimate, `tree='classic'`), plus a
   robust fallback for edges where the classic estimate raises or is non-finite (`method='classic'` disables it).
@@ -22,20 +61,12 @@
   Changes: the robust refinement uses the noise-normalised threshold schedule (coarse round relative to the image
   diagonal, then multiples of the noise floor; identical to the 1.0 schedule for 0.5 px noise), `rng=None` now means
   seed 0, and `report.scale` is a `workflows.ScaleEstimate` (`.details['align']` as before).
-- **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
-  (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
-  (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite
-  differences). Stations (`stations=`) stay in `bundle_adjust_lm`.
-- **One LM core (1.1, plan 04 §3):** a shared Levenberg-Marquardt engine (`aniposelib._lm`: IRLS losses, Marquardt
-  damping with acceptance on the true cost, Schur complement over generic point-like blocks, dense Cholesky or PCG
-  reduced solve). `bundle_adjust_lm` (cost histories unchanged to ~1e-11 relative), `stba.SpatiotemporalBA`
-  (unchanged to ~1e-12, about 2x faster; it now uses the bundle projection kernel), `init.sfm.refine_extrinsics`
-  (now `bundle_adjust_lm` on ideal pinhole cameras; observations behind a camera are pruned) and
-  `intrinsics.lm_board_adjust` (analytic instead of numeric Jacobians; ladder fits agree to ~1e-6 px, more
-  iterations to reach `tol`) all run on it. `method='adam'` is unchanged.
-
-- Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av, pyyaml); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
+- **`triangulation.triangulate_robust` / `triangulate_possible` do the lens-fold / ray-consistency check** (`check_invertible=True`, plan 04 decision 24), formerly only in the `CameraGroup` wrappers; function and method now agree. Results are unchanged where no lens folds; for strongly barrel-distorted lenses the function results change like the method's did in 1.0. `check_invertible=False` restores the 1.0 function behaviour.
+- `triangulate_robust(scores=...)`: confidences as soft weights (clipped to [0, 1]) in the MSAC hypothesis cost, the inlier refit and the Gauss-Newton refinement (and the IRLS / reject fits). New keyword; no default change.
+- **`optim_points(normalize=True)` default (plan 04 decision 24, plan 05 §6.3).** The optimisation runs in pixel-equivalent units (points parametrised as `center + u * q`, `u` = median z/f at the points), so its result no longer depends on the rig's units (mm vs m vs km give the same answer; before, the Adam step `max_lr` and the bone/smoothness weights were in world units). Bone targets are fixed at a robust per-bone median (frames where both joints are triangulated) instead of free parameters clipped across bones, and the bone term is a squared pixel-equivalent residual (`10 * scale_length`), so bone constraints now tighten bone lengths within a short budget (the 1.0 target `test_optim_points_tightens_bones` passes). Smoothness is `0.01 * scale_smooth / mean|diff|` on pixel-equivalent differences (a light default). `normalize=False` restores the 1.0 loss and parametrisation exactly.
+- `optim_points(normalize=True)`: joints that are never triangulated start at the scene centre instead of the world origin.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
+- Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
 
 ## 1.0.0
 

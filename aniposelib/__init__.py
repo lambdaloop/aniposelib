@@ -18,7 +18,7 @@ if _classic_version is not None and _classic_version != '0.0.1':
         "'aniposelib-pytorch'.".format(_classic_version))
 del _md, _classic_version
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 VERSION = __version__
 DISTRIBUTION = 'aniposelib-pytorch'
 BACKEND = 'torch'
