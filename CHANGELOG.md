@@ -40,6 +40,19 @@ Same results (bitwise, or within float rounding where noted), less time and memo
   1M columns (no more OOM at 12 x 2M points); MSAC hypothesis errors are computed only where a point is observed;
   on a GPU MSAC chunks are sized by the actual hypotheses (CPU chunks unchanged).
 - `init.sfm`: pairwise essential matrices on a thread pool (same per-pair seeds); vectorised frame grouping.
+- **`init.sfm.from_correspondences` 2-4x faster** (the top cost of `calibrate_from_points` with SfM: motor
+  observatory 43 -> 13 s, outdoor mouse 44 -> 22 s, Emory 36 -> 10 s on an L4 node; W2 results equivalent, see
+  below). RANSAC results change slightly for a given `rng` (same seed -> same result, whatever the thread count):
+  - the frame PnP RANSAC (`frame_pnp_ransac`, new `n_jobs=`) runs its hypotheses in independent streams of 50
+    iterations whose seeds are drawn from `rng`, on a thread pool; the per-camera scan runs all remaining cameras
+    at once. Frames are sampled with O(k) draws instead of a permutation of all frames. No way back to the 1.0
+    random stream (statistically the same search).
+  - **`pair_method='usac'`** (new default; `pairwise_poses(method=)`): OpenCV `USAC_DEFAULT` essential matrices,
+    5-10x faster on real keypoints and more inliers per pair. This can change the seed pair (Emory: a pair with
+    8035 vs 5906 inliers). Old behaviour: `pair_method='ransac'` (`calibrate_from_points(...,
+    options={'sfm_kwargs': {'pair_method': 'ransac'}})`).
+  - **`device=`** (None: the group's device): the robust re-triangulations run there. `calibrate_from_points` passes
+    its `device` (they ran on the CPU). Old behaviour: `options={'sfm_kwargs': {'device': 'cpu'}}`.
 - `optim_points` packs the fixed cameras once per call (the cameras no longer accumulate `.grad` during it), has no
   host syncs in its loop and evaluates all bone terms in one op (float rounding). `reconstruct_3d(device='auto')`
   runs `optim_points` chunks smaller than 50k frame x joint cells on the CPU (a GPU was 3-7x slower there); pass
