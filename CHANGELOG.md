@@ -56,6 +56,9 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
 1.1 development behaviour.
 
 - **`reconstruct_3d` (W6)**
+  - Default MSAC threshold `tau = clip(3 x noise floor, 10 px, 1 % of the diagonal)` (`tau_noise_mult` 5 -> 3;
+    motor observatory median reprojection 3.75 -> 3.31 px vs 3.07 px for the project's IRLS, EvoVision/Panoptic
+    MPJPE unchanged to better, other datasets sit at the 10 px floor). Old: `options={'tau_noise_mult': 5}`.
   - `fill='interior'` fills gaps of at most `options['max_gap']=10` frames (it filled 90 % of a sparse outdoor
     trajectory, runs up to 4 minutes). New `times=` (interpolate on time; `options['max_gap_s']`). Old:
     `options={'max_gap': None}`. For label frames that are not consecutive, use `fill='none'` (or pass `times=`).

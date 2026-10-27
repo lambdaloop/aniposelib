@@ -136,8 +136,8 @@ class Reconstruction(WorkflowResult):
 
 
 _W6_DEFAULTS = {
-    'tau_px': None,            # fixed MSAC threshold (px); None = clip(5 x noise floor, 10 px, 1 % of the diagonal)
-    'tau_noise_mult': 5.0,
+    'tau_px': None,            # fixed MSAC threshold (px); None = clip(3 x noise floor, 10 px, 1 % of the diagonal)
+    'tau_noise_mult': 3.0,
     'first_tau_diag_frac': 0.01,   # first robust pass: tau = max(10 px, this x image diagonal)
     'min_score': None,         # hard score cut (observations below are removed); None = soft only
     'min_views': 2,
@@ -616,9 +616,10 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                       extrinsics=Ef)
             r0 = T.triangulate_robust(P, flat, tau=tau0, **kw)
             nf = noise_floor(r0.errors, r0.inliers, diag)
-            # 5 x noise floor, at least the 1.0 default (10 px) and never looser than the first-pass
+            # 3 x noise floor, at least the 1.0 default (10 px) and never looser than the first-pass
             # gate (1 % of the diagonal): on real keypoints a 20 x rule gave 60-190 px and let poor
-            # cameras pull the points
+            # cameras pull the points (motor observatory: 5 x -> 3.75 px median, 3 x -> 3.31 px,
+            # project IRLS 3.07 px)
             tau = float(opts['tau_px']) if opts['tau_px'] is not None else \
                 float(min(max(float(opts['tau_noise_mult']) * nf, 10.0), max(tau0, 10.0)))
             res = T.triangulate_robust(P, flat, tau=tau, **kw)
