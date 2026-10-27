@@ -55,16 +55,14 @@ Conventions
 """
 
 import os
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
-from ._common import (MIN_NOISE_PX, NOISE_DIAG_FRAC, Rule, Timer, WorkflowResult, evaluate_rules,
-                      image_diagonal, merge_options, noise_floor, provenance, save_calibration,
-                      to_numpy, worst)
+from ._common import (MIN_NOISE_PX, Rule, Timer, WorkflowResult, evaluate_rules, image_diagonal,
+                      merge_options, noise_floor, provenance, save_calibration, to_numpy)
 
 __all__ = ['calibrate_from_board', 'BoardCalibration', 'calibrate_from_points', 'PointCalibration',
            'estimate_scale', 'ScaleEstimate', 'evaluate_calibration', 'CalibrationEvaluation']
@@ -126,13 +124,6 @@ def _rules(rules, opts):
                 setattr(r, a, float('{:.4g}'.format(v)))
     return evaluate_rules(rules, opts.get('verdict'))
 
-
-def _cam_list(names, values, pred):
-    return [n for n, v in zip(names, values) if pred(v)]
-
-
-def _jsonable_list(x):
-    return [str(v) for v in x]
 
 
 # ================================================================== W1 calibrate_from_board
@@ -806,7 +797,7 @@ W2_DEFAULTS = dict(
     cam_names=None, sizes=None, fisheye=False,   # when `intrinsics` is K / dict (make_intrinsics_group)
     refine='robust',          # 'robust' (bundle_adjust_robust) | 'refine' (sfm.refine_group) | 'iter' | None
     coarse=(0.12, 0.06, 0.03),                    # first-round MSAC thresholds, fraction of the diagonal
-    fine=((80, 40, 20, 10), (40, 20, 10)),        # later rounds, multiples of the noise floor
+    fine=((40, 20, 10, 5), (20, 10, 5)),          # later rounds (px at 0.5 px noise) x noise unit
     resect=True,
     ba_kwargs=None, sfm_kwargs=None, vggt_kwargs=None, select_kwargs=None, people_kwargs=None,
     intrinsics_free=('f', 'k1'),                  # refine_intrinsics: parameters freed
@@ -1106,7 +1097,6 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
       below 0.5, fail below 0.1;
     - ``scale_rejected``: a requested scale was refused (fail).
     """
-    from ..cameras import CameraGroup
     from ..init import RecipeReport, make_intrinsics_group, select
     from ..init import _refine as _legacy_refine
     timer = Timer()

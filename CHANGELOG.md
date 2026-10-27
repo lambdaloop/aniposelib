@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Calibration workflows (1.1, plan 05 W1-W4):** `aniposelib.calibrate_from_board` (boards and the new
+  `boards.PointObject`: known-3D-points objects, moving wands with per-view DLT intrinsics or static landmarks that
+  define the world frame), `calibrate_from_points`, `estimate_scale`, `evaluate_calibration`. Results carry a
+  noise-relative verdict (`'ok' | 'warn' | 'fail'`) with reasons and every derived threshold in `.settings`;
+  calibrations unpack as `cgroup, result = ...`. A disconnected board graph is a `'fail'` with per-component groups;
+  `bridge_points=` solves one 6-DoF pose per extra component.
+- **`utils.get_initial_extrinsics` / `CameraGroup.calibrate_rows` route through `init.board` (decision 22):**
+  connected graphs give exactly the 1.0 result (same spanning tree and per-edge estimate, `tree='classic'`), plus a
+  robust fallback for edges where the classic estimate raises or is non-finite (`method='classic'` disables it).
+  Disconnected graphs still raise `ValueError`, now listing the components; `disconnected='components'` opts in to
+  per-component gauges. `init.board.initial_extrinsics(tree=)` is new (default `'max'`, unchanged).
+- **`init.calibrate_from_points` is an alias of the workflow** (same signature and `(cgroup, RecipeReport)` return).
+  Changes: the robust refinement uses the noise-normalised threshold schedule (coarse round relative to the image
+  diagonal, then multiples of the noise floor; identical to the 1.0 schedule for 0.5 px noise), `rng=None` now means
+  seed 0, and `report.scale` is a `workflows.ScaleEstimate` (`.details['align']` as before).
 - **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
   (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
   (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite

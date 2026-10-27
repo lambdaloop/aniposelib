@@ -231,7 +231,7 @@ def test_w2_outdoor_trajectory_false_detections():
     assert res.selected_init == 'sfm' and res.intrinsics['decision'] == 'kept'
     assert synth.center_error(cg, true).max() < 0.01
     st = res.settings
-    assert st['noise_unit'] >= 1 and st['fine_px'][-1][-1] == pytest.approx(10 * st['noise_unit'])
+    assert st['noise_unit'] >= 1 and st['fine_px'][-1][-1] == pytest.approx(5 * st['noise_unit'])
     json.dumps(res.to_dict())
 
 
