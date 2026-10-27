@@ -34,6 +34,14 @@ API
     Pixel error; NaN where ``uv`` is missing, ``inf`` where the point is behind the camera.
 ``project_jacobian(P, X, extrinsics=None) -> (uv, depth, J [C,N,2,3])``
     Analytic d(pixel)/d(world point), used by Gauss-Newton point refinement.
+``camera_from_extrinsics_mat(K, E, dist=None, size=None, name=None, *, fisheye=False, ...)``
+    Camera from a 3x3 ``K`` and a 4x4 / 3x4 world -> camera ``E`` (``x_cam = R X + t``).
+``reindex_points(points, from_names, to_names, missing='nan')``
+    Reorder the camera axis of a point array between camera orders.
+``decompose_projection(P)``, ``from_projection_matrix(P, ...)``, ``to_projection_matrix(cam)``,
+``from_dlt(L, ...)``, ``to_dlt(cam)``
+    RQ decomposition of ``P ~ K [R | t]`` and 11-coefficient DLT conversion (affine ``P`` ->
+    :class:`~aniposelib.affine.AffineCamera`). Moved here from ``aniposelib.io`` in 1.1.
 
 Public functions accept numpy or torch for the point arguments: numpy in -> numpy out, torch in
 -> detached torch out (on ``P``'s device), ``return_grad=True`` keeps the autograd graph.
@@ -49,7 +57,9 @@ import torch
 from ._types import DEFAULT_DTYPE, returns_like_input, to_torch
 
 __all__ = ['PackedCameras', 'pack', 'unpack_into', 'project', 'project_jacobian', 'undistort',
-           'distort', 'reproj_err', 'rodrigues', 'make_extrinsics', 'MODELS']
+           'distort', 'reproj_err', 'rodrigues', 'make_extrinsics', 'MODELS',
+           'camera_from_extrinsics_mat', 'reindex_points', 'decompose_projection',
+           'from_projection_matrix', 'to_projection_matrix', 'from_dlt', 'to_dlt']
 
 MODELS = {'brown': 0, 'kb': 1}
 MODEL_NAMES = {v: k for k, v in MODELS.items()}
@@ -631,3 +641,179 @@ def reproj_err(P, X, uv, extrinsics=None):
     uvf, shape = _flat_uv(P, uv)
     Xf, E, lead = _flatten_points(P, X, _ext_for(P, extrinsics))
     return _reproj_err_flat(P, Xf, uvf, E).reshape(shape[:-1])
+
+
+# ------------------------------------------------------------------ camera construction and
+# projection matrices / DLT (moved from ``aniposelib.io`` in 1.1; the file formats were removed)
+
+def _np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().copy()  # never alias camera parameters
+    return np.asarray(x)
+
+
+def _f64(x):
+    return np.array(_np(x), dtype='float64')
+
+
+def _rvec_from_R(R):
+    import cv2
+    return cv2.Rodrigues(np.asarray(R, dtype='float64'))[0].ravel()
+
+
+def _nearest_rotation(R, name=None):
+    R = _f64(R).reshape(3, 3)
+    if not np.all(np.isfinite(R)):
+        raise ValueError('camera {}: rotation has non-finite entries'.format(name))
+    U, s, Vt = np.linalg.svd(R)
+    d = np.linalg.det(U @ Vt)
+    if d < 0:
+        raise ValueError('camera {}: rotation is improper (det < 0); is it transposed or '
+                         'from a left-handed frame?'.format(name))
+    if np.max(np.abs(s - 1)) > 1e-3:
+        warnings.warn('camera {}: rotation is not orthonormal (singular values {}); using the '
+                      'nearest rotation'.format(name, np.round(s, 6)), RuntimeWarning)
+    return U @ Vt
+
+
+def _extrinsics(cam):
+    return _f64(cam.get_extrinsics_mat())
+
+
+def _K(cam):
+    return _f64(cam.get_camera_matrix())
+
+
+def camera_from_extrinsics_mat(K, E, dist=None, size=None, name=None, *, fisheye=False,
+                               offset=None, extra=None, n_dist=None, dtype=torch.float64):
+    """Build a :class:`~aniposelib.cameras.Camera` (or ``FisheyeCamera``) from a 3x3 ``K``, a
+    4x4 (or 3x4) world -> camera matrix ``E`` (``x_cam = R X + t``), distortions and an image
+    ``size`` (width, height). ``offset`` is the crop origin in sensor pixels."""
+    from .cameras import Camera, FisheyeCamera
+    K = _f64(K).reshape(3, 3)
+    E = _f64(E)
+    if E.shape not in ((4, 4), (3, 4)):
+        raise ValueError('extrinsics must be 4x4 or 3x4, got {}'.format(E.shape))
+    R = _nearest_rotation(E[:3, :3], name)
+    t = E[:3, 3]
+    cls = FisheyeCamera if fisheye else Camera
+    if dist is None:
+        dist = np.zeros(cls.n_dist_model)
+    dist = _f64(dist).ravel()
+    if len(dist) < cls.n_dist_model:
+        dist = np.concatenate([dist, np.zeros(cls.n_dist_model - len(dist))])
+    kw = dict(matrix=K, dist=dist, size=None if size is None else [int(round(float(s))) for s in list(size)[:2]],
+              rvec=_rvec_from_R(R), tvec=t, name=name, offset=offset, extra=extra, dtype=dtype)
+    if n_dist is not None:
+        kw['n_dist'] = int(n_dist)
+    return cls(**kw)
+
+
+def reindex_points(points, from_names, to_names, missing='nan'):
+    """Reorder axis 0 (cameras) of ``points`` from camera order ``from_names`` to ``to_names``.
+
+    ``from_names``/``to_names`` may be name lists or ``CameraGroup`` s. Cameras of ``to_names``
+    absent from ``from_names`` are filled with NaN (``missing='nan'``) or raise
+    (``missing='raise'``). numpy in -> numpy out, torch in -> torch out."""
+    def names_of(x):
+        return list(x.get_names()) if hasattr(x, 'get_names') else [str(n) for n in x]
+    src, dst = names_of(from_names), names_of(to_names)
+    if len(set(src)) != len(src) or len(set(dst)) != len(dst):
+        raise ValueError('camera names must be unique')
+    if missing not in ('nan', 'raise'):
+        raise ValueError("missing must be 'nan' or 'raise'")
+    if len(points) != len(src):
+        raise ValueError('points have {} cameras, from_names has {}'.format(len(points), len(src)))
+    lookup = {n: i for i, n in enumerate(src)}
+    absent = [n for n in dst if n not in lookup]
+    if absent and missing == 'raise':
+        raise KeyError('cameras not in from_names: {}'.format(absent))
+    if isinstance(points, torch.Tensor):
+        out = torch.full((len(dst),) + tuple(points.shape[1:]), float('nan'),
+                         dtype=points.dtype if points.is_floating_point() else torch.float64,
+                         device=points.device)
+        for j, n in enumerate(dst):
+            if n in lookup:
+                out[j] = points[lookup[n]]
+        return out
+    points = np.asarray(points)
+    dt = points.dtype if points.dtype.kind in 'fc' else np.float64
+    out = np.full((len(dst),) + points.shape[1:], np.nan, dtype=dt)
+    for j, n in enumerate(dst):
+        if n in lookup:
+            out[j] = points[lookup[n]]
+    return out
+
+
+def decompose_projection(P):
+    """RQ-decompose a finite 3x4 camera ``P ~ K [R | t]`` -> ``(K, R, t)`` with K
+    upper-triangular, positive diagonal, ``K[2, 2] = 1`` (skew kept) and R a proper rotation."""
+    from scipy.linalg import rq
+    P = _f64(P).reshape(3, 4)
+    M = P[:, :3]
+    if abs(np.linalg.det(M)) < 1e-300 or not np.all(np.isfinite(P)):
+        raise ValueError('projection matrix is singular (affine camera?)')
+    if np.linalg.det(M) < 0:
+        P = -P
+        M = P[:, :3]
+    K, R = rq(M)
+    S = np.diag(np.sign(np.diag(K)))
+    K, R = K @ S, S @ R
+    lam = K[2, 2]
+    t = np.linalg.solve(K, P[:, 3])
+    K = K / lam
+    if np.linalg.det(R) < 0:  # pragma: no cover (det(M) > 0 and diag(K) > 0 imply det(R) > 0)
+        raise ValueError('decomposition gave an improper rotation')
+    return K, R, t
+
+
+def _is_affine_P(P, tol):
+    P = _f64(P).reshape(3, 4)
+    return np.linalg.norm(P[2, :3]) <= tol * max(abs(P[2, 3]), 1e-300)
+
+
+def from_projection_matrix(P, size=None, name=None, dist=None, *, affine_tol=1e-12):
+    """3x4 projection matrix -> Camera (RQ decomposition, skew kept), or an
+    :class:`~aniposelib.affine.AffineCamera` when ``|P[2,:3]| <= affine_tol * |P[2,3]|``."""
+    P = _f64(P).reshape(3, 4)
+    if _is_affine_P(P, affine_tol):
+        from .affine import AffineCamera
+        return AffineCamera.from_projection_matrix(P, size=size, name=name)
+    K, R, t = decompose_projection(P)
+    E = np.eye(4)
+    E[:3, :3], E[:3, 3] = R, t
+    return camera_from_extrinsics_mat(K, E, dist, size, name)
+
+
+def to_projection_matrix(cam):
+    """``K [R | t]`` (3x4, ``P[2,3]`` not normalised; distortion and offset are not included)."""
+    if hasattr(cam, 'get_projection_matrix'):
+        return cam.get_projection_matrix()
+    return _K(cam) @ _extrinsics(cam)[:3]
+
+
+def _dlt_to_P(L):
+    L = _f64(L).ravel()
+    if len(L) == 11:
+        L = np.concatenate([L, [1.0]])
+    if len(L) != 12:
+        raise ValueError('DLT needs 11 or 12 coefficients, got {}'.format(len(L)))
+    return L.reshape(3, 4)
+
+
+def from_dlt(L, size=None, name=None, dist=None, *, affine_tol=1e-12):
+    """11 DLT coefficients (``L12 = 1``; 12 are accepted) -> Camera, or
+    :class:`~aniposelib.affine.AffineCamera` when ``|L9..L11| <= affine_tol * |L12|``.
+    The DLT is taken to be in 0-based pixels (subtract 1 from ``cx``, i.e. use
+    ``L1..4 -= L9..12`` yourself, for 1-based MATLAB / Hedrick DLTdv coefficients)."""
+    return from_projection_matrix(_dlt_to_P(L), size=size, name=name, dist=dist,
+                                  affine_tol=affine_tol)
+
+
+def to_dlt(cam):
+    """Camera (or AffineCamera) -> 11 DLT coefficients (normalised so ``L12 = 1``)."""
+    P = to_projection_matrix(cam)
+    if abs(P[2, 3]) < 1e-300:
+        raise ValueError('P[2,3] is zero (world origin on the principal plane); not a DLT')
+    return (P / P[2, 3]).ravel()[:11]
+

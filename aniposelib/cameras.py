@@ -53,67 +53,11 @@ def _check_kwargs(fname, kwargs, allowed):
         raise TypeError("{}() got unexpected keyword argument(s) {}; valid options are {}".format(
             fname, ', '.join(repr(b) for b in bad), sorted(allowed)))
 
-# @jit(nopython=True, parallel=True)
-# @torch.compile
-def triangulate_simple(points, camera_mats):
-    num_cams = len(camera_mats)
-    A = torch.zeros((num_cams * 2, 4), dtype=points.dtype, device=points.device)
-    for i in range(num_cams):
-        x, y = points[i]
-        mat = camera_mats[i]
-        A[(i * 2):(i * 2 + 1)] = x * mat[2] - mat[0]
-        A[(i * 2 + 1):(i * 2 + 2)] = y * mat[2] - mat[1]
-    u, s, vh = torch.linalg.svd(A, full_matrices=True)
-    p3d = vh[-1]
-    p3d = p3d[:3] / p3d[3]
-    return p3d
-
-def triangulate_simple_batch(points, camera_mats, weights):
-    '''
-    Inputs:
-        points: [C, N, 2] 2d points to triangulate
-        camera_mats: [C, 4, 4] camera extrinsics
-        weights: [C, N] weight for each camera
-    Outputs:
-        p3d: [N, 3] triangulated 3d point
-    '''
-    C, N, _ = points.shape
-
-    points = rearrange(points, 'c n r -> n c r')
-    
-    # Expand camera_mats to [N, C, 4, 4]
-    cam_mats = repeat(camera_mats, 'c i j -> n c i j', n=N)
-    
-    # Extract x, y coordinates and reshape weights
-    x = points[:, :, 0:1, None]  # [N, C, 1]
-    y = points[:, :, 1:2, None]  # [N, C, 1]
-    w = rearrange(weights, 'c n -> n c 1 1')  # [N, C, 1]
-    
-    # Build equations for each camera
-    # x * mat[2] - mat[0] and y * mat[2] - mat[1]
-    eq_x = w * (x * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 0:1, :])  # [N, C, 1, 4]
-    eq_y = w * (y * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 1:2, :])  # [N, C, 1, 4]
-    
-    # Stack and reshape to [N, C*2, 4]
-    A = rearrange([eq_x, eq_y], 'two n c 1 j -> n (c two) j')
-    
-    # SVD decomposition
-    u, s, vh = torch.linalg.svd(A, full_matrices=False)  # vh: [N, 4, 4]; only vh used downstream
-    
-    # Take last row of vh for each point
-    p3d_homogeneous = vh[:, -1, :]  # [N, 4]
-    
-    # Convert from homogeneous to 3D coordinates
-    p3d = p3d_homogeneous[:, :3] / p3d_homogeneous[:, 3:4]  # [N, 3]
-    
-    return p3d
-
-
 def _triangulate_svd(points, camera_mats, weights):
     """Homogeneous SVD DLT (aniposelib <= 0.9), with static [C,4,4] or per-point [C,N,4,4]
     extrinsics. points [C,N,2] (finite), weights [C,N] -> [N,3]."""
     if camera_mats.ndim == 3:
-        return triangulate_simple_batch(points, camera_mats, weights)
+        camera_mats = camera_mats[:, None].expand(-1, points.shape[1], 4, 4)
     x = points[..., 0, None]
     y = points[..., 1, None]
     w = weights[..., None]
@@ -994,14 +938,13 @@ class Camera(nn.Module):
         return rays
 
 
-
     # -- 1.0 convenience aliases (thin delegates)
     @classmethod
     def from_extrinsics_mat(cls, K, E, dist=None, size=None, name=None, **kwargs):
         """A camera from a 3x3 ``K`` and a 4x4 / 3x4 world->camera matrix ``E``
-        (``x_cam = R X + t``); see :func:`aniposelib.io.camera_from_extrinsics_mat`.
+        (``x_cam = R X + t``); see :func:`aniposelib.geometry.camera_from_extrinsics_mat`.
         ``FisheyeCamera.from_extrinsics_mat`` builds a fisheye camera."""
-        from aniposelib import io as _io
+        from aniposelib import geometry as _io
         kwargs.setdefault('fisheye', issubclass(cls, FisheyeCamera))
         cam = _io.camera_from_extrinsics_mat(K, E, dist, size, name, **kwargs)
         if not isinstance(cam, cls):
@@ -1196,7 +1139,6 @@ class FisheyeCamera(Camera):
         return torch.stack(rows, dim=1)
 
 
-
 # cv2.fisheye has no CALIB_FIX_K0, the flags start at k1
 _FISHEYE_FIX_K = [cv2.fisheye.CALIB_FIX_K1, cv2.fisheye.CALIB_FIX_K2,
                   cv2.fisheye.CALIB_FIX_K3, cv2.fisheye.CALIB_FIX_K4]
@@ -1260,7 +1202,6 @@ def init_camera_intrinsics(camera, objp, imgp, size, *, guard=False):
     # initCameraMatrix2D estimates no distortion, so the free coefficients start
     # at zero; the frozen ones stay where they were
     camera.set_distortions(restore_frozen(np.zeros_like(old_dist)))
-
 
 
 def _natural_key(key):
@@ -1415,7 +1356,7 @@ class CameraGroup(nn.Module):
 
     def reorder(self, names):
         """A new group with the same cameras in the order ``names`` (a permutation of
-        ``get_names()``). Reorder point arrays with :func:`aniposelib.io.reindex_points`."""
+        ``get_names()``). Reorder point arrays with :func:`aniposelib.geometry.reindex_points`."""
         names = list(names)
         if sorted(map(str, names)) != sorted(map(str, self.get_names())) or len(names) != len(self.cameras):
             raise ValueError('reorder needs a permutation of {}, got {}'.format(self.get_names(), names))
@@ -1564,16 +1505,13 @@ class CameraGroup(nn.Module):
         n_points = points.shape[0]
         if len(self.cameras) == 0:
             return torch.empty((0, n_points, 2), dtype=points.dtype, device=points.device)
-        if self._packable():
-            P = self._pack_internal()
-            # sanitise non-finite points before any arithmetic so that their gradients stay
-            # finite (torch.where's backward would otherwise give 0 * NaN on the cameras)
-            bad = ~torch.isfinite(points).all(-1)
-            X = torch.where(bad[:, None], torch.zeros_like(points), points)
-            uv, _ = _G._project_flat(P, X, P.extrinsics())
-            return torch.where(bad[None, :, None], torch.full_like(uv, float('nan')), uv)
-        out = [cam._project(points).reshape(n_points, 2) for cam in self.cameras]
-        return torch.stack(out)
+        P = self._robust_packed('project')
+        # sanitise non-finite points before any arithmetic so that their gradients stay
+        # finite (torch.where's backward would otherwise give 0 * NaN on the cameras)
+        bad = ~torch.isfinite(points).all(-1)
+        X = torch.where(bad[:, None], torch.zeros_like(points), points)
+        uv, _ = _G._project_flat(P, X, P.extrinsics())
+        return torch.where(bad[None, :, None], torch.full_like(uv, float('nan')), uv)
 
     @returns_like_input()
     def undistort_points(self, points, batch_size=None, progress=False, desc="undistort"):
@@ -1595,12 +1533,8 @@ class CameraGroup(nn.Module):
             return points.clone()
         K = points[0].numel() // 2
         points_flat = points.reshape(C, K, 2)
-        if self._packable():
-            P = self._pack_internal()
-            fn = lambda p: _G._undistort_flat(P, p)
-        else:
-            fn = lambda p: torch.stack([cam._undistort_points(p[cnum])
-                                        for cnum, cam in enumerate(self.cameras)])
+        P = self._robust_packed('undistort_points')
+        fn = lambda p: _G._undistort_flat(P, p)
         if batch_size is None or batch_size >= K:
             return fn(points_flat).reshape(orig_shape)
         undistort_iter = trange(0, K, batch_size, ncols=70, desc=desc) if progress \
@@ -1833,11 +1767,7 @@ class CameraGroup(nn.Module):
 
     def _triangulate_possible(self, points, undistort=True, min_cams=2, progress=False,
                               batch_size=None, tau=10.0, n_refine=2):
-        if not self._packable():
-            return self._triangulate_possible_subsets(
-                points, undistort=undistort, min_cams=min_cams, progress=progress,
-                batch_size=1000 if batch_size is None else batch_size)
-        P = self._pack_internal()
+        P = self._robust_packed('triangulate_possible')
         pts = self._tensor(points)
         if undistort:
             pts = self._mask_noninvertible(P, pts)
@@ -1862,139 +1792,6 @@ class CameraGroup(nn.Module):
                 res.n_inliers[redo] = r2.n_inliers
         return res.legacy()
 
-    def _triangulate_possible_subsets(self, points, undistort=True, min_cams=2, progress=False, batch_size=1000):
-        """aniposelib <= 0.9 subset enumeration (fallback for cameras packed() cannot represent)."""
-        device = self.device
-        dtype = self.dtype
-        points_raw_cpu = to_tensor(points, device='cpu', dtype=dtype)  # master stays on CPU
-
-        assert points_raw_cpu.shape[0] == len(self.cameras), \
-            "Invalid points shape, first dim should be equal to" \
-            " number of cameras ({}), but shape is {}".format(
-                len(self.cameras), points_raw_cpu.shape
-            )
-
-        n_cams, n_points, n_possible, _ = points_raw_cpu.shape
-
-        # Output tensors — O(N), small for typical N
-        out         = torch.full((n_points, 3),                    torch.nan, dtype=dtype, device=device)
-        picked_vals = torch.zeros((n_cams, n_points, n_possible),             dtype=torch.bool,    device=device)
-        errors_out  = torch.zeros(n_points,                                   dtype=dtype, device=device)
-        points_2d   = torch.full((n_cams, n_points, 2),            torch.nan, dtype=dtype, device=device)
-
-        cam_mats = torch.stack([cam.get_extrinsics_mat() for cam in self.cameras])
-
-        # Observation mask kept on CPU — (C, N, P) bool, one allocation for all chunks
-        obs_mask_np_full = ~np.isnan(points_raw_cpu[..., 0].numpy())
-
-        chunk_iter = trange(0, n_points, batch_size, ncols=70, desc="triangulate_possible") \
-            if progress else range(0, n_points, batch_size)
-
-        for p0 in chunk_iter:
-            p1 = min(p0 + batch_size, n_points)
-            chunk_size = p1 - p0
-
-            # Upload chunk to GPU
-            points_raw_chunk = points_raw_cpu[:, p0:p1].to(device)  # (C, chunk, P, 2)
-
-            if undistort:
-                points_undist_chunk = self._undistort_points(points_raw_chunk)
-            else:
-                points_undist_chunk = points_raw_chunk
-
-            # Enumerate combos for this chunk — CPU numpy, no GPU involvement
-            obs_mask_chunk = obs_mask_np_full[:, p0:p1]  # (C, chunk, P)
-
-            flat_c_chunks: list = []
-            flat_q_chunks: list = []
-            flat_m_chunks: list = []
-            flat_p_chunks: list = []  # chunk-local point indices [0, chunk_size)
-            point_to_m_range: dict = {}  # chunk-local p_local -> (start_m, end_m)
-
-            m = 0
-            for p_local in range(chunk_size):
-                obs_cams_p = np.flatnonzero(obs_mask_chunk[:, p_local].any(axis=-1))
-                n_obs = obs_cams_p.size
-                if n_obs < min_cams:
-                    continue
-
-                qs_per_cam = [np.flatnonzero(obs_mask_chunk[c, p_local]) for c in obs_cams_p]
-                P_per_cam = np.fromiter((qs.size for qs in qs_per_cam), dtype=np.int64, count=n_obs)
-                shape = tuple((P_per_cam + 1).tolist())
-
-                idx_matrix = np.indices(shape).reshape(n_obs, -1)
-                is_kept    = idx_matrix < P_per_cam[:, None]
-                n_picked   = is_kept.sum(axis=0)
-                keep_combo = (n_picked >= min_cams) & (n_picked < n_obs)
-
-                n_kept = int(keep_combo.sum())
-                if n_kept == 0:
-                    continue
-
-                idx_k     = idx_matrix[:, keep_combo]
-                is_kept_k = is_kept[:, keep_combo]
-
-                q_2d = np.zeros((n_obs, n_kept), dtype=np.int64)
-                for i, qs in enumerate(qs_per_cam):
-                    v = is_kept_k[i]
-                    q_2d[i, v] = qs[idx_k[i, v]]
-
-                cam_2d = np.broadcast_to(obs_cams_p[:, None], (n_obs, n_kept))
-                m_2d   = np.broadcast_to(np.arange(m, m + n_kept, dtype=np.int64)[None, :], (n_obs, n_kept))
-
-                mask = is_kept_k.ravel()
-                flat_c_chunks.append(cam_2d.ravel()[mask].astype(np.int64, copy=False))
-                flat_q_chunks.append(q_2d.ravel()[mask])
-                flat_m_chunks.append(m_2d.ravel()[mask])
-                flat_p_chunks.append(np.full(int(mask.sum()), p_local, dtype=np.int64))
-
-                point_to_m_range[p_local] = (m, m + n_kept)
-                m += n_kept
-
-            M_chunk = m
-            if M_chunk == 0:
-                continue
-
-            flat_c = torch.from_numpy(np.concatenate(flat_c_chunks)).to(device=device)
-            flat_q = torch.from_numpy(np.concatenate(flat_q_chunks)).to(device=device)
-            flat_m = torch.from_numpy(np.concatenate(flat_m_chunks)).to(device=device)
-            flat_p = torch.from_numpy(np.concatenate(flat_p_chunks)).to(device=device)
-
-            # Build (C, M_chunk, 2) and (C, M_chunk) buffers — bounded by chunk, not N
-            batch_points_undist = torch.zeros((n_cams, M_chunk, 2), dtype=dtype, device=device)
-            batch_points_raw    = torch.zeros((n_cams, M_chunk, 2), dtype=dtype, device=device)
-            batch_weights       = torch.zeros((n_cams, M_chunk),    dtype=dtype, device=device)
-
-            # flat_p is chunk-local: indexes into points_raw_chunk[:, 0:chunk_size, ...]
-            batch_points_undist[flat_c, flat_m] = points_undist_chunk[flat_c, flat_p, flat_q].to(dtype)
-            batch_points_raw   [flat_c, flat_m] = points_raw_chunk   [flat_c, flat_p, flat_q].to(dtype)
-            batch_weights      [flat_c, flat_m] = 1.0
-
-            # One SVD over all M_chunk records; full_matrices=False keeps u bounded
-            p3ds_batched = triangulate_simple_batch(batch_points_undist, cam_mats, batch_weights)
-
-            proj     = self._project(p3ds_batched)  # (C, M_chunk, 2)
-            err_norm = torch.linalg.norm(proj.to(dtype) - batch_points_raw, dim=-1)
-            err      = (err_norm * batch_weights).sum(dim=0) / batch_weights.sum(dim=0)
-
-            # Per-point argmin — write into global output tensors using p0 offset
-            winner_mask = torch.zeros(M_chunk, dtype=torch.bool, device=device)
-            for p_local, (m_s, m_e) in point_to_m_range.items():
-                j = m_s + int(err[m_s:m_e].argmin().item())
-                p_global = p0 + p_local
-                out[p_global]        = p3ds_batched[j]
-                errors_out[p_global] = err[j]
-                winner_mask[j]       = True
-
-            # Scatter picked_vals / points_2d; flat_p is chunk-local for gather,
-            # flat_p + p0 is global for output scatter
-            sel          = winner_mask[flat_m]
-            p_global_idx = flat_p[sel] + p0
-            picked_vals[flat_c[sel], p_global_idx, flat_q[sel]] = True
-            points_2d  [flat_c[sel], p_global_idx] = \
-                points_raw_chunk[flat_c[sel], flat_p[sel], flat_q[sel]].to(dtype)
-
-        return out, picked_vals, points_2d, errors_out
 
 
     @returns_like_input()
@@ -2013,10 +1810,6 @@ class CameraGroup(nn.Module):
                 len(self.cameras), points.shape
             )
         n_cams, n_points, _ = points.shape
-        if not self._packable():
-            return self._triangulate_possible_subsets(
-                self._tensor(points).reshape(n_cams, n_points, 1, 2), undistort=undistort,
-                min_cams=min_cams, progress=progress)
         pts = self._tensor(points)
         res = self._triangulate_robust(pts, method='msac', tau=tau, min_inliers=min_cams,
                                        n_refine=n_refine, undistort=undistort,
@@ -2627,7 +2420,6 @@ class CameraGroup(nn.Module):
         return total_loss
 
 
-
     def _initialize_params_bundle(self, p2ds, extra, rng=None):
         """Given an CxNx2 array of 2D points,
         where N is the number of points and C is the number of cameras,
@@ -2916,7 +2708,6 @@ class CameraGroup(nn.Module):
             return p3ds
 
         return self._optim_points(points, p3ds, **kwargs)
-
 
 
     # @torch.compile
@@ -3247,7 +3038,6 @@ class CameraGroup(nn.Module):
                 except Exception as e:
                     print("WARNING: camera size detection failed for video {}".format(vidname))
                     print(e)
-
 
 
     def calibrate_videos(self, videos, board,

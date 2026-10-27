@@ -120,19 +120,18 @@ def test_triangulate_moving_extrinsics():
     assert np.nanmax(np.abs(out - X.reshape(6, 5, 3))) < 1e-6 * synth.rig_scale(cg)
 
 
-def test_fallback_for_custom_cameras():
+def test_custom_cameras_raise():
+    """1.1: no per-camera slow path; groups the packed kernels cannot represent raise."""
     cg = synth.load_rig('allen_7cam')
     cams = [CustomCamera.from_dict(c.get_dict()) for c in cg.cameras]
     cc = CameraGroup(cams)
     assert not cc._packable() and cg._packable()
     X = synth.random_points(cg, 20, seed=7)
-    assert np.allclose(cc.project(X), cg.project(X) + 0.5, atol=1e-6)
     p2d = cg.project(X)
-    assert np.allclose(cc.triangulate(p2d), cg.triangulate(p2d), atol=1e-8)
-    out, picked, p2, err = cc.triangulate_ransac(p2d)   # 0.9 subset search
-    assert out.shape == (20, 3) and picked.shape == (7, 20, 1)
-    with pytest.raises(NotImplementedError):
-        cc.triangulate_robust(p2d)
+    for fn in (lambda: cc.project(X), lambda: cc.triangulate(p2d), lambda: cc.triangulate_ransac(p2d),
+               lambda: cc.triangulate_robust(p2d)):
+        with pytest.raises(NotImplementedError):
+            fn()
 
 
 def test_packed_roundtrip_and_grad():

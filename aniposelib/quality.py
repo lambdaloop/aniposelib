@@ -21,11 +21,6 @@ API
     ``loo_median_px`` / ``loo_coverage`` / ``agree@T`` (fixed denominator) and ``flags``.
     ``overall`` summarises; ``per_group`` breaks the LOO agreement down by point group.
     ``to_dict()``, ``to_json(path=None)``, ``passes(max_median_px=12, max_loo_px=60)``.
-``paired_bootstrap(res_a, res_b, clusters, n_boot=2000, seed=0, threshold=8) -> PairedBootstrap``
-    Candidate (b) minus reference (a) LOO agreement and common-supported error, with a
-    cluster (e.g. time window) bootstrap that resamples whole clusters identically for both.
-``temporal_split(starts, block, guard, fractions=(.6, .2, .2), seed=0, window=0) -> TemporalSplit``
-    Fit / validation / audit split by whole time blocks, with a guard band at block edges.
 ``compare(cg_a, cg_b, p2ds=None, trim=2.5) -> CompareResult``
     Trimmed Umeyama-aligned camera-centre residuals, scale, rotation, per-camera orientation
     and intrinsics deltas, and (with ``p2ds``) paired LOO/reprojection errors of both groups.
@@ -39,9 +34,6 @@ API
     Triangulation angles: per point maximum, per camera pair median; grazing pairs flagged.
 ``detect_moves(cgroup, p2ds, times, ...) -> MoveReport``
     Re-exported from :mod:`aniposelib.stations` (bumped / re-aimed cameras over time).
-``assess_reuse(cgroup, p2ds, ...) -> ReuseAssessment``
-    good / medium / bad from the global median and the worst per-camera LOO median
-    (EvoVision ``calib_reuse.assess/classify``).
 
 Points are ``C x N x 2`` (or ``C x N x J x 2``, flattened), NaN = missing, in group order.
 Results hold numpy arrays and Python numbers (they are reports); torch input is accepted.
@@ -59,10 +51,10 @@ from . import triangulation as T
 from . import scale as S
 from .stations import detect_moves, MoveReport  # re-export (camera move QA lives in stations)
 
-__all__ = ['loo_reprojection', 'report', 'paired_bootstrap', 'temporal_split', 'compare', 'sanity',
-           'lens_validity', 'coverage', 'board_shape_residual', 'ray_angles', 'assess_reuse',
-           'LOOResult', 'CalibrationReport', 'PairedBootstrap', 'TemporalSplit', 'CompareResult',
-           'ReuseAssessment', 'detect_moves', 'MoveReport']
+__all__ = ['loo_reprojection', 'report', 'compare', 'sanity',
+           'lens_validity', 'coverage', 'board_shape_residual', 'ray_angles',
+           'LOOResult', 'CalibrationReport', 'CompareResult',
+           'detect_moves', 'MoveReport']
 
 _builtin = S._builtin
 
@@ -437,143 +429,6 @@ def report(cgroup, p2ds, robust=True, loo=True, min_views=3, fit_mask=None, grou
                              params=params, loo=lres)
 
 
-# ------------------------------------------------------------------ paired bootstrap
-
-@dataclass
-class PairedBootstrap:
-    """Candidate (b) minus reference (a). ``agree_*`` are macro (mean over cameras) fractions of
-    eligible observations below ``threshold``; ``error_delta`` is the pooled mean px change on
-    observations supported by both; ``ci95_*`` are cluster-bootstrap percentile intervals."""
-    agree_a: Optional[float]
-    agree_b: Optional[float]
-    delta_agree: Optional[float]
-    ci95_agree: Optional[List[float]]
-    error_delta: Optional[float]
-    ci95_error: Optional[List[float]]
-    n_eligible: int
-    n_common_supported: int
-    n_dropped: int
-    n_clusters: int
-    n_boot: int
-    seed: Any
-    threshold: float
-
-    def to_dict(self):
-        return {f.name: _builtin(getattr(self, f.name)) for f in fields(self)}
-
-
-def _errors_of(res):
-    if isinstance(res, LOOResult):
-        return np.asarray(res.errors, dtype='float64'), np.asarray(res.eligible, dtype=bool)
-    e = np.asarray(_np(res), dtype='float64')
-    return e, None
-
-
-def paired_bootstrap(res_a, res_b, clusters, n_boot=2000, seed=0, threshold=8.0, eligible=None):
-    """Paired cluster bootstrap of two LOO evaluations of the same observations (Emory
-    ``paired_compare``). ``res_a``/``res_b``: :class:`LOOResult` or ``[C,N]`` error arrays (inf =
-    miss); ``clusters [N]``: cluster id per point (whole clusters are resampled, identically for
-    both arms). ``eligible`` defaults to ``res_a.eligible`` (or the finite-or-inf entries)."""
-    e0, el0 = _errors_of(res_a)
-    e1, _ = _errors_of(res_b)
-    if e0.shape != e1.shape:
-        raise ValueError('res_a and res_b must cover the same [C,N] observations')
-    if eligible is None:
-        eligible = el0 if el0 is not None else ~np.isnan(e0)
-    eligible = np.asarray(_np(eligible), dtype=bool)
-    wid = np.asarray(_np(clusters)).reshape(-1)
-    if wid.shape != (e0.shape[1],):
-        raise ValueError('clusters must have one id per point')
-    rng = np.random.default_rng(seed)
-    _, inverse = np.unique(wid, return_inverse=True)
-    nw, nc = int(inverse.max()) + 1 if len(inverse) else 0, e0.shape[0]
-    denom = np.zeros((nw, nc))
-    hits0, hits1 = np.zeros_like(denom), np.zeros_like(denom)
-    common = eligible & np.isfinite(e0) & np.isfinite(e1)
-    ndiff, ediff = np.zeros(nw), np.zeros(nw)
-    with np.errstate(invalid='ignore'):
-        for c in range(nc):
-            denom[:, c] = np.bincount(inverse, weights=eligible[c], minlength=nw)
-            hits0[:, c] = np.bincount(inverse, weights=eligible[c] & (e0[c] < threshold), minlength=nw)
-            hits1[:, c] = np.bincount(inverse, weights=eligible[c] & (e1[c] < threshold), minlength=nw)
-            m = common[c]
-            ndiff += np.bincount(inverse[m], minlength=nw)
-            ediff += np.bincount(inverse[m], weights=e1[c, m] - e0[c, m], minlength=nw)
-
-    def macro(h, n):
-        v = np.divide(h, n, out=np.full_like(h, np.nan), where=n > 0)
-        v = v[np.isfinite(v)]
-        return float(v.mean()) if len(v) else None
-
-    tot = denom.sum(0)
-    a0, a1 = macro(hits0.sum(0), tot), macro(hits1.sum(0), tot)
-    delta = macro((hits1 - hits0).sum(0), tot)
-    ncommon = int(common.sum())
-    de = float(ediff.sum() / ncommon) if ncommon else None
-    ba, be = [], []
-    for _ in range(n_boot if nw else 0):
-        draw = rng.integers(nw, size=nw)
-        da = macro((hits1[draw] - hits0[draw]).sum(0), denom[draw].sum(0))
-        if da is not None:
-            ba.append(da)
-        ne = ndiff[draw].sum()
-        if ne:
-            be.append(float(ediff[draw].sum() / ne))
-
-    def ci(v):
-        return np.percentile(v, [2.5, 97.5]).tolist() if v else None
-    return PairedBootstrap(agree_a=a0, agree_b=a1, delta_agree=delta, ci95_agree=ci(ba),
-                           error_delta=de, ci95_error=ci(be), n_eligible=int(eligible.sum()),
-                           n_common_supported=ncommon, n_dropped=int(eligible.sum()) - ncommon,
-                           n_clusters=nw, n_boot=int(n_boot), seed=_builtin(seed) if not isinstance(seed, np.random.Generator) else None,
-                           threshold=float(threshold))
-
-
-# ------------------------------------------------------------------ temporal split
-
-@dataclass
-class TemporalSplit:
-    """Indices into ``starts`` for each partition (``test`` = val + audit)."""
-    train: Any
-    val: Any
-    audit: Any
-    test: Any
-    block: int
-    guard: int
-
-    def to_dict(self):
-        return {f.name: _builtin(getattr(self, f.name)) for f in fields(self)}
-
-
-def temporal_split(starts, block, guard, fractions=(0.6, 0.2, 0.2), seed=0, window=0):
-    """Split samples (frames or windows starting at ``starts``) into fit / val / audit by whole
-    time blocks of ``block`` frames (Emory ``make_split``): blocks are shuffled with ``seed``,
-    ``fractions[2]`` of them (at least one) become audit, ``fractions[1]`` (at least one, if
-    non-zero) validation, the rest train. Samples within ``guard`` frames of a block edge
-    (``window`` = sample length) are dropped from every partition, so no held-out sample is
-    adjacent to a fit sample."""
-    starts = np.asarray(_np(starts)).astype(np.int64).reshape(-1)
-    fr = np.asarray(fractions, dtype='float64')
-    if len(fr) != 3 or np.any(fr < 0) or fr.sum() <= 0:
-        raise ValueError('fractions must be 3 non-negative numbers (train, val, audit)')
-    fr = fr / fr.sum()
-    blocks = starts // block
-    ub = np.unique(blocks)
-    order = np.random.default_rng(seed).permutation(ub)
-    nb = len(order)
-    n_audit = max(1, int(round(fr[2] * nb))) if fr[2] > 0 else 0
-    n_val = max(1, int(round(fr[1] * nb))) if fr[1] > 0 else 0
-    if n_audit + n_val >= nb and nb > 0 and fr[0] > 0:
-        raise ValueError('only {} blocks: not enough for train/val/audit'.format(nb))
-    off = starts % block
-    guarded = (off >= guard) & (off + window < block - guard)
-    audit = np.flatnonzero(guarded & np.isin(blocks, order[:n_audit]))
-    val = np.flatnonzero(guarded & np.isin(blocks, order[n_audit:n_audit + n_val]))
-    train = np.flatnonzero(guarded & ~np.isin(blocks, order[:n_audit + n_val]))
-    return TemporalSplit(train=train, val=val, audit=audit, test=np.sort(np.r_[val, audit]),
-                         block=int(block), guard=int(guard))
-
-
 # ------------------------------------------------------------------ compare two calibrations
 
 @dataclass
@@ -870,95 +725,3 @@ def ray_angles(cgroup, p3d, p2ds=None, min_deg=2.0, in_image=True):
                 median_max_angle_deg=float(np.median(maxang[fin])) if fin.any() else None)
 
 
-# ------------------------------------------------------------------ reuse assessment
-
-@dataclass
-class ReuseAssessment:
-    """``label`` is 'good', 'medium' or 'bad'. ``median_px``: median per-point mean reprojection
-    error over multi-view points; ``worst_cam_px``/``worst_camera``: the largest per-camera LOO
-    median (the 'has a camera moved' number)."""
-    label: str
-    median_px: Optional[float]
-    mean_px: Optional[float]
-    worst_cam_px: Optional[float]
-    worst_camera: Optional[str]
-    n_points: int
-    per_camera: Dict[str, Dict[str, Any]]
-    reason: Optional[str] = None
-    thresholds: Dict[str, float] = field(default_factory=dict)
-
-    def to_dict(self):
-        return {f.name: _builtin(getattr(self, f.name)) for f in fields(self)}
-
-
-def assess_reuse(cgroup, p2ds, good=(12.0, 18.0), medium=(25.0, 40.0), min_cams=3, min_points=200,
-                 min_cam_points=100, sample=2000, rng=0, robust=False, names=None):
-    """Can an existing calibration be reused for new 2D data? (EvoVision ``calib_reuse``)
-
-    Coverage first: every camera needs >= ``min_cam_points`` observations of points seen by
-    >= ``min_cams`` cameras, and there must be >= ``min_points`` such points, otherwise 'bad'
-    (an unmeasured camera cannot be vouched for). Then the global median of the per-point
-    mean reprojection error and the worst per-camera LOO median (a moved camera cannot hide
-    behind its own observations) must clear ``good = (median, worst)`` for 'good', ``medium``
-    for 'medium'; else 'bad'. ``sample`` caps the points used (``rng`` seeds the draw).
-    ``names`` (the 2D data's camera names) are checked against the group's order."""
-    gnames = cgroup.get_names()
-    thr = dict(good_median_px=good[0], good_worst_cam_px=good[1],
-               medium_median_px=medium[0], medium_worst_cam_px=medium[1])
-    def bad(reason, **kw):
-        base = dict(median_px=None, mean_px=None, worst_cam_px=None, worst_camera=None, n_points=0,
-                    per_camera={})
-        base.update(kw)
-        return ReuseAssessment(label='bad', reason=reason, thresholds=thr, **base)
-    if names is not None and list(names) != list(gnames):
-        return bad('camera order mismatch: calibration {} vs 2D {}'.format(gnames, list(names)))
-    try:
-        pts = _flat_points(p2ds, len(gnames))
-    except ValueError as e:
-        return bad(str(e))
-    C = pts.shape[0]
-    fin = np.isfinite(pts).all(-1)
-    multi = fin.sum(0) >= min(min_cams, C)
-    pts = pts[:, multi]
-    if pts.shape[1] < min_points:
-        return bad('only {} points seen by >= {} cameras (need {})'.format(pts.shape[1], min(min_cams, C), min_points),
-                   n_points=int(pts.shape[1]))
-    counts = np.isfinite(pts).all(-1).sum(1)
-    low = [n for n, k in zip(gnames, counts) if k < min_cam_points]
-    if low:
-        return bad('cameras with < {} multi-view points: {}'.format(min_cam_points, low),
-                   n_points=int(pts.shape[1]))
-    if sample and pts.shape[1] > sample:
-        g = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
-        pts = pts[:, np.sort(g.choice(pts.shape[1], size=sample, replace=False))]
-    P = G.pack(cgroup)
-    pt = torch.as_tensor(pts, dtype=P.dtype, device=P.device)
-    with torch.no_grad():
-        if robust:
-            X = T.triangulate_robust(P, pt, tau=max(good[1], 10.0)).p3d
-        else:
-            X = T.triangulate_linear(P, pt, min_cams=2)
-        e = _np(G.reproj_err(P, X, pt))
-    with np.errstate(invalid='ignore'):
-        e = np.where(np.isinf(e), np.nan, e)
-        per_pt = np.nanmean(np.where(np.isfinite(e), e, np.nan), axis=0) if e.size else np.array([])
-    per_pt = per_pt[np.isfinite(per_pt)]
-    med = float(np.median(per_pt)) if len(per_pt) else None
-    mean = float(np.mean(per_pt)) if len(per_pt) else None
-    lres = loo_reprojection(cgroup, pts, min_others=2, robust=robust, tau_tri=max(good[1], 10.0))
-    per = {n: dict(loo_median_px=lres.per_camera[n]['median_px'], loo_coverage=lres.per_camera[n]['coverage'],
-                   n=lres.per_camera[n]['n_supported']) for n in gnames}
-    meds = [(v['loo_median_px'], n) for n, v in per.items() if v['loo_median_px'] is not None]
-    worst, wcam = (max(meds) if meds else (None, None))
-    if med is None:
-        label = 'bad'
-    else:
-        w = med if worst is None else worst
-        if med <= good[0] and w <= good[1]:
-            label = 'good'
-        elif med <= medium[0] and w <= medium[1]:
-            label = 'medium'
-        else:
-            label = 'bad'
-    return ReuseAssessment(label=label, median_px=med, mean_px=mean, worst_cam_px=worst, worst_camera=wcam,
-                           n_points=int(pts.shape[1]), per_camera=per, thresholds=thr)

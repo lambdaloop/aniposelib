@@ -415,6 +415,12 @@ def _auto_margin(margin, width, height, nx, ny, frac=0.5):
         raise ValueError('margin must be >= 0 or "auto", got {}'.format(margin))
     return margin
 
+
+def _no_manual_verify(flag):
+    if flag:
+        raise ValueError('manually_verify was removed in aniposelib 1.1 (the cv2.imshow popup); '
+                         'inspect detections with board.draw_corners / your own viewer instead')
+
 class CalibrationObject(ABC):
     @abstractmethod
     def draw(self, size):
@@ -422,10 +428,6 @@ class CalibrationObject(ABC):
 
     @abstractmethod
     def detect_image(self, image):
-        pass
-
-    @abstractmethod
-    def manually_verify_board_detection(self, image, corners):
         pass
 
     @abstractmethod
@@ -646,7 +648,7 @@ class Checkerboard(CalibrationObject):
         self.squaresY = squaresY
         self.square_length = square_length
         self.units = units
-        self.manually_verify = manually_verify
+        _no_manual_verify(manually_verify)
 
         total_size = squaresX * squaresY
 
@@ -716,36 +718,12 @@ class Checkerboard(CalibrationObject):
             if subpix:
                 corners = cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1), self.SUBPIX_CRITERIA)
 
-        if corners is not None \
-            and self.manually_verify \
-                and not self.manually_verify_board_detection(gray, corners):
-            corners = None
-
         if corners is None:
             ids = None
         else:
             ids = self.ids
 
         return corners, ids
-
-    def manually_verify_board_detection(self, image, corners):
-
-        height, width = image.shape[:2]
-        image = cv2.drawChessboardCorners(image, self.get_size(), corners, 1)
-        cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
-        cv2.imshow('verify_detection', image)
-        while 1:
-            key = cv2.waitKey(0) & 0xFF
-            if key == ord('a'):
-                cv2.putText(image, 'Accepted!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
-                cv2.imshow('verify_detection', image)
-                cv2.waitKey(100)
-                return True
-            elif key == ord('d'):
-                cv2.putText(image, 'Rejected!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
-                cv2.imshow('verify_detection', image)
-                cv2.waitKey(100)
-                return False
 
     def get_object_points(self):
         return self.objPoints
@@ -872,7 +850,7 @@ class CharucoBoard(CalibrationObject):
     aruco_dict : cv2.aruco.Dictionary, int or str, optional
         Any ArUco/AprilTag dictionary (see :func:`get_aruco_dictionary`).
     manually_verify : bool
-        Show each detection and ask to accept or reject it.
+        Removed in 1.1 (kept in the signature for positional compatibility; ``True`` raises).
     legacy_pattern : bool
         Use the checkerboard phase of OpenCV < 4.6 / calib.io boards. It only matters for an
         even number of rows (``squaresY``); with the wrong setting, few corners are found.
@@ -924,7 +902,7 @@ class CharucoBoard(CalibrationObject):
         self.squaresY = int(squaresY)
         self.square_length = square_length
         self.marker_length = marker_length
-        self.manually_verify = manually_verify
+        _no_manual_verify(manually_verify)
         self.marker_bits = marker_bits
         self.dict_size = dict_size
         self.aruco_dict = aruco_dict
@@ -1124,9 +1102,6 @@ class CharucoBoard(CalibrationObject):
         if self.validate and len(corners) > 0 and \
                 not self.validate_detection(corners, ids):
             return empty_corners()
-        if len(corners) > 0 and self.manually_verify \
-                and not self.manually_verify_board_detection(_to_gray(image), corners, ids):
-            return empty_corners()
         return corners, ids
 
     def detect_image(self, image, camera=None):
@@ -1159,25 +1134,6 @@ class CharucoBoard(CalibrationObject):
         return homography_check(self.objPoints, corners, ids,
                                 max_homography_px=max_homography_px,
                                 min_corners=min_corners)
-
-    def manually_verify_board_detection(self, image, corners, ids=None):
-
-        height, width = image.shape[:2]
-        image = draw_corners(image, corners, ids)
-        cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
-        cv2.imshow('verify_detection', image)
-        while 1:
-            key = cv2.waitKey(0) & 0xFF
-            if key == ord('a'):
-                cv2.putText(image, 'Accepted!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
-                cv2.imshow('verify_detection', image)
-                cv2.waitKey(100)
-                return True
-            elif key == ord('d'):
-                cv2.putText(image, 'Rejected!', (int(width/2.5), int(height/1.05)), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, cv2.LINE_AA)
-                cv2.imshow('verify_detection', image)
-                cv2.waitKey(100)
-                return False
 
     # ------------------------------------------------------------ geometry / pose
 

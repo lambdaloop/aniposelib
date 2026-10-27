@@ -1295,14 +1295,12 @@ packages:
   - huggingface-hub ; extra == 'vggt'
   - soundfile ; extra == 'sync'
   - av ; extra == 'sync'
-  - pyyaml ; extra == 'io'
   - huggingface-hub ; extra == 'all'
   - onnxruntime ; extra == 'all'
   - onnx ; extra == 'all'
   - vggt ; extra == 'all'
   - soundfile ; extra == 'all'
   - av ; extra == 'all'
-  - pyyaml ; extra == 'all'
   requires_python: '>=3.9'
 - pypi: ./shim
   name: aniposelib

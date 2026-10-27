@@ -36,7 +36,7 @@ ANIPOSELIB_EXPECT_NOCONTRIB = "1"
 [feature.nocontrib.tasks]
 test-nocontrib = "pytest -q tests/test_boards.py tests/test_deepcharuco.py tests/test_intrinsics.py tests/test_rig_lab_board.py tests/test_fisheye.py"
 
-# All optional extras ([deepcharuco], [vggt], [sync], [io]) so the full test suite, including
+# All optional extras ([deepcharuco], [vggt], [sync]) so the full test suite, including
 # the real-model VGGT/DeepCharuco tests, runs in the default dev env.
 [feature.extras.pypi-dependencies]
 torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
@@ -48,7 +48,6 @@ onnxruntime = "*"
 onnx = "*"
 soundfile = "*"
 av = "*"
-pyyaml = "*"
 
 [environments]
 default = ["extras"]

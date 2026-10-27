@@ -30,7 +30,7 @@ from .boards import CharucoBoard, Checkerboard
 # Sub-modules imported on first attribute access (``aniposelib.quality``), so ``import
 # aniposelib`` stays fast and never imports optional dependencies (vggt, huggingface_hub,
 # onnxruntime, soundfile, av, yaml: those are imported inside the functions that need them).
-_LAZY_SUBMODULES = ('affine', 'bundle', 'detectors', 'geometry', 'init', 'intrinsics', 'io',
+_LAZY_SUBMODULES = ('affine', 'bundle', 'detectors', 'geometry', 'init', 'intrinsics',
                     'matching', 'quality', 'scale', 'stations', 'stba', 'sync', 'triangulation')
 
 __all__ = ['boards', 'cameras', 'params', 'utils', 'Camera', 'FisheyeCamera', 'CameraGroup',

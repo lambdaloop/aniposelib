@@ -79,35 +79,6 @@ def test_loo_fixed_denominator(scene):
     assert np.nanmax(c.medians()) < 3
 
 
-def test_assess_reuse_detects_moved_camera(scene):
-    true, p3d, p2d, *_ = scene
-    flat = p2d.reshape(7, -1, 2)
-    good = quality.assess_reuse(true, flat)
-    assert good.label == 'good' and good.worst_cam_px < 2
-    bad = quality.assess_reuse(moved(true, 5, 4), flat)
-    assert bad.label == 'bad' and bad.worst_camera == true.get_names()[5]
-    # unmeasured camera: no reuse, whatever the numbers
-    hole = flat.copy()
-    hole[1] = np.nan
-    assert quality.assess_reuse(true, hole).label == 'bad'
-    assert quality.assess_reuse(true, flat, names=true.get_names()[::-1]).label == 'bad'
-
-
-def test_paired_bootstrap(scene):
-    true, p3d, p2d, *_ = scene
-    flat = p2d.reshape(7, -1, 2)
-    a = quality.loo_reprojection(true, flat)
-    b = quality.loo_reprojection(moved(true, 2, 3), flat)
-    clusters = np.repeat(np.arange(p2d.shape[1]) // 5, p2d.shape[2])
-    pb = quality.paired_bootstrap(a, b, clusters, n_boot=300, seed=0)
-    assert pb.delta_agree < 0 and pb.ci95_agree[1] < 0
-    assert pb.error_delta > 0 and pb.ci95_error[0] > 0
-    assert pb.n_clusters == 12
-    json.dumps(pb.to_dict())
-    same = quality.paired_bootstrap(a, a, clusters, n_boot=50)
-    assert same.delta_agree == 0 and same.error_delta == 0
-
-
 def test_compare_recovers_similarity(scene):
     import cv2
     true, p3d, p2d, *_ = scene
@@ -176,15 +147,3 @@ def test_board_shape_residual():
     assert warped['median'] > 2 * good['median']
 
 
-def test_temporal_split():
-    starts = np.arange(0, 20000, 12)
-    sp = quality.temporal_split(starts, block=1000, guard=50, window=12, seed=1)
-    parts = [set(sp.train.tolist()), set(sp.val.tolist()), set(sp.audit.tolist())]
-    assert not (parts[0] & parts[1]) and not (parts[0] & parts[2]) and not (parts[1] & parts[2])
-    for part in (sp.train, sp.val, sp.audit):
-        off = starts[part] % 1000
-        assert np.all(off >= 50) and np.all(off + 12 < 950)
-    blocks = [set((starts[p] // 1000).tolist()) for p in (sp.train, sp.val, sp.audit)]
-    assert len(blocks[1]) == 4 and len(blocks[2]) == 4 and not (blocks[0] & blocks[1])
-    again = quality.temporal_split(starts, block=1000, guard=50, window=12, seed=1)
-    assert np.array_equal(again.audit, sp.audit)

@@ -20,7 +20,7 @@ API
     Least-squares fit of ``A, b`` from 3D-2D correspondences (>= 4 non-coplanar points).
 
 numpy in -> numpy out, torch in -> torch out (``return_grad=True`` keeps the graph).
-``aniposelib.io.from_dlt`` / ``from_projection_matrix`` return an ``AffineCamera`` when the
+``aniposelib.geometry.from_dlt`` / ``from_projection_matrix`` return an ``AffineCamera`` when the
 third row of the projection is ``[0, 0, 0, *]``.
 """
 
@@ -127,7 +127,7 @@ class AffineCamera(nn.Module):
         ``support`` points ``[N,3]`` (ported from tailcyclenet ``scripts/convert/johnson_fly.py``).
         Keeps skew. Raises if the approximation is worse than ``max_error_px``. Returns a
         :class:`~aniposelib.cameras.Camera`."""
-        from .io import camera_from_extrinsics_mat
+        from .geometry import camera_from_extrinsics_mat
         X = _f64(support).reshape(-1, 3)
         X = X[np.all(np.isfinite(X), 1)]
         if not len(X):
