@@ -311,9 +311,12 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   calibration error (the LOO rules report it) and is left out of the move tests, so its views do not bias its
   neighbours (`report['static_bad_cameras']`); a camera's first step is a move only if, just before it, the
   camera's LOO agreement was >= `moves_before_ratio` (0.5) x the other cameras' (a wrong position shows as a slow
-  decline as the subject moves; else `report['moves_demoted']`, with `reason`). Panoptic 00_15 off by
+  decline as the subject moves; else `report['moves_demoted']`, with `reason`), and when the step shifts its
+  projections by > 2 agreement thresholds, its agreement must drop after it (below `moves_after_ratio`, 0.7, x the
+  one before; measured with the move tests' 2-view LOO when the W4 LOO has too few points). Panoptic 00_15 off by
+  200 mm: no move (was 00_03 / 00_24, the neighbours); injected 1-8 deg re-aims and the dancing moves are unchanged. Panoptic 00_15 off by
   50 mm: no move (was a recovered 1.1 deg 'move' at 12 s). Old behaviour:
-  `options={'static_bad_ratio': None, 'moves_before_ratio': None}`.
+  `options={'static_bad_ratio': None, 'moves_before_ratio': None}` (`moves_after_ratio` is part of the latter).
 - **W2 `refine_intrinsics='auto'`** keeps the 2 % held-out gain rule but now also needs enough held-out evidence:
   every camera >= `intrinsics_min_heldout_obs` (100) held-out LOO observations from >= `intrinsics_min_heldout_windows`
   (10) windows, and a paired bootstrap over the held-out windows (`intrinsics_n_boot` 200) must find a gain > 0 in
