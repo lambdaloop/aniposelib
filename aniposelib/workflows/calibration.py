@@ -1816,7 +1816,7 @@ def _station_poses(cg, srep):
 
 W3_DEFAULTS = dict(
     board_kwargs=None,        # passed to scale.from_board (relative gates: frame MAD, spread)
-    lengths_kwargs=None,      # passed to scale.from_lengths (tau defaults to 5 noise units)
+    lengths_kwargs=None,      # passed to scale.from_lengths (tau defaults to 5 px; 5 x noise_unit if noise_unit is given)
     reference_kwargs=None,    # passed to scale.from_reference
     ground_points=None, up='z', origin='centroid',   # align='ground'
     noise_unit='auto',        # 'auto' (capped noise floor / 0.5 px) or a float (1 = absolute pixel defaults)
@@ -1993,7 +1993,10 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
             diag = _diag(cgroup, pts)
             nf, _ = _points_noise(cgroup, pts, diag)
             u = _noise_unit(nf, opts['noise_unit'])
-            kw = dict(tau=5.0 * u, min_inliers=min(3, len(cgroup.cameras)))
+            # absolute 5 px (the length pairs are scored on their best views; noise-scaled taus
+            # let heavy-tailed keypoints bias the scale: Emory +2 % at 5 u vs -0.8 % at 5 px)
+            kw = dict(tau=5.0 * (u if opts['noise_unit'] not in (None, 'auto') else 1.0),
+                      min_inliers=min(3, len(cgroup.cameras)))
             kw.update(opts['lengths_kwargs'] or {})
             settings.update(noise_floor_px=nf, noise_unit=u, tau_px=kw['tau'], min_inliers=kw['min_inliers'])
             r = S.from_lengths(cgroup, pts, lengths['pairs'], ref, joints=lengths.get('joints'), **kw)
@@ -2078,7 +2081,7 @@ W4_DEFAULTS = dict(
     tau_tri_px=None,          # LOO triangulation threshold (default 5 noise units)
     thresholds_px=None,       # LOO agreement thresholds (default (5, 8, 10) noise units)
     loo_window_s='auto',      # time-blocked LOO with times=: window (s); 'auto' ~ 20 windows; None = off
-    min_window_obs=50,        # ... windows with fewer eligible observations are not judged
+    min_window_obs=200,       # ... windows with fewer eligible observations are not judged
     bad_window_ratio=0.5,     # ... a camera is bad in a window when its LOO coverage / agreement < this x its median
     min_bad_cameras=None,     # ... a window is bad when this many cameras are (None: max(2, 25 % of the cameras))
     compare_to=None,          # {name: CameraGroup}: paired LOO agreement vs other calibrations

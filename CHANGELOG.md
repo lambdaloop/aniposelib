@@ -88,7 +88,8 @@ dancing). Behaviour changes say how to get the previous behaviour.
   (never 1.8e308); W4 names cameras with a low inlier rate as the likely cause of a low LOO coverage.
 - `init.sfm.from_correspondences`: when the best seed pair triangulates fewer than `min_pair_points` points, the next
   pairs are tried (`stats['seed_tried']`); this made `test_w2_bad_inputs` flaky across machines.
-- W3 lengths: MSAC threshold 5 noise units (was 10: +16 % scale on Emory), and the bones are re-measured on the scaled
+- W3 lengths: MSAC threshold an absolute 5 px (was 10 noise units: +16 % scale on Emory; 5 noise units still gave +2 %;
+  `options['noise_unit']` makes it 5 x that unit), and the bones are re-measured on the scaled
   rig at half the threshold (`report['lengths_check']`, rule `lengths_check`, warn above `options['lengths_check']`
   = 3 %). Old: `options={'lengths_kwargs': {'tau': 10 * u}}`. `lengths=` / `board=` together with `reference=` and
   `align='reference'`: scale from the lengths / board, frame from the reference (`details['reference_scale']`).
@@ -180,6 +181,12 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   - Frame ids: linking uses frame-id differences; `options['frame_axis']='auto'` returns only the frames with
     detections (`frame_ids`) when the dense axis would be > 2x larger and > 1000 frames (ids around 1e5 took
     hundreds of MB). Old: `options={'frame_axis': 'dense'}`.
+
+### Defaults settled after the real-data check
+
+- `associate_views`: `switch_min_frames` 3 -> 10 (3 over-split a real IoU tracker: 7 identities for 4 people);
+  `options={'switch_min_frames': 3}` for trackers that swap often.
+- `evaluate_calibration`: `min_window_obs` 50 -> 200, so sparse hours are not judged; `bad_windows_frac` is warn-only.
 
 ### Removed
 

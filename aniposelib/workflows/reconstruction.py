@@ -873,7 +873,7 @@ _W7_DEFAULTS = {
                                 # instances re-enter the nearest dormant identity instead of a new one
     'split_on_switch': True,    # tracklets: split a tracklet where the verification drops a run of
                                 # its frames (an identity switch), associate again
-    'switch_min_frames': 3,     # shortest dropped run treated as a switch
+    'switch_min_frames': 10,    # shortest dropped run treated as a switch (3 over-split a real IoU tracker)
     'stitch': True,             # tracklets: join identities that follow each other in time and space
     'frame_axis': 'auto',       # 'dense' (axis = frame id 0..max), 'sparse' (frames with detections,
                                 # see frame_ids), 'auto' (sparse when dense would be > 2x larger and > 1000 frames)
