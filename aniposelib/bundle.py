@@ -1,5 +1,5 @@
 """Bundle adjustment: sparse observations, Schur-complement Levenberg-Marquardt, robust recipe
-and camera resection (1.0, plan 01 D2-D7, F3, F5).
+and camera resection (1.0, plan 01 D2-D7, F5; 1.1: on the shared LM engine).
 
 API
 ---
@@ -8,8 +8,9 @@ API
     converts ``C x N x 2`` (or ``C x N x J x 2``; then ``group`` gets ``frame`` and ``keypoint``).
 ``bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy', f_scale=5.0,
                    n_iter=25, max_points=None, prune=None, extra=None, ...) -> float | BAReport``
-    Torch Schur-complement LM over camera parameters (selected by a
-    :class:`~aniposelib.params.ParamSpec`) and 3D points (or rigid board poses with ``extra=``),
+    Torch Schur-complement LM (the shared engine, :mod:`aniposelib._lm`) over camera parameters
+    (selected by a :class:`~aniposelib.params.ParamSpec`) and 3D points (or rigid board poses with
+    ``extra=``),
     with robust IRLS weights (``'linear' | 'huber' | 'cauchy' | 'soft_l1'``), priors, gauge
     (``fixed_cameras``) and scale (``scale_constraint``) control, and stations (F5: several
     extrinsic segments of one camera sharing its intrinsics). Time offsets live in
