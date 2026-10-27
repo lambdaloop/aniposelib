@@ -276,6 +276,12 @@ def _set_intrinsics(cam, K, dist=None, n_dist=None):
         cam.set_n_dist(int(min(n_dist, nd)))
 
 
+def _given_intrinsics(cam):
+    """Does this camera carry real intrinsics (not the default identity matrix)?"""
+    K = to_numpy(cam.get_camera_matrix()).astype(float)
+    return bool(np.all(np.isfinite(K)) and K[0, 0] > 1 and K[1, 1] > 1 and not np.allclose(K, np.eye(3)))
+
+
 def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
     """Per-camera intrinsics. Returns ``(lens_models, missing, fallbacks)``."""
     from .. import intrinsics as I
@@ -291,6 +297,7 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
     prior = mode if hasattr(mode, 'cameras') else None
     for cam, r, n in zip(cg.cameras, rows, names):
         size = cam.get_size()
+        has_init = init is not None and _given_intrinsics(cam)
         n_obs = int(sum(np.isfinite(np.asarray(x['filled'], float).reshape(-1, 2)).all(1).sum() for x in r))
         if prior is not None:
             pc = prior.cameras[prior.get_names().index(n)] if n in prior.get_names() else None
@@ -323,14 +330,14 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
             objp, imgp = board.get_all_calibration_points(r, min_points=max(opts['min_corners'], 4))
             if len(objp) >= 1:
                 seed = IB.init_camera_intrinsics(cam, objp, imgp, size,
-                                                 fallback='keep' if init is not None else 'nominal')
+                                                 fallback='keep' if has_init else 'nominal')
                 cam.set_n_dist(min(opts['min_n_dist'], to_numpy(cam.get_distortions()).shape[0]))
                 lens[n] = dict(source='seed:' + seed.source, reason=seed.reason, ladder_error=err)
                 fallbacks.append('{}: ladder failed ({}), {} intrinsics'.format(n, err, seed.source))
                 if seed.source == 'fallback:nominal':
                     fallbacks.append('{}: nominal intrinsics'.format(n))
                 continue
-            if init is not None:
+            if has_init:
                 lens[n] = dict(source='init', reason='no board views')
                 fallbacks.append('{}: no board views, intrinsics from init'.format(n))
             else:
@@ -342,7 +349,7 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
                 nd = 1 if n_obs >= 100 else 0
                 _set_intrinsics(cam, K, None, nd)
                 lens[n] = dict(source='dlt', n_dist=nd, **info)
-            elif init is not None:
+            elif has_init:
                 lens[n] = dict(source='init', reason='no view with >= 6 non-coplanar points')
                 fallbacks.append('{}: DLT impossible, intrinsics from init'.format(n))
             else:
