@@ -139,6 +139,36 @@ def test_reconstruct_soft_scores(person):
     assert not cut.inliers[bad].any() and cut.settings['min_score'] == 0.5
 
 
+def test_reconstruct_inlier_refit_heavy_tails(person):
+    """Opt-in inlier_refit='auto': on heavy-tailed keypoint noise the MSAC inliers are refit with
+    Cauchy weights (lower 3D and median reprojection error than the hard inliers); on Gaussian
+    noise it does not trigger. The default (False) is the plain least-squares inlier fit."""
+    true, p3d, p2d, _ = person
+    clean = synth.project(true, p3d)
+    rng = np.random.default_rng(11)
+    sig = np.where(rng.random(clean.shape[:-1]) < 0.25, 3.0, 0.7)
+    heavy = clean + rng.normal(size=clean.shape) * sig[..., None]
+    heavy[~np.isfinite(p2d).all(-1)] = np.nan
+    auto = W.reconstruct_3d(true, heavy, fill='none', options={'inlier_refit': 'auto'})
+    hard = W.reconstruct_3d(true, heavy, fill='none')
+    assert hard.settings['inlier_refit'] is False and not hard.settings['inlier_refit_applied']
+    assert auto.settings['inlier_refit_applied'] and auto.settings['inlier_tail_frac'] > 0.12
+    e = lambda r: np.nanmedian(_rel(true, r.points3d, p3d))
+    assert e(auto) < 0.9 * e(hard)
+    med = lambda r: np.nanmedian(r.errors)
+    assert med(auto) < med(hard)
+    np.testing.assert_array_equal(np.isfinite(auto.points3d), np.isfinite(hard.points3d))
+    # error_drift is measured on the MSAC fit (the refit must not absorb moved-camera errors)
+    assert auto.report['error_drift'] == hard.report['error_drift']
+    # Gaussian noise (+ gross outliers): 'auto' leaves the plain least-squares inlier fit
+    g = W.reconstruct_3d(true, p2d, fill='none', options={'inlier_refit': 'auto'})
+    g0 = W.reconstruct_3d(true, p2d, fill='none')
+    assert not g.settings['inlier_refit_applied'] and g.settings['inlier_tail_frac'] < 0.12
+    np.testing.assert_array_equal(g.points3d, g0.points3d)
+    with pytest.raises(ValueError):
+        W.reconstruct_3d(true, p2d, options={'inlier_refit': 'yes'})
+
+
 def test_reconstruct_bad_inputs(person):
     true, p3d, p2d, _ = person
     r = W.reconstruct_3d(true, np.full_like(p2d, np.nan))

@@ -259,6 +259,11 @@ class Reconstruction(WorkflowResult):
 _W6_DEFAULTS = {
     'tau_px': None,            # fixed MSAC threshold (px); None = clip(3 x noise floor, 10 px, 1 % of the diagonal)
     'tau_noise_mult': 3.0,
+    'inlier_refit': False,     # Cauchy-weighted refit of the MSAC inliers (opt-in): 'auto' = when the inlier errors are
+                               # heavier-tailed than Gaussian noise, True = always; False = plain least squares on the inliers
+    'refit_sigma_mult': 1.5,   # Cauchy scale of that refit, x noise floor
+    'refit_tail_frac': 0.12,   # 'auto': refit when more than this share of the inlier errors exceed 2 x their median
+                               # (Gaussian pixel noise: 0.06-0.10)
     'first_tau_diag_frac': 0.01,   # first robust pass: tau = max(10 px, this x image diagonal)
     'min_score': None,         # hard score cut (observations below are removed); None = soft only
     'min_views': 2,
@@ -592,6 +597,53 @@ def _reconstruct_identities(cgroup, pts, scores, bones, smooth, fill, robust, op
 
 
 @thread_guard
+def _inlier_tail_frac(errors, inl, weights=None):
+    """Share of the inlier errors above twice their median (Gaussian pixel noise: 0.06-0.10;
+    heavy-tailed keypoint noise: 0.15-0.25). ``weights`` (scores): a weighted share and median,
+    so low-score views that the scores already discount do not count as a heavy tail."""
+    m = np.asarray(inl, bool) & np.isfinite(np.asarray(errors, float))
+    e = np.asarray(errors, float)[m]
+    w = np.ones_like(e) if weights is None else np.asarray(weights, float).reshape(m.shape)[m]
+    if e.size < 20 or w.sum() <= 0:
+        return float('nan')
+    o = np.argsort(e)
+    cw = np.cumsum(w[o])
+    med = e[o][min(int(np.searchsorted(cw, 0.5 * cw[-1])), e.size - 1)]
+    return float(w[e > 2.0 * med].sum() / w.sum())
+
+
+def _cauchy_refit(P, X, flat, base, sigma, extrinsics=None, n_outer=4, n_gn=2,
+                  max_elems=1 << 22):
+    """Cauchy-weighted Gauss-Newton refit of triangulated points ``X [M,3]`` on the pixel
+    observations ``flat [C,M,2]`` with fit weights ``base [C,M]`` (inlier mask x scores; 0 = not
+    used): weights ``base / (1 + (e / sigma)^2)``, recomputed ``n_outer`` times. Points with
+    fewer than two used views are unchanged; NaN points stay NaN."""
+    import torch
+    from .. import geometry as G
+    from .. import triangulation as T
+    C, M = base.shape
+    dev, dt = P.device, P.dtype
+    Xt = torch.as_tensor(np.asarray(X, float).reshape(M, 3), device=dev, dtype=dt)
+    uv = torch.as_tensor(np.asarray(flat, float), device=dev, dtype=dt)
+    b = torch.as_tensor(np.asarray(base, float), device=dev, dtype=dt)
+    E = T._prep_ext(P, extrinsics, M)
+    fin = torch.isfinite(Xt).all(-1)
+    out = Xt.clone()
+    step = max(1, int(max_elems // max(1, C)))
+    with torch.no_grad():
+        for s0 in range(0, M, step):
+            sl = slice(s0, min(M, s0 + step))
+            Xs, us, bs, Es = Xt[sl], uv[:, sl], b[:, sl], T._sub_ext(E, sl)
+            for _ in range(n_outer):
+                e = torch.nan_to_num(G._reproj_err_flat(P, torch.nan_to_num(Xs), us, Es),
+                                     nan=float('inf'), posinf=float('inf'))
+                w = torch.where(bs > 0, bs / (1.0 + (e / sigma) ** 2), torch.zeros_like(bs))
+                Xs = T._refine_flat(P, Xs, us, w, Es, n_iter=n_gn)
+            out[sl] = Xs
+    out = torch.where(fin[:, None], out, torch.full_like(out, float('nan')))
+    return out.cpu().numpy()
+
+
 def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
                    robust=True, options=None, device='auto', times=None, segments=None,
                    extrinsics=None):
@@ -616,7 +668,13 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             (frames that are not consecutive) use ``'none'``, or pass ``times=``.
         robust: True (MSAC with a noise-derived tau) or False (score-weighted linear DLT).
         options: overrides of ``_W6_DEFAULTS``:
-            ``tau_px`` (fixed MSAC threshold), ``min_score`` (hard score cut), ``min_views``
+            ``tau_px`` (fixed MSAC threshold), ``inlier_refit`` (False, default: plain least squares
+            on the MSAC inliers; 'auto': Cauchy-weighted refit of the inliers, scale
+            ``refit_sigma_mult`` (1.5) x noise floor, when the score-weighted share of inlier errors
+            above 2 x their median exceeds ``refit_tail_frac`` (0.12), i.e. heavier tails than
+            Gaussian noise; True: always. The refit lowers the in-sample reprojection error, not
+            the held-out 3D accuracy, see docs/workflows.md),
+            ``min_score`` (hard score cut), ``min_views``
             (2), ``min_joints_per_view`` (None; int, or a fraction of J if < 1: camera-frames
             with fewer finite keypoints are dropped before triangulation), ``mask_out_of_bounds``
             (True: observations outside the image are not used; counted in ``out_of_image``),
@@ -768,6 +826,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         return to_numpy(G.project(P, torch.as_tensor(Xc, device=P.device, dtype=P.dtype),
                                   extrinsics=Ef)[0]).reshape(C, N, J, 2)
 
+    X_msac = None                                       # MSAC points before the inlier refit
     with timer('triangulate'):
         if robust:
             tau0 = max(10.0, opts['first_tau_diag_frac'] * diag) if diag else 20.0
@@ -785,6 +844,27 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             X = to_numpy(res.p3d).reshape(N, J, 3)
             inl = to_numpy(res.inliers).reshape(C, N, J)
             settings.update(first_tau_px=tau0, noise_px=nf, noise_unit=_noise_unit(nf), tau_px=tau)
+            # optional Cauchy-weighted refit of the inliers: lowers the in-sample reprojection error on
+            # heavy-tailed keypoints (motor observatory median 3.29 -> 2.94 px, project IRLS 3.06) but not
+            # the held-out accuracy elsewhere (Panoptic MPJPE +0.05 cm, dancing bone CV +5-11 %), so opt-in;
+            # the plain least-squares inlier fit already beats the project's IRLS on leave-one-camera-out
+            # reprojection (4.98 vs 5.20 px)
+            mode = opts['inlier_refit']
+            if mode not in ('auto', True, False):
+                raise ValueError("options['inlier_refit'] must be 'auto', True or False, got {!r}".format(mode))
+            tail = _inlier_tail_frac(to_numpy(res.errors), to_numpy(res.inliers), swf) \
+                if mode == 'auto' else None
+            do_refit = mode is True or (mode == 'auto' and np.isfinite(tail) and
+                                        tail > float(opts['refit_tail_frac']))
+            sig = float(opts['refit_sigma_mult']) * nf
+            if do_refit:
+                X_msac = X.copy()
+                base = to_numpy(res.inliers).astype(float).reshape(C, -1)
+                if swf is not None:
+                    base = base * swf
+                X = _cauchy_refit(P, X.reshape(-1, 3), flat, base, sig, extrinsics=Ef).reshape(N, J, 3)
+            settings.update(inlier_refit=mode, inlier_tail_frac=tail, inlier_refit_applied=bool(do_refit),
+                            inlier_refit_sigma_px=sig if do_refit else None)
         else:
             w = None if swf is None else np.sqrt(swf)
             lin = np.where(usable.reshape(C, -1)[..., None], flat, np.nan)
@@ -976,7 +1056,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         'median_point_error_px': float(np.nanmedian(pe)) if np.isfinite(pe).any() else None,
         'two_view_frac': float(((n_views == 2) & have).sum() / max(have.sum(), 1)),
     }
-    drift = _error_drift(err, usable & have[None])
+    # drift on the MSAC fit: the Cauchy refit absorbs part of a systematic error (moved cameras)
+    err_d = err if X_msac is None else np.linalg.norm(project(X_msac) - pts, axis=-1)
+    drift = _error_drift(err_d, usable & have[None])
     report['error_drift'] = drift
     rules = [
         Rule('reconstructed_frac', float(have.mean()) if have.size else 0.0, 0.5, 0.05,
