@@ -657,7 +657,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                 m = inl[:, s:e] & have[None, s:e]
                 return float(np.median(ee[m])) if m.any() else float('nan')
             Xo = np.full((N, J, 3), np.nan)
-            for s0, e0 in runs:
+            # bones and reprojection terms are per frame: only smoothing must be split by
+            # segment (filled cells are always inside a segment, see _fill_keep)
+            for s0, e0 in (runs if smooth is not None else [(0, N)]):
                 if not have[s0:e0].any():
                     continue
                 Xs, nc, nr = _optim_chunked(

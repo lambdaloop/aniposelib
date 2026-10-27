@@ -282,8 +282,8 @@ def test_reconstruct_max_gap_segments_times(person):
         W.reconstruct_3d(true, q, options={'max_gap_s': 0.5})
     # segments: a gap at a segment boundary is never bridged, also with bones
     seg = np.r_[np.zeros(43), np.ones(q.shape[1] - 43)]
-    for b in (None, bones):
-        r = W.reconstruct_3d(true, p2d, segments=seg, bones=b, options={'n_iters': 40})
+    for b, sm in ((None, None), (bones, None), (None, 2.0)):
+        r = W.reconstruct_3d(true, p2d, segments=seg, bones=b, smooth=sm, options={'n_iters': 40})
         assert np.isnan(r.points3d[40:43, 3]).all() and np.isnan(r.points3d[43:46, 3]).all()
         assert np.isfinite(r.points3d[30:40, 3]).all()
     assert r.settings['n_segments'] == 2
