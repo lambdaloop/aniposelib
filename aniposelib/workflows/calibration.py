@@ -1144,9 +1144,19 @@ def _candidates(base, p, init, frames, gr, opts, rng, rpt, names, dev=None):
                 rpt.init_reports['sfm'] = ir
             elif spec == 'people':
                 from ..init import people
-                cg, ir = people.from_people(base, p, **(opts['people_kwargs'] or {}))
+                pk = dict(opts['people_kwargs'] or {})
+                akw = dict(pk.pop('association_kwargs', None) or {})
+                akw.setdefault('track_ids', pk.pop('track_ids', None))
+                akw.setdefault('rng', rng)
+                # associate once: the 4D points below reuse it (it ran twice before 1.1, ~2 x 30 s on
+                # Panoptic, and unseeded)
+                assoc = people.associate_people(base, p, **akw)
+                pk.setdefault('rng', rng)
+                pk.setdefault('device', dev)
+                cg, ir = people.from_people(base, p, association=assoc, **pk)
                 cands['people'] = cg
                 rpt.init_reports['people'] = ir
+                rpt._people_assoc = assoc[0]
             else:
                 raise ValueError('unknown init {!r}'.format(spec))
         except Exception as exc:
@@ -1547,10 +1557,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     with timer('init'):
         cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names, dev=dev)
         if p.ndim == 5 and 'people' in cands:
-            from ..init import people
-            akw = dict(pk.get('association_kwargs') or {})
-            akw.setdefault('track_ids', track_ids)
-            assoc, _ = people.associate_people(base, p, **akw)
+            assoc = rpt._people_assoc
             C_, F_, G_, J_, _ = assoc.shape
             p = assoc.reshape(C_, F_ * G_, J_, 2)
             gr = dict(frame=np.arange(F_ * G_), window=np.repeat(np.arange(F_), G_))

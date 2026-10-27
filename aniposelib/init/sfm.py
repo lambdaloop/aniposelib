@@ -445,6 +445,23 @@ def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pa
     return {(jb[0], jb[1]): r for jb, r in zip(jobs, results) if r is not None}
 
 
+def _epipolar_median(u, f, i, j, r):
+    """Median symmetric epipolar distance (px) of all correspondences of pair ``(i, j)`` under
+    its essential matrix (``r`` from :func:`pairwise_poses`)."""
+    idx = r['idx']
+    a, b = u[i, idx] / f[i], u[j, idx] / f[j]
+    t = np.asarray(r['t'], dtype='float64').ravel()
+    E = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) @ np.asarray(r['R'])
+    ha = np.concatenate([a, np.ones((len(a), 1))], 1)
+    hb = np.concatenate([b, np.ones((len(b), 1))], 1)
+    la, lb = ha @ E.T, hb @ E
+    with np.errstate(all='ignore'):
+        d = 0.5 * np.abs(np.sum(hb * la, 1)) * (1 / np.linalg.norm(la[:, :2], axis=1)
+                                                 + 1 / np.linalg.norm(lb[:, :2], axis=1))
+    d = d[np.isfinite(d)] * np.sqrt(f[i] * f[j])
+    return float(np.median(d)) if len(d) else float('nan')
+
+
 def _resolve_device(cgroup, device):
     """``device`` (None: the group's device; 'auto': CUDA if available) as a torch device string."""
     if device is None:
@@ -561,7 +578,7 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
                          pair_thresh=2.0, pair_method='usac', pnp_thresh=8.0, point_max_err=12.0, decoy_thresh=25.0,
                          min_pair_points=30, scan_iters=60, place_iters=400,
                          min_frame_points=None, local_ba_kwargs=None, pairs=None, device=None,
-                         n_jobs=None, verbose=False):
+                         n_jobs=None, noise_mult=2.5, verbose=False):
     """Initial extrinsics from 2D correspondences and per-camera intrinsics (see module doc).
 
     Parameters
@@ -587,6 +604,10 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         CUDA if available). The RANSAC itself is OpenCV on the CPU.
     n_jobs : threads for the RANSAC (pairs, per-camera PnP); None: torch's thread count, at
         most 16. Does not change the result.
+    noise_mult : the PnP threshold is ``max(pnp_thresh, noise_mult * noise)``, with ``noise`` the
+        median symmetric epipolar distance (px) of the seed pair's correspondences (1.1; None/0:
+        the fixed ``pnp_thresh``, as before). Noisy keypoints (people at 1080p, ~6 px) otherwise
+        fail the per-frame median test on correctly posed cameras.
 
     Returns
     -------
@@ -643,6 +664,17 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         ext = {i0: np.eye(4), j0: make_M(r0['R'], r0['t'])}
         drivers = {i0, j0}
     log('sfm: seed pair {}/{} ({} inliers; tried {})'.format(names[i0], names[j0], r0['n_in'], seed_tried))
+    # keypoint noise from the seed pair: median symmetric epipolar distance of all its
+    # correspondences (px; ~ the per-coordinate noise sigma). The frame-RANSAC threshold is at
+    # least noise_mult x that: the fixed 8 px suits ~2-3 px noise, but with ~6 px (people at
+    # 1080p, a COCO detector) most frames of a correctly posed camera fail 8 px and cameras were
+    # rejected or became passengers (Panoptic: 2 of 5 unplaced)
+    noise_px = _epipolar_median(u, f, i0, j0, r0)
+    pnp_thresh_in = pnp_thresh
+    if noise_mult and np.isfinite(noise_px):
+        pnp_thresh = max(pnp_thresh, float(noise_mult) * noise_px)
+    if pnp_thresh != pnp_thresh_in:
+        log('sfm: noise {:.2f} px -> pnp_thresh {:.1f} px'.format(noise_px, pnp_thresh))
 
     def implausible(M, p3d, good):
         pts = p3d[good]
@@ -676,7 +708,35 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
     p3d, good, err, ks = retri()
     remaining = set(range(C)) - set(ext)
     order = 0
-    while remaining:
+    ba_at = 0            # placements at the last local BA
+    deferred, retried, last_try = {}, False, {}
+
+    def local_ba():
+        nonlocal ext, p3d, good, err, ks, ba_at
+        ks = sorted(ext)
+        work = _frame_mask(u[ks], fid, err, decoy_thresh, mfp)
+        work[~(err <= max(pnp_thresh, 3 * _med(err)))] = np.nan  # single-view outliers
+        cloud = np.where(good[:, None], p3d, np.nan)
+        kw = dict(fix=(ks.index(i0),), rng=rng, reject_px=pnp_thresh)
+        kw.update(local_ba_kwargs or {})
+        Ms = refine_extrinsics(work, f[ks], np.stack([ext[k] for k in ks]), cloud, **kw)
+        ext = {k: M for k, M in zip(ks, Ms)}
+        p3d, good, err, ks = retri()
+        ba_at = order
+        log('sfm:   local BA -> {:.2f} px'.format(_med(err)))
+
+    while remaining or (deferred and not retried):
+        if not remaining:
+            # cameras too weak against the early (2-3 view, unrefined) cloud get one more try
+            # against the final one: a few placements and a local BA later the cloud is much
+            # better (before 1.1 they were rejected for good, e.g. 2 of 5 Panoptic cameras)
+            retried = True
+            if local_ba_every and order > ba_at:
+                local_ba()
+            remaining = set(deferred)
+            last_try = dict(deferred)
+            log('sfm: retry {}'.format([names[k] for k in sorted(remaining)]))
+            deferred.clear()
         cloud = np.where(good[:, None], p3d, np.nan)
         # scan: every remaining camera against the cloud, in parallel (independent seeds drawn
         # from rng in camera order, so the result depends on rng only)
@@ -690,7 +750,10 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
                 r['cam'] = c
                 cands.append(r)
         if not cands:
-            break
+            if retried:     # a deferred camera that found no pose at all on its retry
+                rejected.update({names[k]: last_try[k] for k in remaining if k in last_try})
+            remaining.clear()
+            continue
         cands.sort(key=lambda r: -(r['n_inlier_frames'] + r['n_inlier_frames'] / max(1, r['n_frames'])))
         c = cands[0]['cam']
         r = frame_pnp_ransac(cloud, u[c], fid, f[c], thresh=pnp_thresh, n_iters=place_iters,
@@ -705,10 +768,15 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
             if r2 is not None and r2['n_inlier_frames'] > r['n_inlier_frames']:
                 r = r2
             if weak(r):
-                rejected[name] = dict(reason='too few independent frames agree with the reconstruction',
-                                      inlier_frames=r['n_inlier_frames'],
-                                      inlier_windows=n_windows(r['inlier_frames']), n_frames=r['n_frames'])
-                log('sfm: REJECT {}: {}'.format(name, rejected[name]))
+                info = dict(reason='too few independent frames agree with the reconstruction',
+                            inlier_frames=r['n_inlier_frames'],
+                            inlier_windows=n_windows(r['inlier_frames']), n_frames=r['n_frames'])
+                if not retried:
+                    deferred[c] = info
+                    log('sfm: defer {}: {}'.format(name, info))
+                else:
+                    rejected[name] = info
+                    log('sfm: REJECT {}: {}'.format(name, info))
                 continue
         M_new = make_M(rodrigues(r['rvec']), r['tvec'])
         bad, d_new, d_med = implausible(M_new, p3d, good)
@@ -762,16 +830,7 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         log('sfm: placed {} {}/{} frames, {} windows, {:.2f} px{}'.format(
             name, r['n_inlier_frames'], r['n_frames'], nw, _med(err), '' if is_driver else ' [passenger]'))
         if local_ba_every and (order % local_ba_every == 0 or not remaining):
-            ks = sorted(ext)
-            work = _frame_mask(u[ks], fid, err, decoy_thresh, mfp)
-            work[~(err <= max(pnp_thresh, 3 * _med(err)))] = np.nan  # single-view outliers
-            cloud = np.where(good[:, None], p3d, np.nan)
-            kw = dict(fix=(ks.index(i0),), rng=rng, reject_px=pnp_thresh)
-            kw.update(local_ba_kwargs or {})
-            Ms = refine_extrinsics(work, f[ks], np.stack([ext[k] for k in ks]), cloud, **kw)
-            ext = {k: M for k, M in zip(ks, Ms)}
-            p3d, good, err, ks = retri()
-            log('sfm:   local BA -> {:.2f} px'.format(_med(err)))
+            local_ba()
 
     ks = sorted(ext)
     placed = [names[k] for k in ks]
@@ -783,7 +842,7 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         passengers=passengers, rejected=rejected,
         missing=[n for i, n in enumerate(names) if i not in ext and n not in rejected],
         stats=dict(seed_pair=[names[i0], names[j0]], seed_inliers=int(r0['n_in']), seed_tried=seed_tried,
-                   n_pairs=len(pairs), cameras=cam_stats, median_px=_med(err), per_camera_px=per_cam,
+                   n_pairs=len(pairs), noise_px=float(noise_px), pnp_thresh_px=float(pnp_thresh), cameras=cam_stats, median_px=_med(err), per_camera_px=per_cam,
                    n_points=int(good.sum()), gauge='seed camera {} = identity, seed baseline = 1'.format(names[i0])))
     return out, report
 
