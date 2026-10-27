@@ -758,8 +758,23 @@ class Association:
 def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, max_instances=0,
                      scores=None):
     """Per-frame multi-instance association of single-point detections. See the module docstring."""
+    return _associate_batch(cgroup, [points_per_cam], max_res_px=max_res_px, min_views=min_views,
+                            max_instances=max_instances, scores=scores)[0]
+
+
+def associate_points_frames(cgroup, frames, batch_frames=256, **kwargs):
+    """:func:`associate_points` over a list of frames (each a ``points_per_cam`` list). Frames are
+    processed ``batch_frames`` at a time: one undistortion, one pair triangulation and one refit
+    per greedy round for the whole batch (the same result as one call per frame)."""
     P = cgroup if isinstance(cgroup, G.PackedCameras) else G.pack(cgroup)
-    C = P.K.shape[0]
+    frames = list(frames)
+    out = []
+    for s in range(0, len(frames), max(1, int(batch_frames))):
+        out += _associate_batch(P, frames[s:s + max(1, int(batch_frames))], **kwargs)
+    return out
+
+
+def _prep_frame(points_per_cam, C, scores):
     if len(points_per_cam) != C:
         raise ValueError(f'points_per_cam has {len(points_per_cam)} cameras, the group has {C}')
     torch_out = any(isinstance(p, torch.Tensor) for p in points_per_cam)
@@ -771,17 +786,17 @@ def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, ma
     pad = np.full((C, N, 2), np.nan)
     for c, p in enumerate(pts):
         pad[c, :len(p)] = p
-    valid = np.isfinite(pad).all(-1)                                   # [C, N]
+    spad = None
     if scores is not None:
         spad = np.full((C, N), -np.inf)
         for c, s in enumerate(scores):
             s = np.asarray(s.detach().cpu().numpy() if isinstance(s, torch.Tensor) else s,
                            dtype=np.float64).reshape(-1)
             spad[c, :len(s)] = s
-    und = G.undistort(P, pad)                                          # once per detection
-    valid &= np.isfinite(und).all(-1)
+    return dict(torch_out=torch_out, device=device, n=n, pad=pad, spad=spad)
 
-    # all cross-camera candidate pairs, one triangulation
+
+def _pair_candidates(valid, C):
     ca_l, ia_l, cb_l, ib_l = [], [], [], []
     for ca, cb in itertools.combinations(range(C), 2):
         ia, ib = np.flatnonzero(valid[ca]), np.flatnonzero(valid[cb])
@@ -790,16 +805,22 @@ def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, ma
         A, B = np.meshgrid(ia, ib, indexing='ij')
         ca_l.append(np.full(A.size, ca)); cb_l.append(np.full(A.size, cb))
         ia_l.append(A.ravel()); ib_l.append(B.ravel())
+    if not ca_l:
+        return None
+    return tuple(np.concatenate(v) for v in (ca_l, ia_l, cb_l, ib_l))
+
+
+def _greedy_frame(C, fr, und, valid, cand, X, proj, depth, max_res_px, min_views, max_instances):
+    """Greedy instance growing of one frame (a generator: yields refit requests ``(sub [C,2]
+    undistorted, obs [C,2] pixels)`` and receives ``(Xr [3], e [C])``); returns the
+    :class:`Association`."""
+    pad, spad, n = fr['pad'], fr['spad'], fr['n']
     members, points3d, residuals, support = [], [], [], []
     used = ~valid
-    if ca_l:
-        ca_, ia_, cb_, ib_ = (np.concatenate(v) for v in (ca_l, ia_l, cb_l, ib_l))
+    if cand is not None:
+        ca_, ia_, cb_, ib_ = cand
         M = len(ca_)
         r_ = np.arange(M)
-        cu = np.full((C, M, 2), np.nan)
-        cu[ca_, r_], cu[cb_, r_] = und[ca_, ia_], und[cb_, ib_]
-        X = T.triangulate_linear(P, cu, undistort=False)               # [M, 3]
-        proj, depth = G.project(P, X)                                  # [C, M, 2]
         proj = np.where((depth > 0)[..., None], proj, np.nan)
         pair_res = 0.5 * (np.linalg.norm(proj[ca_, r_] - pad[ca_, ia_], axis=-1)
                           + np.linalg.norm(proj[cb_, r_] - pad[cb_, ib_], axis=-1))
@@ -812,12 +833,12 @@ def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, ma
         near[ca_, r_] = False
         near[cb_, r_] = False
         sup = near.sum(0)
-        cand = np.flatnonzero(ok)
-        if scores is not None:
+        cand_ok = np.flatnonzero(ok)
+        if spad is not None:
             ps = np.minimum(spad[ca_, ia_], spad[cb_, ib_])
-            order = cand[np.lexsort((pair_res[cand], -ps[cand], -sup[cand]))]
+            order = cand_ok[np.lexsort((pair_res[cand_ok], -ps[cand_ok], -sup[cand_ok]))]
         else:
-            order = cand[np.lexsort((pair_res[cand], -sup[cand]))]
+            order = cand_ok[np.lexsort((pair_res[cand_ok], -sup[cand_ok]))]
         for k in order:
             a, ia, b, ib = int(ca_[k]), int(ia_[k]), int(cb_[k]), int(ib_[k])
             if used[a, ia] or used[b, ib]:
@@ -833,14 +854,12 @@ def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, ma
             if len(mem) < max(2, min_views):
                 continue
             cams = sorted(mem)
-            sub = np.full((C, 1, 2), np.nan)
+            sub = np.full((C, 2), np.nan)
+            obs = np.full((C, 2), np.nan)
             for c in cams:
-                sub[c, 0] = und[c, mem[c]]
-            Xr = T.triangulate_linear(P, sub, undistort=False)[0]
-            obs = np.full((C, 1, 2), np.nan)
-            for c in cams:
-                obs[c, 0] = pad[c, mem[c]]
-            e = G.reproj_err(P, Xr[None], obs)[:, 0]
+                sub[c] = und[c, mem[c]]
+                obs[c] = pad[c, mem[c]]
+            Xr, e = yield sub, obs
             res = float(np.median(e[cams]))
             if not res <= max_res_px:
                 continue
@@ -871,13 +890,66 @@ def associate_points(cgroup, points_per_cam, max_res_px=30.0, min_views=2, *, ma
     p3 = np.array(points3d, dtype=np.float64).reshape(-1, 3)
     res = np.array(residuals, dtype=np.float64)
     sup = np.array(support, dtype=np.int64)
-    if torch_out:
+    if fr['torch_out']:
+        device = fr['device']
         p3, res, sup = (torch.as_tensor(v, device=device) for v in (p3, res, sup))
         labels = [torch.as_tensor(l, device=device) for l in labels]
     return Association(p3, members, res, sup, labels)
 
 
-def associate_points_frames(cgroup, frames, **kwargs):
-    """:func:`associate_points` over a list of frames (each a ``points_per_cam`` list)."""
-    P = G.pack(cgroup) if not isinstance(cgroup, G.PackedCameras) else cgroup
-    return [associate_points(P, f, **kwargs) for f in frames]
+def _associate_batch(cgroup, frames, max_res_px=30.0, min_views=2, *, max_instances=0, scores=None):
+    P = cgroup if isinstance(cgroup, G.PackedCameras) else G.pack(cgroup)
+    C = P.K.shape[0]
+    frs = [_prep_frame(f, C, scores) for f in frames]
+    if not frs:
+        return []
+    # one undistortion of every detection of every frame
+    widths = [f['pad'].shape[1] for f in frs]
+    cuts = np.cumsum([0] + widths)
+    und_all = G.undistort(P, np.concatenate([f['pad'] for f in frs], axis=1))
+    unds, valids, cands = [], [], []
+    for k, f in enumerate(frs):
+        und = und_all[:, cuts[k]:cuts[k + 1]]
+        valid = np.isfinite(f['pad']).all(-1) & np.isfinite(und).all(-1)
+        unds.append(und); valids.append(valid)
+        cands.append(_pair_candidates(valid, C))
+    # one linear triangulation + projection of every cross-camera candidate pair
+    sizes = [0 if cd is None else len(cd[0]) for cd in cands]
+    mcuts = np.cumsum([0] + sizes)
+    cu = np.full((C, int(mcuts[-1]), 2), np.nan)
+    for k, cd in enumerate(cands):
+        if cd is None:
+            continue
+        ca_, ia_, cb_, ib_ = cd
+        r_ = mcuts[k] + np.arange(len(ca_))
+        cu[ca_, r_], cu[cb_, r_] = unds[k][ca_, ia_], unds[k][cb_, ib_]
+    if cu.shape[1]:
+        X_all = T.triangulate_linear(P, cu, undistort=False)          # [M, 3]
+        proj_all, depth_all = G.project(P, X_all)                     # [C, M, 2]
+    gens, out = [], [None] * len(frs)
+    for k, f in enumerate(frs):
+        sl = slice(int(mcuts[k]), int(mcuts[k + 1]))
+        args = (None, None, None) if cands[k] is None else (X_all[sl], proj_all[:, sl], depth_all[:, sl])
+        gens.append(_greedy_frame(C, f, unds[k], valids[k], cands[k], *args, max_res_px, min_views,
+                                  max_instances))
+    # drive the greedy loops: one batched refit per round over all frames
+    pending = {}
+    for k, g in enumerate(gens):
+        try:
+            pending[k] = next(g)
+        except StopIteration as stop:
+            out[k] = stop.value
+    while pending:
+        keys = list(pending)
+        sub = np.stack([pending[k][0] for k in keys], 1)               # [C, R, 2]
+        obs = np.stack([pending[k][1] for k in keys], 1)
+        Xr = T.triangulate_linear(P, sub, undistort=False)             # [R, 3]
+        e = G.reproj_err(P, Xr, obs)                                   # [C, R]
+        nxt = {}
+        for r, k in enumerate(keys):
+            try:
+                nxt[k] = gens[k].send((Xr[r], e[:, r]))
+            except StopIteration as stop:
+                out[k] = stop.value
+        pending = nxt
+    return out

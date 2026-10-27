@@ -637,8 +637,9 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
 
         def run(gate):
             out = [None] * F
-            for f, per in zip(fids, cent):
-                out[int(f)] = M.associate_points(P, per, max_res_px=gate, min_views=max(2, min_views))
+            res = M.associate_points_frames(P, cent, max_res_px=gate, min_views=max(2, min_views))
+            for f, a in zip(fids, res):
+                out[int(f)] = a
             return [a if a is not None else empty() for a in out]
         with timer('associate'):
             assoc = run(gate1)
