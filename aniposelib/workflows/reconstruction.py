@@ -184,6 +184,9 @@ def _bone_cv(X, bones):
     return out
 
 
+OPTIM_GPU_MIN_CELLS = 50000   # device='auto': smaller optim_points chunks (frames x joints) run on the CPU
+
+
 def _chunks(N, chunk, overlap):
     if N <= chunk:
         return [(0, N)]
@@ -249,7 +252,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         robust: True (MSAC with a noise-derived tau) or False (score-weighted linear DLT).
         options: overrides of ``_W6_DEFAULTS`` (``tau_px``, ``min_score``, ``n_iters``,
             ``chunk_frames``, ``verdict``, ...).
-        device: ``'auto'`` (cuda if available), ``'cpu'``, ``'cuda'``.
+        device: ``'auto'`` (cuda if available; ``optim_points`` chunks of fewer than
+            ``OPTIM_GPU_MIN_CELLS`` frames x joints stay on the CPU, where they are faster),
+            ``'cpu'``, ``'cuda'``.
 
     Verdict rules:
         ``reconstructed_frac`` (triangulated (frame, joint) cells / all; warn < 0.5,
@@ -338,7 +343,12 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         if optimise and have.sum() >= 2:
             obs_in = np.where(inl[..., None], pts, np.nan)
             tau_o = tau if tau is not None else 10.0 * _noise_unit(noise_floor(None))
-            Xo, n_chunks = _optim_chunked(cg, obs_in, X, sw, bones,
+            # optim_points is a loop of small steps: a GPU only pays off for large chunks
+            cg_o = cg
+            if device in (None, 'auto') and str(cg.device).startswith('cuda') and \
+                    min(N, int(opts['chunk_frames'])) * J < OPTIM_GPU_MIN_CELLS:
+                cg_o = _group_on(cgroup, 'cpu')
+            Xo, n_chunks = _optim_chunked(cg_o, obs_in, X, sw, bones,
                                           0.0 if smooth is None else float(smooth), opts, tau_o,
                                           keep)
             final = Xo
