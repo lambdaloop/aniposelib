@@ -109,7 +109,11 @@ class IntrinsicsPrior:
 
     ``reference``: a CameraGroup (cameras matched by name, else by position) or a list of cameras.
     ``sigma_logf``: sigma of log focal length (0.05 = 5 %); ``sigma_c``: principal point, px;
-    ``sigma_k``: distortion coefficients (unitless). None skips that prior.
+    ``sigma_k``: distortion coefficients (unitless). None skips that prior. Each sigma may also be
+    a dict ``{camera name: sigma, 'default': sigma}`` (per-camera priors, e.g. a loose focal prior for
+    a phone with stabilisation and tight ones for board-calibrated cameras; a camera without an
+    entry and no ``'default'`` gets no prior of that kind).
+    Cameras are matched by name; by position only when no camera name matches the reference.
     A prior residual ``(value - mu) / sigma`` weighs like one observation with that pixel error.
     """
     reference: Any
@@ -121,27 +125,35 @@ class IntrinsicsPrior:
         """``{camera index: {name: (mu, sigma[, 'log'])}}`` for ``cameras``."""
         ref = list(getattr(self.reference, 'cameras', self.reference))
         by_name = {c.get_name(): c for c in ref}
+        by_position = not any(cam.get_name() in by_name for cam in cameras)
         out = {}
+
+        def sig(v, name):
+            if isinstance(v, dict):
+                return v.get(name, v.get('default'))
+            return v
         for i, cam in enumerate(cameras):
             rc = by_name.get(cam.get_name())
             if rc is None:
-                if i >= len(ref):
+                if not by_position or i >= len(ref):
                     continue
                 rc = ref[i]
+            name = cam.get_name()
+            s_f, s_c, s_k = sig(self.sigma_logf, name), sig(self.sigma_c, name), sig(self.sigma_k, name)
             K = rc.get_camera_matrix().detach().cpu().numpy() if isinstance(rc.matrix, torch.Tensor) \
                 else np.asarray(rc.get_camera_matrix())
             d = rc.dist.detach().cpu().numpy() if isinstance(rc.dist, torch.Tensor) else np.asarray(rc.dist)
             pr = {}
-            if self.sigma_logf is not None:
-                pr['fx'] = (float(K[0, 0]), self.sigma_logf, 'log')
-                pr['fy'] = (float(K[1, 1]), self.sigma_logf, 'log')
-            if self.sigma_c is not None:
-                pr['cx'] = (float(K[0, 2]), self.sigma_c)
-                pr['cy'] = (float(K[1, 2]), self.sigma_c)
-            if self.sigma_k is not None:
+            if s_f is not None:
+                pr['fx'] = (float(K[0, 0]), float(s_f), 'log')
+                pr['fy'] = (float(K[1, 1]), float(s_f), 'log')
+            if s_c is not None:
+                pr['cx'] = (float(K[0, 2]), float(s_c))
+                pr['cy'] = (float(K[1, 2]), float(s_c))
+            if s_k is not None:
                 model = 'kb' if getattr(rc, 'fisheye', False) else 'brown'
                 for j, n in enumerate(DIST_NAMES[model][:len(d)]):
-                    pr[n] = (float(d[j]), self.sigma_k)
+                    pr[n] = (float(d[j]), float(s_k))
             out[i] = pr
         return out
 

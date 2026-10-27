@@ -296,3 +296,77 @@ def test_w4_reference_rule_warns_only(mo):
     ev = evaluate_calibration(true, p2, reference=rough)
     lv = {r['rule']: r['level'] for r in ev.report['rules']}
     assert lv['center_residual_frac'] == 'warn'
+
+
+# ------------------------------------------------------------------ W1 (dancing replay)
+
+def _board():
+    from aniposelib.boards import CharucoBoard
+    return CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, units='mm')
+
+
+def test_w1_bridge_rules_and_board_floor():
+    from aniposelib.workflows import calibrate_from_board
+    true = synth.load_rig('allen_7cam')
+    rows = synth.board_rows(true, _board(), n_frames=40, seed=1)
+    rows = [[r for r in rr if r['framenum'][1] % 2 == (0 if c in (0, 1, 2) else 1)] for c, rr in enumerate(rows)]
+    p3 = synth.random_points(true, 200, min_views=3, seed=3)
+    bp = synth.add_noise(synth.project(true, p3), 3.0, seed=4)          # people: noisier than the boards
+    res = calibrate_from_board(rows, _board(), init=WC_no_extrinsics(true), intrinsics=true, bridge_points=bp)
+    lv = {r['rule']: (r['level'], r['value']) for r in res.report['rules']}
+    assert res.verdict == 'ok', res.summary()
+    assert lv['bridge_inlier_frac'][1] > 0.8 and lv['runaway_cameras'][1] == 0
+    # the board threshold comes from the board observations, not from the noisier bridge
+    nfb = res.settings['noise_floor_board_px']
+    assert nfb < 1.0 and res.settings['board_reproj_warn_px'] == pytest.approx(max(1.0, 3 * nfb), rel=1e-3)
+    # a wrong bridge (the second component sees a mirrored scene) is not 'ok'
+    c0 = synth.scene_center(true)
+    bad = bp.copy()
+    bad[3:] = synth.add_noise(synth.project(true, 2 * c0 - p3), 3.0, seed=5)[3:]
+    res = calibrate_from_board(rows, _board(), init=WC_no_extrinsics(true), intrinsics=true, bridge_points=bad)
+    assert res.verdict == 'fail', res.summary()
+
+
+def test_w1_focal_guess_is_forwarded(monkeypatch):
+    from aniposelib import intrinsics as I
+    from aniposelib.workflows import calibrate_from_board
+    true = synth.load_rig('allen_7cam').subset_cameras([0, 1, 2])
+    rows = synth.board_rows(true, _board(), n_frames=12, seed=1)
+    seen = []
+
+    def fake(rows_, board_, size, **kw):
+        seen.append(kw.get('focal_inits'))
+        raise RuntimeError('stop')
+    monkeypatch.setattr(I, 'calibrate_ladder_rows', fake)
+    calibrate_from_board(rows, _board(), init=true, options={'focal_guess': {true.get_names()[1]: 1700.0}})
+    assert seen == [None, [1700.0], None]
+
+
+# ------------------------------------------------------------------ W2 stations -> rig_at
+
+def test_w2_stations_poses_in_the_group():
+    from aniposelib.stations import Stations
+    from aniposelib.workflows.calibration import rig_at
+    rig = synth.load_rig('motobs_7cam')
+    fn = synth.smooth_tracks(rig, n_points=6, amp=0.1, seed=1)
+    t = np.arange(0, 24, 1 / 10)
+    X = np.stack([fn(p, t) for p in range(6)], 1)
+    bumped = _bumped(rig, 2, [1.2, -1.0, 0.8])
+    moved = (t >= 12.0)[None, :, None, None]
+    p2 = synth.add_noise(np.where(moved, synth.project(bumped, X), synth.project(rig, X)), 0.5, seed=2)
+    name = rig.get_names()[2]
+    st = Stations({name: [(-np.inf, 12.0, name), (12.0, np.inf, name + '@s1')]})
+    from aniposelib import scale as S
+    ref = rig.copy()
+    cg, res = calibrate_from_points(p2, ref, init='reference', refine_intrinsics=False, stations=st,
+                                    groups=dict(time=t), options={'quality': False}, scale=2.0)
+    assert cg.stations is not None and name + '@s1' in cg.metadata['station_poses']
+    late = rig_at(cg, 20.0)
+    early = res.rig_at(5.0)
+    tgt = bumped.copy()
+    S.rescale(tgt, 2.0)
+    E = lambda g: synth.to_np(g.cameras[2].get_extrinsics_mat())
+    ref2 = rig.copy()
+    S.rescale(ref2, 2.0)
+    assert np.abs(E(late) - E(tgt))[:3, :3].max() < 2e-3
+    assert np.abs(E(early) - E(ref2))[:3, :3].max() < 2e-3

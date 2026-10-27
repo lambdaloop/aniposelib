@@ -77,6 +77,15 @@ def _noise_unit(nf, override=None):
     return noise_unit(nf, override)
 
 
+def _sigma_opt(v, default):
+    """A prior sigma option: a float, or ``{camera name: sigma}`` (+ ``'default'``, else ``default``)."""
+    if isinstance(v, dict):
+        out = dict(v)
+        out.setdefault('default', default)
+        return out
+    return v
+
+
 def _check_noise_unit(v):
     if v in (None, 'auto'):
         return
@@ -160,9 +169,12 @@ W1_DEFAULTS = dict(
     f_scale_noise=3.0,        # second-pass Cauchy scale, multiple of the noise floor
     max_points=None,          # subsample boards in BA
     skip=20, frame_indices=None, n_workers=1, detector_kwargs=None,   # video detection
-    prior_sigma_logf=0.05, prior_sigma_k=0.1,                          # intrinsics=<CameraGroup>
+    prior_sigma_logf=0.05, prior_sigma_k=0.1,  # intrinsics=<CameraGroup> (float or {camera name: sigma})
     object_sigma=None,        # static PointObject: not supported yet (points held fixed)
     min_bridge_points=6,      # bridge: minimum points per extra component
+    focal_guess=None,         # lens ladder: extra focal starts (px), a float or {camera name: f} (e.g. phones)
+    runaway_ratio=10.0,       # verdict: camera centre farther than this x the median distance from the rig centre
+    board_ratio=(3.0, 8.0),   # verdict: worst camera's board error / median camera's (warn, fail)
     noise_unit='auto',        # bridge MSAC threshold = 10 noise units; a float forces the unit
     verdict=None,
 )
@@ -325,8 +337,11 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
             models = opts['ladder_models'] or (I.FISHEYE_MODELS if fish else I.DEFAULT_MODELS)
             if fish:
                 models = ('pinhole',) + tuple(m for m in models if m != 'pinhole')
+            fg = opts['focal_guess']
+            fg = fg.get(n) if isinstance(fg, dict) else fg
+            lkw = dict(focal_inits=[float(v) for v in np.atleast_1d(fg)]) if fg is not None else {}
             try:
-                lr = I.calibrate_ladder_rows(r, board, size, min_corners=opts['min_corners'], models=models)
+                lr = I.calibrate_ladder_rows(r, board, size, min_corners=opts['min_corners'], models=models, **lkw)
                 if fish and not I.is_fisheye(lr.selected):
                     fits = [m for m in lr.fits if I.is_fisheye(m)]
                     sel = fits[0] if fits else None
@@ -534,7 +549,18 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
     - ``disconnected_components``: extra components of the board graph left unbridged (fail);
     - ``board_shape_rel``: median shape residual of the triangulated board / object size;
       warn 0.5 %, fail 2 %;
-    - ``lens_invalid``: cameras whose lens model is not invertible over the image (warn).
+    - ``lens_invalid``: cameras whose lens model is not invertible over the image (warn);
+    - ``board_reproj_ratio``: worst camera's median board error / the median camera's; warn above 3,
+      fail above 8 (``options['board_ratio']``): one camera with a wrong lens skews the others;
+    - ``runaway_cameras``: centres farther than ``options['runaway_ratio']`` (10) x the median
+      distance from the rig centre (fail);
+    - ``bridge_inlier_frac`` (with ``bridge_points``): smallest share of a bridged component's
+      bridge observations that the final rig explains; warn below 0.5, fail below 0.2. With a
+      bridge, the board rules use the board observations alone (re-triangulated), not the joint BA.
+
+    ``options['focal_guess']`` (a float or ``{camera name: f}``, px) adds focal starts to the lens
+    ladder (phones / unusual lenses); ``prior_sigma_logf`` / ``prior_sigma_k`` may be
+    ``{camera name: sigma, 'default': sigma}``; ``noise_unit`` forces the bridge noise unit.
     """
     from .. import quality as Q
     from ..boards import merge_rows, extract_points, extract_rtvecs
@@ -638,8 +664,9 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
     if intrinsics == 'fixed':
         spec = ParamSpec(intrinsics=(), n_dist=0)
     elif hasattr(intrinsics, 'cameras'):
-        spec = ParamSpec(intrinsics=None, priors=IntrinsicsPrior(intrinsics, sigma_logf=opts['prior_sigma_logf'],
-                                                                 sigma_k=opts['prior_sigma_k']))
+        spec = ParamSpec(intrinsics=None, priors=IntrinsicsPrior(intrinsics,
+                                                                 sigma_logf=_sigma_opt(opts['prior_sigma_logf'], 0.05),
+                                                                 sigma_k=_sigma_opt(opts['prior_sigma_k'], 0.1)))
     else:
         spec = ParamSpec(intrinsics=None)
     if static and opts['object_sigma'] is not None:
@@ -743,11 +770,63 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
                 cgroup.metadata.pop('units', None)
             cgroup.metadata['scale_source'] = 'object' if point_object else \
                 ('charuco' if hasattr(board, 'marker_length') else 'board')
+    # bridged rig: judge the boards on the board observations alone (the joint BA's noise floor
+    # is the people's), and the bridge on how many bridge observations the final rig explains
+    bridge_frac = None
+    if cgroup is not None and bridge_rep is not None and bridge_rep.get('components') and len(imgp):
+        with timer('quality'):
+            _, be, bi = _robust_points(cgroup, imgp, 0.02 * diag)
+            bsup = bi.sum(0) >= 2
+            nf = noise_floor(be[:, bsup], bi[:, bsup], diag=diag)
+            settings['noise_floor_board_px'] = nf
+            meds = []
+            for c, n in enumerate(names):
+                e = be[c][bi[c] & bsup]
+                per_cam[n]['median_px'] = float(np.median(e)) if e.size else None
+                per_cam[n]['board_n_obs'] = int(e.size)
+                if e.size and n not in uncovered:
+                    meds.append(float(np.median(e)))
+            worst_px = float(np.max(meds)) if meds else None
+            bt = bridge_rep['tau_px']
+            _, _, qi = _robust_points(cgroup, bridge_points, bt)
+            bfl = _flat(bridge_points)
+            fin = np.isfinite(bfl).all(-1)
+            multi = fin.sum(0) >= 2
+            fr = []
+            for comp in bridge_rep['components']:
+                idx = [names.index(n) for n in comp['cameras']]
+                m = fin[idx] & multi[None]
+                f = float(qi[idx][m].mean()) if m.any() else 0.0
+                comp['final_inlier_frac'] = f
+                fr.append(f)
+            bridge_frac = float(min(fr)) if fr else None
     report['per_camera'] = per_cam
     thr = float('{:.4g}'.format(max(1.0, 3 * nf)))
     settings['board_reproj_warn_px'] = thr
+    # runaway cameras and one camera far worse than the others
+    runaway, ratio, ratio_cam = [], None, None
+    if cgroup is not None:
+        from .. import scale as S
+        cen = S.camera_centers(cgroup)
+        okc = [i for i, n in enumerate(names) if n not in uncovered and n not in missing]
+        if len(okc) >= 3:
+            d = np.linalg.norm(cen[okc] - np.median(cen[okc], 0), axis=1)
+            md = float(np.median(d))
+            runaway = [names[i] for i, v in zip(okc, d) if md > 0 and v > opts['runaway_ratio'] * md]
+        meds = [(per_cam[n]['median_px'], n) for n in names if per_cam[n].get('median_px') is not None
+                and n not in uncovered]
+        if len(meds) >= 3:
+            mm = float(np.median([m for m, _ in meds]))
+            if mm > 0:
+                w, ratio_cam = max(meds)
+                ratio = w / mm
     rules = [
         Rule('board_reproj_px', worst_px, thr, 2 * thr, 'worst per-camera median board reprojection'),
+        Rule('board_reproj_ratio', ratio, opts['board_ratio'][0], opts['board_ratio'][1],
+             'worst camera ({}) board error / the median camera\'s'.format(ratio_cam)),
+        Rule('runaway_cameras', len(runaway), None, 0,
+             'camera centres > {} x the median distance from the rig centre: {}'.format(
+                 opts['runaway_ratio'], runaway) if runaway else ''),
         Rule('uncovered_cameras', len(uncovered), None, 0,
              'cameras without usable board views: {}'.format(uncovered) if uncovered else ''),
         Rule('missing_intrinsics', len(missing), None, 0,
@@ -761,6 +840,12 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
         Rule('board_shape_rel', shape_rel, 0.005, 0.02, 'board shape residual / object size'),
         Rule('lens_invalid', n_lens_bad, 0, None, 'lens model not invertible over the image'),
     ]
+    if bridge_frac is not None:
+        rules.append(Rule('bridge_inlier_frac', bridge_frac, 0.5, 0.2,
+                          'smallest share of a bridged component\'s bridge observations explained by the final '
+                          'rig within {:.3g} px (a mirrored / wrong bridge explains few)'.format(bridge_rep['tau_px']),
+                          higher_is_worse=False))
+    report['runaway'] = runaway
     verdict, reasons, table = _rules(rules, opts)
     if cgroup is None and ba_rep is None and not comp_groups:
         verdict = 'fail'
@@ -826,7 +911,7 @@ W2_DEFAULTS = dict(
     ba_kwargs=None, sfm_kwargs=None, vggt_kwargs=None, select_kwargs=None, people_kwargs=None,
     track_ids=None,           # C x F x P track ids of 5D points (init='people' / 'vggt' / a CameraGroup)
     intrinsics_free=('f', 'k1'),                  # refine_intrinsics: parameters freed
-    intrinsics_sigma_logf=0.05, intrinsics_sigma_k=0.1,   # ... under priors around the given ones
+    intrinsics_sigma_logf=0.05, intrinsics_sigma_k=0.1,   # ... under priors around the given ones (or {name: sigma})
     heldout_every=5,          # refine_intrinsics='auto': every k-th window is held out
     intrinsics_gain=0.02,     # ... accepted if the held-out LOO median improves by this fraction
     intrinsics_share=None,    # refine_intrinsics: None | 'all' | groups of camera names/indices sharing f + k1
@@ -861,12 +946,38 @@ class PointCalibration(WorkflowResult):
         yield self.cgroup
         yield self
 
+    def rig_at(self, t):
+        """The calibration at time ``t`` (s): a copy of ``cgroup`` whose moved cameras get the pose
+        of their station at ``t`` (``stations=``; ``cgroup.stations`` holds the intervals and
+        ``cgroup.metadata['station_poses']`` the per-station poses). Without stations: a copy."""
+        return rig_at(self.cgroup, t)
+
     def to_dict(self):
         d = super().to_dict()
         if self.quality is not None and hasattr(self.quality, 'to_dict'):
             q = self.quality.to_dict()
             d['quality'] = {k: q[k] for k in ('per_camera', 'overall') if k in q}
         return d
+
+
+def rig_at(cgroup, t):
+    """A copy of ``cgroup`` with every moved camera at its station's pose at time ``t`` (from
+    ``cgroup.stations`` and ``cgroup.metadata['station_poses']``, as written by
+    :func:`calibrate_from_points` with ``stations=``). A time in a 'skip' interval keeps the
+    camera's first pose."""
+    out = cgroup.copy()
+    st = getattr(cgroup, 'stations', None)
+    poses = cgroup.metadata.get('station_poses') or {}
+    if st is None or not poses:
+        return out
+    for cam in out.cameras:
+        n = cam.get_name()
+        sn = str(st.lookup_name(n, [float(t)])[0])
+        p = poses.get(sn)
+        if p is not None and p.get('camera', n) == n:
+            cam.set_rotation(np.asarray(p['rvec'], float))
+            cam.set_translation(np.asarray(p['tvec'], float))
+    return out
 
 
 def _dense_from_obs(obs):
@@ -1095,8 +1206,8 @@ def _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng):
     names = cg.get_names()
     share = _share_spec(opts['intrinsics_share'], names)
     spec = ParamSpec(intrinsics=tuple(opts['intrinsics_free']), share=share,
-                     priors=IntrinsicsPrior(cg.copy(), sigma_logf=opts['intrinsics_sigma_logf'],
-                                            sigma_k=opts['intrinsics_sigma_k']))
+                     priors=IntrinsicsPrior(cg.copy(), sigma_logf=_sigma_opt(opts['intrinsics_sigma_logf'], 0.05),
+                                            sigma_k=_sigma_opt(opts['intrinsics_sigma_k'], 0.1)))
     f_scale = 3 * max(nf, MIN_NOISE_PX)
     min_views = min(3, C)
 
@@ -1517,6 +1628,12 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
                                 timings=timer.times)
     cg.metadata['calibration'] = dict(workflow='calibrate_from_points', verdict=verdict, init=str(key),
                                       noise_floor_px=float(nf))
+    if stations is not None and 'stations' in res.report:
+        srep = res.report['stations']
+        cg.stations = stations.copy()
+        cg.metadata['station_poses'] = _station_poses(cg, srep)
+        srep.pop('_relative', None)
+        srep.pop('_scale', None)
     _save(res, out)
     return res
 
@@ -1586,7 +1703,10 @@ def _stations_ba(cg, pc, gr, stations, nf, rng, noise_unit=None):
     if 'time' not in gr:
         raise ValueError("stations= needs groups['time'] (frame times, s)")
     u = _noise_unit(nf, noise_unit)
-    _, _, inl = _robust_points(cg, pc, 10 * u)
+    # a moved camera's later observations are outliers of the static rig: select loosely (5 % of
+    # the diagonal) for a first station fit, then keep the observations within 10 noise units of it
+    diag = _diag(cg, pc) or 1000.0
+    _, _, inl = _robust_points(cg, pc, max(10 * u, 0.05 * diag))
     flat = _flat(pc)
     t = np.asarray(gr['time'], float)
     if pc.ndim == 4 and t.ndim == 1:
@@ -1594,10 +1714,47 @@ def _stations_ba(cg, pc, gr, stations, nf, rng, noise_unit=None):
     t = t.reshape(-1)
     keep = inl & (inl.sum(0) >= 2)[None]
     ci, pj = np.nonzero(keep)
+    kw = dict(stations=stations, only_extrinsics=True, loss='cauchy', f_scale=3 * max(nf, MIN_NOISE_PX),
+              return_report=True, rng=rng)
     obs = B.Observations(ci, pj, flat[ci, pj], time=t[pj], n_points=flat.shape[1], n_cams=flat.shape[0])
-    r = B.bundle_adjust_lm(cg, obs, stations=stations, only_extrinsics=True, loss='cauchy',
-                           f_scale=3 * max(nf, MIN_NOISE_PX), return_report=True, rng=rng)
-    return dict(error_px=r.error, error_before_px=r.error_before, stations=r.stations)
+    r = B.bundle_adjust_lm(cg, obs, **kw)
+    e = np.asarray(r.obs_errors, float)
+    if e.shape == ci.shape:
+        k2 = np.nan_to_num(e, nan=np.inf) < 10 * u
+        if k2.sum() >= 20 and not k2.all():
+            obs = B.Observations(ci[k2], pj[k2], flat[ci[k2], pj[k2]], time=t[pj[k2]], n_points=flat.shape[1],
+                                 n_cams=flat.shape[0])
+            r = B.bundle_adjust_lm(cg, obs, **kw)
+    # each station relative to its camera's (first-station) pose: invariant to a later rescale /
+    # alignment of the world apart from the translation's scale
+    from .. import scale as S
+    from ..init._common import M_from_rt
+    names = cg.get_names()
+    rel = {}
+    st = r.stations or {}
+    for k, sn in enumerate(st.get('names') or []):
+        c = int(st['station_cam'][k])
+        E0 = np.asarray(to_numpy(cg.cameras[c].get_extrinsics_mat()), float)
+        Es = M_from_rt(np.asarray(st['rvec'][k], float), np.asarray(st['tvec'][k], float))
+        rel[str(sn)] = dict(camera=names[c], D=Es @ np.linalg.inv(E0))
+    return dict(error_px=r.error, error_before_px=r.error_before, stations=r.stations, _relative=rel,
+                _scale=S._rig_scale(S.camera_centers(cg)))
+
+
+def _station_poses(cg, srep):
+    """Absolute per-station poses ``{station: dict(camera, rvec, tvec)}`` of the final group."""
+    from .. import scale as S
+    from ..init._common import rotvec
+    s = S._rig_scale(S.camera_centers(cg)) / srep['_scale'] if srep.get('_scale') else 1.0
+    names = cg.get_names()
+    out = {}
+    for sn, v in srep['_relative'].items():
+        D = np.array(v['D'])
+        D[:3, 3] *= s
+        E = D @ np.asarray(to_numpy(cg.cameras[names.index(v['camera'])].get_extrinsics_mat()), float)
+        out[sn] = dict(camera=v['camera'], rvec=[float(x) for x in rotvec(E[:3, :3])],
+                       tvec=[float(x) for x in E[:3, 3]])
+    return out
 
 
 # ================================================================== W3 estimate_scale
