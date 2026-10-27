@@ -1,6 +1,6 @@
 # Changelog (aniposelib-pytorch)
 
-## 1.1.0 (2026-10-28)
+## 1.1.0 (2026-10-27)
 
 Plans 04 (scope trim, one LM core) and 05 (one entry point per workflow). Upgrade notes: everything under
 **Removed** is gone without a deprecation cycle (verbatim copies for downstream projects are kept outside the
