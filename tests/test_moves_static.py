@@ -166,3 +166,25 @@ def test_w4_lost_but_unmoved_camera_is_reassociated_not_moved(lost_camera):
     got = ev.points[0, post]
     assert np.isfinite(got).mean() > 0.9
     np.testing.assert_allclose(got[np.isfinite(got)], p[0, post][np.isfinite(got)])
+
+
+def test_w4_step_inside_bad_windows_is_demoted():
+    """A camera 'rotated' only while two other cameras deliver garbage (broken data at the start):
+    the step's short side lies in bad time windows, so it is not reported as a moved camera."""
+    rig = synth.load_rig('motobs_7cam')
+    t = np.arange(0, 60, 1 / 15.0)
+    fn = synth.smooth_tracks(rig, n_points=10, amp=0.1, seed=1)
+    X = np.stack([fn(k, t) for k in range(10)], 1)
+    p2 = synth.project(rig, X)
+    early = t < 16
+    p2[2:4, early] = np.random.default_rng(5).uniform(100, 900, p2[2:4, early].shape)
+    p2[1, early] = synth.project(_bumped(rig, 1, [4.0, -4.0, 2.0]), X)[1, early]
+    p2 = synth.add_noise(p2, 0.5, seed=2)
+    name = rig.get_names()[1]
+    opts = {'loo_window_s': 4.0, 'recover_moves': False}
+    ev = W.evaluate_calibration(rig, p2, times=t, options=opts)
+    assert ev.report['windows']['bad']
+    assert name not in ev.moves.moved and name not in ev.moves.stations.moved
+    assert [d['camera'] for d in ev.report['moves_demoted']] == [name]
+    old = W.evaluate_calibration(rig, p2, times=t, options=dict(opts, moves_bad_window_frac=None))
+    assert name in old.moves.moved

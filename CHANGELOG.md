@@ -202,6 +202,10 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   so they looked rotated too, and with W4's robust thresholds the mover itself could stay below `z_thr`: on Panoptic
   with an injected 1 deg re-aim of 00_15, W4 reported 00_03 + 00_24 (both false) and missed 00_15; now 00_15 only.
   The old re-test (exclude the strongest camera, keep it always) is gone; `retest=False` gives one pass.
+- W4 `options['moves_bad_window_frac']=0.8` (new): a detected step whose shorter side has >= 80 % of the camera's
+  observations in bad time windows (`bad_windows_frac`: several cameras broke there) is dropped from `moves`
+  (`report['moves_demoted']`). Outdoor mouse 5_19: the cam 11 '13 deg step' at t = 1051 s lay in the broken first
+  hour. Old: `options={'moves_bad_window_frac': None}`.
 - `stations.Stations.poses` (new): start poses of stations (relative to the camera, rescaled to the rig).
   `detect_moves` fills them from its fitted rotations, `recover_moves` from its recovered poses, and
   `bundle_adjust_lm(stations=...)` / `calibrate_from_points(stations=...)` start each station there (before: every

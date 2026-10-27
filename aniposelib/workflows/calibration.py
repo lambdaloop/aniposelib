@@ -2155,6 +2155,7 @@ W4_DEFAULTS = dict(
     detections=None,          # ... unassociated detections (associate_views input) to re-associate a recovered camera
     frame_ids=None,           # ... frame id of each point row (or of each frame for C x F x P x J x 2 points)
     recover_kwargs=None,      # ... passed to stations.recover_moves
+    moves_bad_window_frac=0.8,  # a step whose shorter side has this share of its observations in bad windows is dropped (None: off)
     verdict=None,
 )
 
@@ -2289,7 +2290,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``lens_invalid``: cameras whose lens model is not invertible over the image (warn);
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
-    - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
+    - ``moved_cameras``: cameras with a detected bump / re-aim (fail); a step whose shorter side has
+      >= ``moves_bad_window_frac`` (0.8) of the camera's observations in bad time windows (see
+      ``bad_windows_frac``) is dropped (``report['moves_demoted']``);
     - ``bad_windows_frac``: share of time windows in which at least ``min_bad_cameras`` (default
       max(2, 25 % of the cameras)) cameras have a LOO coverage, or a LOO agreement among the
       supported points, below ``bad_window_ratio`` x their median window (desync / broken data;
@@ -2483,6 +2486,29 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                                      camera_median_coverage={n: (None if not np.isfinite(v) else float(v))
                                                              for n, v in zip(names, cov_med)},
                                      bad=bad_windows, agree_px=agree_t)
+    # a detected step whose short side lies in time windows where several cameras broke (desync,
+    # broken data) is not evidence of a moved camera (outdoor mouse 5_19: cam 11, first 17 min)
+    if moves is not None and win is not None and bad_windows and opts['moves_bad_window_frac']:
+        bad_labs = {per_window[k]['window'] for k in bad_windows}
+        tt = np.asarray(times, float).reshape(-1)
+        demoted = []
+        for cp in list(moves.change_points):
+            if cp.get('recovered'):
+                continue
+            ci = names.index(cp['camera'])
+            seen = np.isfinite(p[ci]).all(-1).reshape(len(tt), -1).sum(1)
+            left = tt < cp['time']
+            side = left if seen[left].sum() <= seen[~left].sum() else ~left
+            wsum = seen[side].sum()
+            fb = float(seen[side & np.isin(win, list(bad_labs))].sum() / wsum) if wsum else 0.0
+            if fb >= opts['moves_bad_window_frac']:
+                demoted.append(dict(cp, bad_window_frac=fb))
+        if demoted:
+            moves = _demote_moves(moves, demoted)
+            moved = list(moves.moved)
+            report['moves_demoted'] = _to_builtin(demoted)
+            for n in names:
+                per[n]['moved'] = n in moved
     if reference is not None:
         with timer('compare'):
             try:
@@ -2570,6 +2596,22 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                                                        timings=timer.times),
                                  per_camera=per, per_window=per_window, moves=moves, comparison=comparison,
                                  quality=qr, points=rec_points)
+
+
+def _demote_moves(moves, demoted):
+    """A copy of ``moves`` without the change points ``demoted`` (cameras left without change
+    points lose their stations)."""
+    import dataclasses as _dc
+    key = {(d['camera'], d['time']) for d in demoted}
+    cps = [cp for cp in moves.change_points if (cp['camera'], cp['time']) not in key]
+    st = moves.stations.copy()
+    keep = {cp['camera'] for cp in cps}
+    for cam in list(st._iv):
+        if cam not in keep:
+            st._iv.pop(cam)
+    rots = {k: v for k, v in moves.station_rotations.items() if k in keep}
+    return _dc.replace(moves, change_points=cps, stations=st, station_rotations=rots,
+                       info=dict(moves.info, demoted=[d['camera'] for d in demoted]))
 
 
 def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device):
