@@ -2776,26 +2776,21 @@ class CameraGroup(nn.Module):
         sum_smooth = torch.sum(torch.square(errors_smooth)) * scale_smooth
         total_error += sum_smooth
 
-        # joint length constraint
-        error_lengths = 0
-        for cix, (a, b) in enumerate(constraints):
-            lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
-            expected = torch.abs(joint_lengths[cix])
-            if unit is None:
-                error_lengths += torch.sum(torch.square(lengths - expected))/expected
-            else:
-                error_lengths += torch.sum(torch.square(lengths - expected))
+        # joint length constraints, all bones at once
+        def bone_error(pairs, targets):
+            if len(pairs) == 0:
+                return 0
+            pairs = torch.as_tensor(np.asarray(pairs), dtype=torch.long, device=p3ds.device).reshape(-1, 2)
+            lengths = torch.linalg.norm(p3ds[:, pairs[:, 0]] - p3ds[:, pairs[:, 1]], dim=-1)   # [N,K]
+            expected = torch.abs(targets)
+            sq = torch.square(lengths - expected).sum(0)                                   # [K]
+            return (sq / expected).sum() if unit is None else sq.sum()
+
+        error_lengths = bone_error(constraints, joint_lengths)
         sum_lengths = error_lengths * scale_length * (100 if unit is None else 1)
         total_error += sum_lengths
 
-        error_lengths_weak = 0
-        for cix, (a, b) in enumerate(constraints_weak):
-            lengths = torch.linalg.norm(p3ds[:, a] - p3ds[:, b], dim=1)
-            expected = torch.abs(joint_lengths_weak[cix])
-            if unit is None:
-                error_lengths_weak += torch.sum(torch.square(lengths - expected))/expected
-            else:
-                error_lengths_weak += torch.sum(torch.square(lengths - expected))
+        error_lengths_weak = bone_error(constraints_weak, joint_lengths_weak)
         sum_lengths_weak = error_lengths_weak * scale_length_weak * (100 if unit is None else 1)
         total_error += sum_lengths_weak
 
