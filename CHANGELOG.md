@@ -53,6 +53,8 @@ Same results (bitwise, or within float rounding where noted), less time and memo
     options={'sfm_kwargs': {'pair_method': 'ransac'}})`).
   - **`device=`** (None: the group's device): the robust re-triangulations run there. `calibrate_from_points` passes
     its `device` (they ran on the CPU). Old behaviour: `options={'sfm_kwargs': {'device': 'cpu'}}`.
+  - the re-triangulations fit only points seen by >= 2 cameras; single-view observations no longer get a
+    (meaningless, often hundreds of px) error that entered the per-frame decoy medians and the reported medians.
 - `optim_points` packs the fixed cameras once per call (the cameras no longer accumulate `.grad` during it), has no
   host syncs in its loop and evaluates all bone terms in one op (float rounding). `reconstruct_3d(device='auto')`
   runs `optim_points` chunks smaller than 50k frame x joint cells on the CPU (a GPU was 3-7x slower there); pass

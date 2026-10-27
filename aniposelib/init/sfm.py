@@ -477,14 +477,26 @@ def _retriangulate(u, f, Ms, ks, drivers, frame_id, decoy_thresh, point_max_err,
     contrib = np.array([k in drivers for k in ks])
     # tau only decides which views count towards min_inliers; IRLS handles the outliers
     kw = dict(method='irls', sigma=sigma, contrib=contrib, mask_out_of_bounds=False, tau=1e12)
-    res = triangulate_robust(P, sub_d, **kw)
-    err = to_np(res.errors)
+    M = sub.shape[1]
+
+    def tri(obs_d):
+        # points seen by fewer than 2 cameras give no point and no errors: fit only the others
+        cols = torch.nonzero(torch.isfinite(obs_d).all(-1).sum(0) >= 2).ravel()
+        p3d = np.full((M, 3), np.nan)
+        err = np.full((len(ks), M), np.nan)
+        if len(cols):
+            r = triangulate_robust(P, obs_d[:, cols], **kw)
+            c = to_np(cols)
+            p3d[c] = to_np(r.p3d)
+            err[:, c] = to_np(r.errors)
+        return p3d, err
+
+    _, err = tri(sub_d)
     work = _frame_mask(sub, frame_id, err, decoy_thresh, min_frame_pts)
     masked = ~np.all(np.isfinite(work), -1)
     work_d = sub_d.clone()
     work_d[torch.as_tensor(masked, device=sub_d.device)] = float('nan')
-    res = triangulate_robust(P, work_d, **kw)
-    p3d, err = to_np(res.p3d), to_np(res.errors)
+    p3d, err = tri(work_d)
     nobs = (~masked[contrib]).sum(0)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
