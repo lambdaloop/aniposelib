@@ -308,29 +308,49 @@ def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pa
     ``{(i, j): dict(R, t, idx, inl, n_in, ratio)}`` with ``x_j = R x_i + t`` (``|t| = 1``)."""
     rng = as_rng(rng)
     C = u.shape[0]
-    out = {}
     todo = pairs if pairs is not None else [(i, j) for i in range(C) for j in range(i + 1, C)]
+    jobs = []
     for i, j in todo:
         fin = np.all(np.isfinite(u[i]), -1) & np.all(np.isfinite(u[j]), -1)
         idx = np.nonzero(fin)[0]
         if len(idx) < min_points:
             continue
+        jobs.append((i, j, idx, int(rng.integers(2 ** 31 - 1))))   # seeds drawn in pair order
+
+    def one(job):
+        i, j, idx, seed = job
         a, b = u[i, idx] / f[i], u[j, idx] / f[j]
-        cv2.setRNGSeed(int(rng.integers(2 ** 31 - 1)))
+        cv2.setRNGSeed(seed)      # per thread: the same RANSAC stream as a serial loop
         try:
             E, mask = cv2.findEssentialMat(a, b, np.eye(3), method=cv2.RANSAC, prob=0.9999,
                                            threshold=thresh / np.sqrt(f[i] * f[j]), maxIters=max_iters)
         except cv2.error:
-            continue
+            return None
         if E is None or mask is None or E.shape[0] < 3:
-            continue
+            return None
         E = E[:3]
         n_in, R, t, mp = cv2.recoverPose(E, a, b, np.eye(3), mask=mask.copy())
         if n_in < min_points // 2:
-            continue
-        out[(i, j)] = dict(R=R, t=t.ravel() / np.linalg.norm(t), idx=idx,
-                           inl=mp.ravel().astype(bool), n_in=int(n_in), ratio=n_in / len(idx))
-    return out
+            return None
+        return dict(R=R, t=t.ravel() / np.linalg.norm(t), idx=idx,
+                    inl=mp.ravel().astype(bool), n_in=int(n_in), ratio=n_in / len(idx))
+
+    # the pairs are independent and cv2 releases the GIL: run them on a thread pool
+    workers = min(len(jobs), _n_workers())
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(workers) as ex:
+            results = list(ex.map(one, jobs))
+    else:
+        results = [one(jb) for jb in jobs]
+    return {(jb[0], jb[1]): r for jb, r in zip(jobs, results) if r is not None}
+
+
+def _n_workers():
+    """Threads for independent cv2 calls: torch's intra-op thread count (see the workflows'
+    thread guard), at most 16."""
+    import torch
+    return max(1, min(16, torch.get_num_threads()))
 
 
 # ------------------------------------------------------------------ robust cloud
