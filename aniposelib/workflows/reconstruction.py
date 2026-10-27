@@ -6,7 +6,8 @@ association. Composition only: the maths lives in the backend modules
 API
 ---
 ``estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=False,
-                   options=None, rng=0) -> OffsetEstimation``
+                   options=None, rng=0, device='auto', seed=None, refine_windows=None)
+                   -> OffsetEstimation``
     W5. Per-stream time offsets (module convention of :mod:`aniposelib.sync`:
     ``source_time = global_time + offset``) from every available signal per pair: audio
     (``audio_offset`` gcc, cross-checked by the spectrogram and onset methods), motion
@@ -16,7 +17,9 @@ API
     ``solve_offset_graph`` (anchor = ``reference``, default the best-connected stream), then
     ``fit_drift`` per stream on the windowed audio estimates (``drift=True``). ``refine=True``
     runs ``stba.SpatiotemporalBA`` on the 2D points, with offset priors anchored to the graph
-    estimates and a motion prior relative to the rig scale. Nothing is applied: use
+    estimates and a motion prior relative to the rig scale; ``refine_windows`` runs it per
+    window and returns piecewise-linear time maps. Clips of one device share one clock rate
+    (``options['stream_device']`` / ``stream_camera``, ``clip_start``). Nothing is applied: use
     ``result.timemaps`` (``sync.TimeMap`` per stream).
 ``reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
                robust=True, options=None, device='auto') -> Reconstruction``
@@ -1467,6 +1470,11 @@ _W5_DEFAULTS = {
     'fps': None,                  # frame rate (Hz, or {stream: Hz}) for the frame-unit verdicts; None = from the data
     'max_time_jitter': 0.05,      # points with per-frame times: share of irregular frame steps before the rate comes from the mean step (warning)
     'stream_camera': None,        # {stream: camera name}: clips of one camera (default: stream name = camera name)
+    'stream_device': None,        # {stream: device}: clips sharing one clock (default: the stream_camera mapping)
+    'shared_clock': True,         # clips of one device share one clock rate (drift fit and STBA)
+    'clip_start': None,           # {stream: s | (s, sigma)} start of each clip on its device clock, or 'container'
+    'clip_start_sigma': None,     # s; None = 1e-4 for given starts, 1.0 for 'container' (creation_time, whole s)
+    'audio_delay_sigma': 0.0,     # s, added to audio sigmas: sound travel + A/V latency differences (1 m = 2.9 ms)
     'motion_max_lag': 5.0,        # s
     'epipolar_F': 'auto',         # 'calibrated' (cgroup) | 'self' (F fitted per offset) | 'both' | 'auto'
     'epipolar_search_frames': 10.0,   # half-width of the epipolar search (frames)
@@ -1480,6 +1488,7 @@ _W5_DEFAULTS = {
     'refine_rate_sigma': 1e-3,
     'refine_max_iter': 15,
     'refine_extrinsics': False,
+    'refine_window_min_s': 2.0,   # refine_windows: shortest window kept (s)
     'verdict': None,
 }
 
@@ -1500,7 +1509,7 @@ def _load_stream(name, v, sr, decode_audio=True, max_jitter=0.05):
     """-> dict(audio=(sig, sr, t0)|None, motion=(sig, rate, t0)|None, points=(p2d, rate, t0)|None,
     meta={...})."""
     from .. import sync as S
-    out = {'audio': None, 'motion': None, 'points': None, 'meta': {}}
+    out = {'audio': None, 'motion': None, 'points': None, 'points_t': None, 'meta': {}}
     if _is_path(v):
         v = {'audio': str(v)}
     if not isinstance(v, dict):
@@ -1574,6 +1583,9 @@ def _load_stream(name, v, sr, decode_audio=True, max_jitter=0.05):
             rate = 1.0 / med if regular else (len(t) - 1) / float(t[-1] - t[0])
             meta['points_rate_from'] = 'median step' if regular else 'mean step (irregular times)'
             t0 = float(t[0])
+            if regular and len(t) >= 2 and np.ptp(t) > 0:
+                # regular frames (gaps of whole frames allowed): the STBA uses the given times
+                out['points_t'] = t
         out['points'] = (p2d, rate, t0)
     if out['audio'] is None and out['motion'] is None and out['points'] is None and \
             not (a is None and v.get('audio') is not None and not decode_audio):
@@ -1628,7 +1640,7 @@ def _windows_of(est):
 
 @thread_guard
 def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=False,
-                     options=None, rng=0, device='auto', seed=None):
+                     options=None, rng=0, device='auto', seed=None, refine_windows=None):
     """W5: time offsets between unsynchronised streams. See the module docstring.
 
     Args:
@@ -1661,7 +1673,27 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             refinement runs.
         seed: optional previous result (``OffsetEstimation``) or ``{stream: sync.TimeMap}``: the
             pair estimates, graph and drift are skipped (audio is not decoded) and these time
-            maps are used as they are, or refined with ``refine=True``.
+            maps are used as they are (piecewise maps included), or refined with ``refine=True``.
+        refine_windows: piecewise refinement (implies ``refine=True``): a window length in s, or
+            a list of ``(t0, t1)`` global-time windows (or ``(t0, t1, cgroup)``: the rig of that
+            window, e.g. a camera station). The STBA runs per window (clock rates from
+            the seed / drift fit unless a window is long enough, ``refine_rate``) and each
+            stream's time map becomes the seed map plus a piecewise-linear correction through
+            the window centres (``sync.TimeMap.corrected``; continuous, monotone, constant
+            beyond the first / last window). ``offsets`` / ``rates`` then hold the affine part
+            (seed + median correction); use ``timemaps``. Per-window results in
+            ``refined['windows']``.
+
+    Clocks: clips of one device (``options['stream_device']``, default the ``stream_camera``
+    mapping) share one clock rate in the drift fit (``sync.fit_drift_shared``) and in the STBA
+    (``options['shared_clock']=True``). With ``options['clip_start']`` (``{stream: start on the
+    device clock, s}`` or ``(s, sigma)``, e.g. chapter boundaries; or ``'container'`` for the
+    files' ``creation_time``, whole seconds) the clips of a device also keep one timeline:
+    ``clip_start`` edges in the graph, tied intercepts in the drift fit and tied offsets in the
+    STBA. ``options['audio_delay_sigma']`` (s, default 0) is added to every audio sigma: the
+    sound reaches cameras at different distances from the speaker at different times (2.9 ms
+    per m) and phones add their own A/V latency; audio alone cannot see it, the STBA ``delta``
+    of a refinement measures it.
 
     Verdict rules: ``unidentifiable_streams`` (streams not connected to the reference; fail);
     ``max_sigma_frames`` (largest offset sigma in frame periods; warn > 0.25, fail > 1);
@@ -1695,6 +1727,39 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     cam_names = list(cgroup.get_names()) if cgroup is not None else []
     sc = dict(opts['stream_camera'] or {})
     cam_of = {n: str(sc.get(n, n)) for n in names}
+    sd = dict(opts['stream_device'] or {})
+    dev_of = {n: str(sd.get(n, cam_of[n])) for n in names}
+    if refine_windows is not None:
+        refine = True
+    # clip starts on the device clock (ties between the clips of one device)
+    starts, start_sig, clip_unknown = {}, {}, []
+    cs = opts['clip_start']
+    if isinstance(cs, str):
+        if cs != 'container':
+            raise ValueError("options['clip_start'] must be None, 'container' or {stream: s}")
+        for n in names:
+            ct = (data[n]['meta'].get('media') or {}).get('creation_time')
+            if ct is not None:
+                starts[n] = float(ct)
+                start_sig[n] = float(opts['clip_start_sigma'] or 1.0)
+    elif cs is not None:
+        for n, v in dict(cs).items():
+            if str(n) not in data:
+                clip_unknown.append(str(n))      # e.g. a clip left out of this call
+                continue
+            s0, sg = v if isinstance(v, (tuple, list)) else (v, None)
+            if s0 is None:
+                continue
+            starts[str(n)] = float(s0)
+            start_sig[str(n)] = float(sg if sg is not None else (opts['clip_start_sigma'] or 1e-4))
+    dev_streams = {}
+    for n in names:
+        dev_streams.setdefault(dev_of[n], []).append(n)
+    tie_groups = {}
+    for dv, g in dev_streams.items():
+        gs = sorted((n for n in g if n in starts), key=lambda n: starts[n])
+        if len(gs) >= 2:
+            tie_groups[dv] = gs
     # frame rate (verdict units): options > points / motion > per-stream fps > container avg_frame_rate
     fo = opts['fps']
     if isinstance(fo, dict):
@@ -1724,7 +1789,14 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                 'streams': {n: d['meta'] for n, d in data.items()}}
     if opts['stream_camera']:
         settings['stream_camera'] = cam_of
+    if any(len(g) > 1 for g in dev_streams.values()):
+        settings['stream_device'] = dev_of
+        settings['shared_clock'] = bool(opts['shared_clock'])
+    if tie_groups:
+        settings['clip_start'] = {n: [starts[n], start_sig[n]] for g in tie_groups.values() for n in g}
     pairs, edges, windows, disagreements, fallbacks = [], [], {}, [], []
+    if clip_unknown:
+        fallbacks.append('clip_start: not streams of this call, ignored: {}'.format(clip_unknown))
     irregular = [n for n, d in data.items() if d['meta'].get('time_jitter', 0.0) > opts['max_time_jitter']]
     for n in irregular:
         fallbacks.append('stream {}: irregular frame times (jitter {:.2g}); frame rate from the mean '
@@ -1755,6 +1827,8 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             nw = int(np.clip(dur // 120, max(3, opts['audio_windows']), 48))
             best = S.audio_offset_windowed(xa, xb, sr, windows=nw, min_window=opts['audio_window_s'],
                                            **kw)
+            if opts['audio_delay_sigma']:
+                best = _edge(best, (a, b), 0.0, sigma=np.hypot(best.sigma, opts['audio_delay_sigma']))
             record(a, b, best, 'audio', used=True, shift=shift)
             return best, shift, ta
         g = S.audio_offset(xa, xb, sr, method='gcc', windows=opts['audio_windows'], **kw)
@@ -1790,6 +1864,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         if others:
             sig = max(sig, 0.5 * max(abs(c.offset - best.offset) for c in others))
         sig = max(sig, 1.0 / (sr * np.sqrt(12)))
+        sig = float(np.hypot(sig, opts['audio_delay_sigma'] or 0.0))
         best = _edge(best, (a, b), 0.0, sigma=sig)
         record(a, b, g, 'audio', used=best.method == 'gcc', shift=shift,
                sigma=sig if best.method == 'gcc' else None)
@@ -1858,6 +1933,19 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                            note='F ' + kind)
                     edges.append(_edge(est, (a, b), tb - ta))
 
+    # clips of one device with known starts: offset_b - offset_a = start_a - start_b (with drift,
+    # loose by 100 ppm of the gap: the drift fit ties them exactly)
+    if seed is None:
+        for dv, g in tie_groups.items():
+            for a, b in zip(g[:-1], g[1:]):
+                sg = float(np.hypot(start_sig[a], start_sig[b]))
+                if drift and not any(dev_of[n] == dv for n in ([reference] if reference else [])):
+                    sg += 1e-4 * abs(starts[b] - starts[a])
+                est = S.OffsetEstimate(offset=starts[a] - starts[b], sigma=sg, confidence=1.0,
+                                       method='clip_start', pair=(a, b))
+                record(a, b, est, 'clip_start')
+                edges.append(est)
+
     # ---------------------------------------------------------------- graph (or the seed)
     drift_fits, rates_out, drift_fail = {}, {n: 0.0 for n in names}, []
     a0s = {}      # offset at global time 0 of each stream's affine map
@@ -1896,7 +1984,40 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                             fx = S.fit_drift(t_x, o_x)
                             tt = wt if sgn == 1 else wt + wo
                             meas[y] = [(tt, fx.predict(tt) + sgn * wo)]
+                # clips of one device: one clock rate (and tied intercepts with clip starts);
+                # the reference's device runs on the reference clock (rate 0)
+                shared, ref_clock = {}, set()
+                if opts['shared_clock']:
+                    for dv, g in dev_streams.items():
+                        if len(g) < 2:
+                            continue
+                        if ref in g:
+                            ref_clock.update(n for n in g if n != ref)
+                            continue
+                        tied = tie_groups.get(dv, [])
+                        ser = {n: (np.concatenate([m[0] for m in meas[n]]),
+                                   np.concatenate([m[1] for m in meas[n]])) for n in g if n in meas}
+                        if sum(len(v[0]) for v in ser.values()) < 3 or len(ser) + len(tied) < 2:
+                            continue
+                        for n in tied:
+                            ser.setdefault(n, (np.zeros(0), np.zeros(0)))
+                        fits = S.fit_drift_shared(ser, starts={n: starts[n] for n in tied},
+                                                  start_sigma=start_sig)
+                        f0 = next(iter(fits.values()))
+                        if np.isfinite(f0.sigma_rate) and abs(f0.rate) < opts['drift_min_z'] * f0.sigma_rate:
+                            not_sig.extend(fits)
+                        else:
+                            shared[dv] = fits
+                for dv, fits in shared.items():
+                    for n, fit in fits.items():
+                        drift_fits[n] = fit
+                        if fit.identifiable:
+                            rates_out[n] = float(fit.rate)
+                        else:
+                            drift_fail.append(n)
                 for n, ms in meas.items():
+                    if n in drift_fits or n in not_sig or n in ref_clock:
+                        continue
                     t = np.concatenate([m[0] for m in ms])
                     o = np.concatenate([m[1] for m in ms])
                     if len(t) < 3:
@@ -1915,7 +2036,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                 # streams with audio but no windowed estimate: the rate was never fitted
                 for n in names:
                     if n != ref and data[n]['audio'] is not None and n not in drift_fits \
-                            and n not in not_sig and offsets.get(n) is not None:
+                            and n not in not_sig and n not in ref_clock and offsets.get(n) is not None:
                         drift_fail.append(n)
         for n in names:
             if offsets.get(n) is None:
@@ -1926,6 +2047,21 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                 a0s[n] = offsets[n] - f.rate * f.t_ref
             else:
                 a0s[n] = offsets[n]
+        # tied clips of a device: one timeline (the fit's relative intercepts), its level from the
+        # graph offsets of the clips (inverse-variance mean)
+        for dv, g in tie_groups.items():
+            fit_g = [n for n in g if n in drift_fits and drift_fits[n].identifiable]
+            have = [n for n in fit_g if offsets.get(n) is not None]
+            if not have or len(fit_g) < len(g):
+                continue
+            w = np.array([1.0 / max(sigmas[n] or frame_s, 1e-6) ** 2 for n in have])
+            d = np.array([offsets[n] - drift_fits[n].offset0 for n in have])
+            shift = float((w * d).sum() / w.sum())
+            for n in fit_g:
+                f = drift_fits[n]
+                a0s[n] = f.offset0 + shift - f.rate * f.t_ref
+                if sigmas.get(n) is None:
+                    sigmas[n] = float(f.sigma_offset0)
         settings['drift_t_ref'] = {n: float(f.t_ref) for n, f in drift_fits.items()}
         settings['drift_not_significant'] = not_sig if drift else []
     else:
@@ -1934,8 +2070,6 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         for n in names:
             if seed_maps.get(n) is not None:
                 a0s[n], rates_out[n] = _timemap_parts(seed_maps[n])
-                if getattr(seed_maps[n], 'knots', ()):
-                    fallbacks.append('seed {}: time-map knots dropped'.format(n))
         ssig = dict(getattr(seed, 'sigmas', None) or {})
         sigmas = {n: (ssig.get(n) if ssig.get(n) is not None else (frame_s if n in a0s else None))
                   for n in names}
@@ -1947,22 +2081,61 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
 
     # ---------------------------------------------------------------- STBA refinement
     refined = None
-    if refine:
-        seedtm = {n: S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) for n in a0s}
+    # the maps the STBA starts from: the seed's own maps (piecewise ones included), else affine
+    seedtm = {n: (seed_maps[n] if seed_maps is not None and seed_maps.get(n) is not None
+                  else S.TimeMap.from_offset(a0s[n], rate=rates_out[n])) for n in a0s}
+    knotted = {n for n, m in seedtm.items() if getattr(m, 'knots', ())}
+    timemaps = {n: (seedtm[n] if n in knotted else
+                    S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) if n in a0s else None)
+                for n in names}
+    ties = [(a, b, float(np.hypot(start_sig[a], start_sig[b])))
+            for g in tie_groups.values() for a, b in zip(g[:-1], g[1:])]
+    stba_kw = dict(device=device, drift_fits=drift_fits, cam_of=cam_of, seeded=seed is not None,
+                   dev_of=dev_of if opts['shared_clock'] else None, ties=ties)
+    if refine and refine_windows is None:
         refined = _refine_stba(cgroup, data, names, ref, seedtm, sigmas, drift, opts, settings,
-                               fallbacks, timer, device=device, drift_fits=drift_fits, cam_of=cam_of,
-                               seeded=seed is not None)
+                               fallbacks, timer, **stba_kw)
         if refined.get('ok'):
             # STBA: true global = seed + delta + rc * (seed - tmid), so the refined offset is
             # seed offset - delta - rc * (g - tmid)
             free = refined.get('free_rate', False)
             for n, dlt in refined['delta'].items():
                 rc = refined['rate_correction'][n] if free else 0.0
-                a0s[n] = a0s[n] - dlt + rc * refined['tmid'][n]
+                tm_ = refined['tmid'][n]
+                a0s[n] = a0s[n] - dlt + rc * tm_
                 rates_out[n] = rates_out[n] - rc
                 sigmas[n] = refined['sigmas'][n]
-    timemaps = {n: (S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) if n in a0s else None)
-                for n in names}
+                if n in knotted:
+                    # a piecewise seed keeps its knots: correction delta + rc * (g - tmid)
+                    gk = np.array([tm_ - 1.0, tm_ + 1.0]) if rc else np.array([tm_])
+                    timemaps[n] = _corrected(seedtm[n], gk, dlt + rc * (gk - tm_), fallbacks, n)
+                else:
+                    timemaps[n] = S.TimeMap.from_offset(a0s[n], rate=rates_out[n])
+            # tied clips of one device without points here share their siblings' correction
+            for dv, g in tie_groups.items():
+                got = [n for n in g if n in refined['delta']]
+                for n in g:
+                    if n in got or n not in a0s or not got:
+                        continue
+                    dlt = float(np.mean([refined['delta'][m] for m in got]))
+                    refined.setdefault('delta_from_siblings', {})[n] = dlt
+                    a0s[n] = a0s[n] - dlt
+                    timemaps[n] = (_corrected(seedtm[n], [0.0], [dlt], fallbacks, n) if n in knotted
+                                   else S.TimeMap.from_offset(a0s[n], rate=rates_out[n]))
+    elif refine:
+        refined = _refine_windows(cgroup, data, names, ref, seedtm, sigmas, drift, opts, settings,
+                                  fallbacks, timer, refine_windows, dev_of, tie_groups, stba_kw)
+        for n, kn in refined.get('knots', {}).items():
+            if not kn:
+                continue
+            gk = np.array([k[0] for k in kn])
+            dk = np.array([k[1] for k in kn])
+            timemaps[n] = _corrected(seedtm[n], gk, dk, fallbacks, n)
+            med = float(np.median(dk))
+            a0s[n] = a0s[n] - med
+            sk = [k[2] for k in kn if k[2] is not None and np.isfinite(k[2])]
+            if sk:
+                sigmas[n] = float(np.median(sk))
     # reported offsets: the constant part of each time map (offset at global time 0); with a
     # rate the offset at global time g is offsets[n] + rates[n] * g
     offsets = {n: (float(a0s[n]) if n in a0s else None) for n in names}
@@ -1981,6 +2154,9 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                   'audio pairs where spectrogram / onset contradict gcc'),
              Rule('irregular_times', len(irregular), 0, None,
                   'streams with irregular per-frame times (rate from the mean step): {}'.format(irregular))]
+    if refined is not None and refined.get('piecewise'):
+        rules.append(Rule('refine_windows_failed', refined.get('n_failed', 0), 0, None,
+                          'refine_windows windows with data whose STBA failed'))
     if drift and seed is None:
         drift_fail = sorted(set(drift_fail))
         rules.append(Rule('drift_unidentifiable', len(drift_fail), 0, None,
@@ -1997,38 +2173,140 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         refined=refined, reference=ref, report=report, verdict=verdict, reasons=reasons,
         settings=settings,
         provenance=provenance('estimate_offsets',
-                              inputs={n: [k for k, v in d.items() if v is not None and k != 'meta']
+                              inputs={n: [k for k, v in d.items() if v is not None and k not in ('meta', 'points_t')]
                                       for n, d in data.items()},
                               fallbacks=fallbacks, timings=timer.times))
 
 
+def _frame_times(d):
+    """Source time of every point frame: the given per-frame times when regular, else t0 + i / rate."""
+    p2d, rate, t0 = d['points']
+    if d.get('points_t') is not None:
+        return d['points_t']
+    return t0 + np.arange(p2d.shape[0]) / rate
+
+
+def _corrected(tm, g, delta, fallbacks, name):
+    """``tm.corrected`` (piecewise map); a non-monotone result falls back to the median shift."""
+    try:
+        return tm.corrected(g, delta)
+    except ValueError as e:
+        fallbacks.append('refine {}: piecewise map not monotone ({}); median correction used'.format(name, e))
+        return tm.corrected([float(np.median(g))], [float(np.median(delta))])
+
+
+def _window_list(spec, data, use, seed, min_s):
+    """``refine_windows`` -> sorted list of (t0, t1) global-time windows."""
+    if np.ndim(spec) == 0:
+        L = float(spec)
+        if not L > 0:
+            raise ValueError('refine_windows must be a window length > 0 s or a list of (t0, t1)')
+        lo, hi = np.inf, -np.inf
+        for n in use:
+            p2d = data[n]['points'][0]
+            fi = np.nonzero(np.isfinite(p2d).all(-1).any(-1))[0]
+            if len(fi):
+                g = seed[n].to_global(_frame_times(data[n])[fi])
+                lo, hi = min(lo, float(g.min())), max(hi, float(g.max()))
+        if not np.isfinite(lo):
+            return []
+        n_w = max(1, int(np.ceil((hi - lo) / L - 1e-9)))
+        wins = [(lo + k * L, min(lo + (k + 1) * L, hi + 1e-9)) for k in range(n_w)]
+    else:
+        wins = [(float(w[0]), float(w[1])) + tuple(w[2:3]) for w in spec]
+        if any(w[1] <= w[0] for w in wins):
+            raise ValueError('refine_windows: every window needs t1 > t0')
+    return sorted((w for w in wins if w[1] - w[0] >= min_s or len(wins) == 1), key=lambda w: w[:2])
+
+
+def _refine_windows(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, fallbacks, timer,
+                    spec, dev_of, tie_groups, stba_kw):
+    """STBA per window -> {stream: [(global time, delta, sigma), ...]} correction knots."""
+    if cgroup is None:
+        fallbacks.append('refine: needs cgroup, skipped')
+        return {'ok': False, 'reason': 'no cgroup', 'windows': [], 'knots': {}}
+    use = [n for n in names if data[n]['points'] is not None and n in seed]
+    wins = _window_list(spec, data, use, seed, float(opts['refine_window_min_s']))
+    out, knots, n_failed = [], {n: [] for n in names}, 0
+    for w in wins:
+        # an optional third element is the rig of that window (camera stations)
+        cg_w = w[2] if len(w) > 2 and w[2] is not None else cgroup
+        w = w[:2]
+        r = _refine_stba(cg_w, data, names, ref, seed, sigmas, drift, opts, settings, fallbacks,
+                         timer, window=w, **stba_kw)
+        summ = {k: v for k, v in r.items() if k not in ('cameras',)}
+        summ['window'] = [float(w[0]), float(w[1])]
+        out.append(summ)
+        if not r.get('ok'):
+            if r.get('reason') not in ('not enough cameras with points',):
+                n_failed += 1
+            continue
+        free = r.get('free_rate', False)
+        for n, dlt in r['delta'].items():
+            tm_ = r['tmid'][n]
+            sg = r['sigmas'].get(n)
+            if free and r['rate_correction'][n]:
+                rc = r['rate_correction'][n]
+                lo, hi = r['span'][n]
+                knots[n] += [(lo, dlt + rc * (lo - tm_), sg), (hi, dlt + rc * (hi - tm_), sg)]
+            else:
+                knots[n].append((tm_, dlt, sg))
+    # clips of one device with known starts share their corrections (one timeline): a clip
+    # without windows of its own gets those of its siblings
+    for dv, g in tie_groups.items():
+        allk = sorted(k for n in g for k in knots.get(n, []))
+        for n in g:
+            if not knots.get(n) and allk and n in seed:
+                knots[n] = list(allk)
+    ok = any(o.get('ok') for o in out)
+    if not ok:
+        fallbacks.append('refine_windows: no window could be refined')
+    settings['refine_windows'] = [list(w[:2]) for w in wins]
+    return {'ok': ok, 'piecewise': True, 'windows': out, 'n_failed': n_failed,
+            'knots': {n: [list(k) for k in v] for n, v in knots.items() if v}}
+
+
 def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, fallbacks,
-                 timer, device='auto', drift_fits=None, cam_of=None, seeded=False):
+                 timer, device='auto', drift_fits=None, cam_of=None, seeded=False, dev_of=None,
+                 ties=(), window=None):
     """SpatiotemporalBA on the 2D points, seed times from the graph/drift time maps; returns
-    the per-stream constant corrections ``delta`` (refined offset = seed offset - delta)."""
+    the per-stream constant corrections ``delta`` (refined offset = seed offset - delta). With
+    ``window=(t0, t1)`` only the frames whose seed global time is in the window are used. Clips
+    of one device (``dev_of``) share one clock rate; ``ties`` keep tied clips on one timeline."""
     from .. import stba
     if cgroup is None:
         fallbacks.append('refine: needs cgroup, skipped')
         return {'ok': False, 'reason': 'no cgroup'}
     cam_of = cam_of or {n: n for n in names}
     cam_names = list(cgroup.get_names())
-    use = [n for n in names if data[n]['points'] is not None and cam_of[n] in cam_names and n in seed]
+    wtag = '' if window is None else ' [{:.1f}, {:.1f}] s'.format(*window)
+    cand = [n for n in names if data[n]['points'] is not None and cam_of[n] in cam_names and n in seed]
+    sel = {}
+    for n in cand:
+        p2d = data[n]['points'][0]
+        glob = seed[n].to_global(_frame_times(data[n]))     # seed global time
+        fin = np.isfinite(p2d).all(-1)
+        if window is not None:
+            fin &= ((glob >= window[0]) & (glob < window[1]))[:, None]
+        if fin.any():
+            sel[n] = (glob, fin)
+    use = [n for n in cand if n in sel]
     if len(use) < 2 or ref not in use:
-        fallbacks.append('refine: needs points for the reference and >= 1 other camera')
+        if window is None:
+            fallbacks.append('refine: needs points for the reference and >= 1 other camera')
         return {'ok': False, 'reason': 'not enough cameras with points'}
     if len({data[n]['points'][0].shape[1] for n in use}) != 1:
         return {'ok': False, 'reason': 'cameras have different numbers of keypoints'}
     sub = cgroup.subset_cameras([cam_names.index(cam_of[n]) for n in use])
-    cams, pts, uvs, ts, tmid = [], [], [], [], {}
-    span = 0.0
+    cams, pts, uvs, ts, span = [], [], [], [], 0.0
+    spans = {}
     for k, n in enumerate(use):
-        p2d, rate, t0 = data[n]['points']
-        glob = seed[n].to_global(t0 + np.arange(p2d.shape[0]) / rate)     # seed global time
-        fi, ji = np.nonzero(np.isfinite(p2d).all(-1))
+        p2d = data[n]['points'][0]
+        glob, fin = sel[n]
+        fi, ji = np.nonzero(fin)
         cams.append(np.full(len(fi), k)); pts.append(ji); uvs.append(p2d[fi, ji]); ts.append(glob[fi])
-        tmid[n] = 0.5 * (glob[fi].min() + glob[fi].max()) if len(fi) else 0.0
-        if len(fi):
-            span = max(span, float(glob[fi].max() - glob[fi].min()))
+        spans[n] = (float(glob[fi].min()), float(glob[fi].max()))
+        span = max(span, spans[n][1] - spans[n][0])
     rr = opts['refine_rate']
     fitted = any(drift_fits and n in drift_fits and drift_fits[n].identifiable for n in use)
     if rr == 'free':
@@ -2043,25 +2321,40 @@ def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, 
                                  uv=np.concatenate(uvs), t=np.concatenate(ts))
     scale = _rig_scale(sub)
     prior = [max(float(sigmas[n] or 0.0), opts['refine_offset_sigma_min']) for n in use if n != ref]
+    rate_groups = [dev_of[n] for n in use] if dev_of else None
+    clip_ties = [(use.index(a), use.index(b), sg) for a, b, sg in (ties or ()) if a in use and b in use]
     kw = dict(knot_spacing=settings['frame_period_s'], accel_sigma=opts['refine_accel_frac'] * scale,
               free_offsets='per_camera', offset_prior_sigma=float(np.median(prior)),
               ref_camera=use.index(ref), free_rate=free_rate,
               rate_prior_sigma=opts['refine_rate_sigma'], extrinsics=bool(opts['refine_extrinsics']),
               max_iter=int(opts['refine_max_iter']))
-    settings['stba'] = dict(kw, accel_sigma_rel=opts['refine_accel_frac'], cameras=use,
-                            refine_rate=rr, points_span_s=span, device=_device(device))
+    if window is None:
+        settings['stba'] = dict(kw, accel_sigma_rel=opts['refine_accel_frac'], cameras=use,
+                                refine_rate=rr, points_span_s=span, device=_device(device))
+        if rate_groups is not None and len(set(rate_groups)) < len(rate_groups):
+            settings['stba']['rate_groups'] = rate_groups
+        if clip_ties:
+            settings['stba']['clip_ties'] = [(use[a], use[b], s) for a, b, s in clip_ties]
+    else:
+        settings.setdefault('stba', dict(kw, accel_sigma_rel=opts['refine_accel_frac'],
+                                         refine_rate=rr, device=_device(device)))
     try:
         with timer('stba'):
-            res = stba.SpatiotemporalBA(sub, obs, device=_device(device), **kw).fit()
+            res = stba.SpatiotemporalBA(sub, obs, device=_device(device), clip_names=list(use),
+                                        rate_groups=rate_groups, clip_ties=clip_ties or None,
+                                        **kw).fit()
     except Exception as e:  # a failed refinement is reported, never raised
-        fallbacks.append('refine: STBA failed: {}'.format(e))
+        fallbacks.append('refine{}: STBA failed: {}'.format(wtag, e))
         return {'ok': False, 'reason': 'STBA failed: {}'.format(e)}
     delta = np.asarray(res.delta, float)
     sg = np.asarray(res.delta_sigma_sandwich, float)
     sg = np.where(np.isfinite(sg), sg, np.asarray(res.delta_sigma, float))
-    return {'ok': True, 'cameras': use, 'free_rate': free_rate,
+    ctm = res.info.get('clip_tmid', {})
+    tmid = {n: float(ctm.get(n, 0.5 * sum(spans[n]))) for n in use}
+    return {'ok': True, 'cameras': use, 'free_rate': free_rate, 'points_span_s': span,
             'delta': {n: float(delta[k]) for k, n in enumerate(use)},
             'sigmas': {n: (0.0 if n == ref else float(sg[k]) if np.isfinite(sg[k]) else sigmas[n])
                        for k, n in enumerate(use)},
             'rate_correction': {n: float(r) for n, r in zip(use, np.asarray(res.rate, float))},
-            'tmid': tmid, 'sigma_px': float(res.sigma_px), 'cost': float(res.cost)}
+            'tmid': tmid, 'span': spans, 'sigma_px': float(res.sigma_px), 'cost': float(res.cost),
+            'n_obs': int(res.info.get('n_obs_used', len(obs)))}

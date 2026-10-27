@@ -381,3 +381,36 @@ def test_torch_inputs_and_load_audio(tmp_path):
     assert x.shape == b.shape
     x2 = sync.load_audio(p, sr=4000, start=1.0, duration=2.0)
     assert len(x2) == 8000
+
+
+def test_timemap_corrected_piecewise():
+    tm = sync.TimeMap.from_offset(1.0, rate=1e-4)
+    t2 = tm.corrected([10.0, 20.0, 30.0], [0.01, 0.02, 0.0])
+    g = np.array([0.0, 10.0, 15.0, 20.0, 25.0, 30.0, 50.0])
+    pts = tm.to_source(g)
+    # global' = global + d(global): linear between the knots, constant beyond them
+    np.testing.assert_allclose(t2.to_global(pts) - g, [0.01, 0.01, 0.015, 0.02, 0.01, 0.0, 0.0], atol=1e-9)
+    np.testing.assert_allclose(t2.to_source(t2.to_global(pts)), pts, atol=1e-9)
+    # corrections compose; the result round-trips through to_dict
+    t3 = t2.corrected([15.0], [0.005])
+    np.testing.assert_allclose(t3.to_global(pts) - g, [0.015, 0.015, 0.02, 0.025, 0.015, 0.005, 0.005], atol=1e-9)
+    assert sync.TimeMap.from_dict(t3.to_dict()).knots == t3.knots
+    with pytest.raises(ValueError):
+        tm.corrected([0.0, 1.0], [0.0, -2.0])      # not monotone
+
+
+def test_fit_drift_shared_rate_and_ties():
+    rng = np.random.default_rng(0)
+    ser = {}
+    for k, (a, b) in enumerate([(0, 600), (700, 1500)]):
+        t = np.linspace(a, b, 10)
+        ser['c{}'.format(k)] = (t, -(60 + 800 * k) + 4e-5 * t + rng.normal(0, 1e-3, 10))
+    f = sync.fit_drift_shared(ser)
+    assert f['c0'].rate == f['c1'].rate and abs(f['c0'].rate - 4e-5) < 3e-6
+    # known clip starts (60 s and 860 s on the device clock): one timeline, offset_k = o - start_k
+    f = sync.fit_drift_shared(dict(ser, c2=(np.zeros(0), np.zeros(0))),
+                           starts={'c0': 60.0, 'c1': 860.0, 'c2': 1700.0}, start_sigma=1e-4)
+    a = {n: v.offset0 - v.rate * v.t_ref for n, v in f.items()}
+    assert abs((a['c1'] - a['c0']) + 800.0) < 3e-4 and abs((a['c2'] - a['c0']) + 1640.0) < 3e-4
+    assert f['c2'].identifiable and f['c2'].n == 0
+    assert not sync.fit_drift_shared(dict(ser, c2=(np.zeros(0), np.zeros(0))))['c2'].identifiable
