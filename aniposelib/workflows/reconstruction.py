@@ -65,7 +65,7 @@ import torch
 
 from ._common import (MIN_NOISE_PX, NOISE_DIAG_FRAC, Rule, Timer, WorkflowResult, evaluate_rules,
                       image_diagonal, merge_options, noise_floor, provenance, save_arrays,
-                      to_numpy, worst)
+                      thread_guard, to_numpy, worst)
 
 __all__ = ['estimate_offsets', 'OffsetEstimation', 'reconstruct_3d', 'Reconstruction',
            'associate_views', 'Association']
@@ -232,6 +232,7 @@ def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep):
     return out, len(spans)
 
 
+@thread_guard
 def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
                    robust=True, options=None, device='auto'):
     """W6: 2D -> 3D. See the module docstring.
@@ -521,6 +522,7 @@ def _link_instances(frames_inst, gate, max_gap):
     return out, n_id
 
 
+@thread_guard
 def associate_views(cgroup, detections, track_ids=None, min_views=2, options=None):
     """W7: multi-animal / multi-person association across cameras. See the module docstring.
 
@@ -611,11 +613,13 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
         extra = {'tracklets': _jsonable_info(groups.info)}
         backend = groups
     else:
+        # only the frames with detections are associated (frame ids may be sparse, e.g. 1e5
+        # apart); the others get an empty association
         cent = []
-        for f in range(F):
+        for f in fids:
             per = []
             for c in range(C):
-                d = parsed[c].get(f)
+                d = parsed[c].get(int(f))
                 if d is None:
                     per.append(np.zeros((0, 2)))
                     continue
@@ -627,9 +631,15 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
                 per.append(cen)
             cent.append(per)
 
+        def empty():
+            return M.Association(np.zeros((0, 3)), [], np.zeros(0), np.zeros(0, dtype=np.int64),
+                                 [np.full(0, -1, dtype=np.int64) for _ in range(C)])
+
         def run(gate):
-            return [M.associate_points(cgroup, per, max_res_px=gate, min_views=max(2, min_views))
-                    for per in cent]
+            out = [None] * F
+            for f, per in zip(fids, cent):
+                out[int(f)] = M.associate_points(P, per, max_res_px=gate, min_views=max(2, min_views))
+            return [a if a is not None else empty() for a in out]
         with timer('associate'):
             assoc = run(gate1)
             res = np.concatenate([np.asarray(a.residuals, float) for a in assoc]) if assoc else \
@@ -808,8 +818,9 @@ def _edge(est, pair, offset_shift=0.0):
     return dataclasses.replace(est, offset=float(est.offset) + offset_shift, pair=pair)
 
 
+@thread_guard
 def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=False,
-                     options=None, rng=0):
+                     options=None, rng=0, device='auto'):
     """W5: time offsets between unsynchronised streams. See the module docstring.
 
     Args:
@@ -826,6 +837,8 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             >= 2 cameras) with offset priors anchored to the graph estimates.
         options: overrides of ``_W5_DEFAULTS``.
         rng: seed for the bootstrap resamples.
+        device: ``'auto'`` (cuda if available), ``'cpu'`` or ``'cuda'``: where the STBA
+            refinement runs.
 
     Verdict rules: ``unidentifiable_streams`` (streams not connected to the reference; fail);
     ``max_sigma_frames`` (largest offset sigma in frame periods; warn > 0.25, fail > 1);
@@ -1005,7 +1018,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     if refine:
         seed = {n: S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) for n in a0s}
         refined = _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings,
-                               fallbacks, timer)
+                               fallbacks, timer, device=device)
         if refined.get('ok'):
             # STBA: true global = seed + delta + rc * (seed - tmid), so the refined offset is
             # seed offset - delta - rc * (g - tmid)
@@ -1052,7 +1065,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
 
 
 def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, fallbacks,
-                 timer):
+                 timer, device='auto'):
     """SpatiotemporalBA on the 2D points, seed times from the graph/drift time maps; returns
     the per-stream constant corrections ``delta`` (refined offset = seed offset - delta)."""
     from .. import stba
@@ -1086,7 +1099,7 @@ def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, 
     settings['stba'] = dict(kw, accel_sigma_rel=opts['refine_accel_frac'], cameras=use)
     try:
         with timer('stba'):
-            res = stba.SpatiotemporalBA(sub, obs, **kw).fit()
+            res = stba.SpatiotemporalBA(sub, obs, device=_device(device), **kw).fit()
     except Exception as e:  # a failed refinement is reported, never raised
         fallbacks.append('refine: STBA failed: {}'.format(e))
         return {'ok': False, 'reason': 'STBA failed: {}'.format(e)}

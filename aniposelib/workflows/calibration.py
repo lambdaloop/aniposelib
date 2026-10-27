@@ -62,7 +62,7 @@ import numpy as np
 import torch
 
 from ._common import (MIN_NOISE_PX, Rule, Timer, WorkflowResult, evaluate_rules, image_diagonal,
-                      merge_options, noise_floor, provenance, save_calibration, to_numpy)
+                      merge_options, noise_floor, provenance, save_calibration, thread_guard, to_numpy)
 
 __all__ = ['calibrate_from_board', 'BoardCalibration', 'calibrate_from_points', 'PointCalibration',
            'estimate_scale', 'ScaleEstimate', 'evaluate_calibration', 'CalibrationEvaluation']
@@ -79,6 +79,15 @@ def _device(device):
     if device in (None, 'auto'):
         return 'cuda' if torch.cuda.is_available() else 'cpu'
     return str(device)
+
+
+def _on_device(cgroup, device):
+    """``cgroup`` itself if it already lives on ``device``, else a copy moved there."""
+    dev = _device(device)
+    cur = str(cgroup.device)
+    if cur == dev or (dev == 'cuda' and cur.startswith('cuda')):
+        return cgroup
+    return cgroup.copy().to(dev)
 
 
 def _flat(p):
@@ -463,6 +472,7 @@ def _bridge_components(cg, comp_idx, bridge, nf, diag, opts):
     return out
 
 
+@thread_guard
 def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, intrinsics='auto',
                          init=None, detector='auto', bridge_points=None, out=None, options=None,
                          rng=0):
@@ -1053,6 +1063,7 @@ def _scale_spec(scale, p):
     return s
 
 
+@thread_guard
 def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=None,
                           refine_intrinsics='auto', scale=None, stations=None, options=None, rng=0,
                           device='auto', out=None):
@@ -1217,7 +1228,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         if opts['quality']:
             from .. import quality as Q
             try:
-                rpt.quality = res.quality = Q.report(cg, pc, groups=opts['quality_groups'], tau=10.0 * u,
+                rpt.quality = res.quality = Q.report(_on_device(cg, dev), pc, groups=opts['quality_groups'], tau=10.0 * u,
                                                      tau_tri=5.0 * u, max_loo_px=60.0 * u,
                                                      thresholds=tuple(t * u for t in (5, 8, 10)),
                                                      fit_mask=fit_mask)
@@ -1359,6 +1370,7 @@ def _scale_sigma(r):
     return None
 
 
+@thread_guard
 def estimate_scale(cgroup, board=None, board_points=None, lengths=None, reference=None, align='auto',
                    apply=True, options=None, *, object=None, object_points=None):
     """W3: metric scale (and optionally the world frame) of a calibrated rig.
@@ -1506,8 +1518,9 @@ def _to_builtin(x):
     return _jsonable(x)
 
 
+@thread_guard
 def evaluate_calibration(cgroup, points, times=None, reference=None, board=None, options=None, *,
-                         board_points=None, object=None, object_points=None):
+                         board_points=None, object=None, object_points=None, device='auto'):
     """W4: how good is this calibration on these observations?
 
     Parameters
@@ -1519,6 +1532,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         rotation / focal deltas, paired LOO).
     board, board_points : a board and its detections (rows or corners) -> board shape residual
         (``object=`` / ``object_points=`` for a ``PointObject``).
+    device : ``'auto'`` (cuda when available), ``'cpu'`` or ``'cuda'``: where the triangulations
+        run (a copy of ``cgroup`` is moved there; ``cgroup`` is not modified, results are numpy).
 
     Contents: LOO per camera (fixed denominator), coverage, inlier rates, lens validity, ray
     angles, plus moves / comparison / board shape when their inputs are given. Project policy
@@ -1548,13 +1563,14 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     if board is not None and board_points is None:
         raise ValueError('board= needs board_points= (rows or corners)')
     diag = _diag(cgroup, p) or 1000.0
+    cg = _on_device(cgroup, device)
     with timer('noise'):
-        nf, _ = _points_noise(cgroup, p, diag)
+        nf, _ = _points_noise(cg, p, diag)
     u = _noise_unit(nf)
     settings = dict(image_diag_px=diag, noise_floor_px=nf, noise_unit=u, tau_px=10 * u, tau_tri_px=5 * u,
                     loo_warn_px=3 * nf, loo_fail_px=10 * nf)
     with timer('report'):
-        qr = Q.report(cgroup, p, tau=10.0 * u, tau_tri=5.0 * u, max_loo_px=60.0 * u,
+        qr = Q.report(cg, p, tau=10.0 * u, tau_tri=5.0 * u, max_loo_px=60.0 * u,
                       thresholds=tuple(t * u for t in (5, 8, 10)), min_others=opts['min_others'])
     per = {n: dict(qr.per_camera[n]) for n in names}
     with timer('lens'):
@@ -1570,12 +1586,12 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         for n in names:
             per[n]['area'] = cov['per_camera'][n].get('area')
     with timer('rays'):
-        X, _, inl = _robust_points(cgroup, p, 10.0 * u)
+        X, _, inl = _robust_points(cg, p, 10.0 * u)
         X[inl.sum(0) < 2] = np.nan
         ok = np.isfinite(X).all(1)
         grazing = None
         if ok.any():
-            ra = Q.ray_angles(cgroup, X[ok], _flat(p)[:, ok], min_deg=opts['min_ray_deg'])
+            ra = Q.ray_angles(cg, X[ok], _flat(p)[:, ok], min_deg=opts['min_ray_deg'])
             grazing = float(ra['frac_points_below'])
     report = dict(overall=qr.overall, coverage=cov, rules=None)
     moves = comparison = None
@@ -1585,7 +1601,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             from ..stations import detect_moves
             kw = dict(tau=10.0 * u, huber_px=3.0 * u)
             kw.update(opts['detect_moves_kwargs'] or {})
-            moves = detect_moves(cgroup, p, times, **kw)
+            moves = detect_moves(cg, p, times, **kw)
             moved = list(moves.moved)
             settings['detect_moves'] = {k: v for k, v in kw.items() if isinstance(v, (int, float))}
             for n in names:
@@ -1601,7 +1617,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 report['compare_error'] = str(exc)
     if board is not None:
         with timer('board'):
-            bs = Q.board_shape_residual(cgroup, board_points, board)
+            bs = Q.board_shape_residual(cg, board_points, board)
             report['board_shape'] = bs
             objp = np.asarray(board.get_object_points(), float).reshape(-1, 3)
             size = float(np.max(np.linalg.norm(objp - objp.mean(0), axis=1)) * 2)

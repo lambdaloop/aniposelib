@@ -15,10 +15,16 @@
     ``provenance``; ``to_dict()``, ``to_json(path=None)``, ``summary()``.
 ``Options``
     ``options=`` handling: a dict (or None) merged over a workflow's defaults; unknown keys raise.
+``thread_guard``
+    Decorator of every workflow: caps torch's intra-op threads for the call (see
+    :func:`max_threads`); most workflow tensors are small, and torch's default (one thread per
+    core) makes them 10-40x slower on a shared machine.
 """
 
 import dataclasses
+import functools
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -28,11 +34,51 @@ import torch
 
 __all__ = ['Rule', 'evaluate_rules', 'noise_floor', 'WorkflowResult', 'merge_options',
            'provenance', 'image_diagonal', 'MIN_NOISE_PX', 'NOISE_DIAG_FRAC', 'to_numpy',
-           'Timer', 'worst']
+           'Timer', 'worst', 'thread_guard', 'max_threads']
 
 MIN_NOISE_PX = 0.5
 NOISE_DIAG_FRAC = 0.01
 _ORDER = {'ok': 0, 'warn': 1, 'fail': 2}
+
+
+DEFAULT_MAX_THREADS = 8
+
+
+def max_threads():
+    """Thread cap of the workflows: ``ANIPOSELIB_NUM_THREADS``, else ``OMP_NUM_THREADS``, else
+    ``DEFAULT_MAX_THREADS`` (8), and never more than the CPUs this process may use."""
+    for key in ('ANIPOSELIB_NUM_THREADS', 'OMP_NUM_THREADS'):
+        v = os.environ.get(key, '').strip()
+        if v:
+            try:
+                n = int(v)
+                break
+            except ValueError:
+                pass
+    else:
+        n = DEFAULT_MAX_THREADS
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):  # pragma: no cover
+        pass
+    return max(1, n)
+
+
+def thread_guard(fn):
+    """Run ``fn`` with ``torch.set_num_threads(min(current, max_threads()))``, restored after
+    (an explicit lower ``torch.set_num_threads`` is kept)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        before = torch.get_num_threads()
+        n = min(before, max_threads())
+        if n == before:
+            return fn(*args, **kwargs)
+        torch.set_num_threads(n)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.set_num_threads(before)
+    return wrapper
 
 
 def worst(*verdicts):
