@@ -95,6 +95,67 @@ def _rig_scale(cgroup):
     return float(np.median(np.linalg.norm(c - c.mean(0), axis=1)))
 
 
+def static_flags(X, t, voxel, min_s=40.0, bin_s=3600.0, min_bins=5, dilate=True):
+    """Static-artifact flags (outdoor-mouse ``robust_triangulation.static_flags``).
+
+    ``X [N,J,3]`` (or ``[N,3]``) points, ``t [N]`` frame times (s), ``voxel`` edge (world units).
+    A voxel is static when it is occupied in distinct frames for at least ``min_s`` seconds
+    (frames x median frame interval) spread over at least ``min_bins`` distinct ``bin_s`` time
+    bins; with ``dilate`` its 26 neighbours count too. A moving animal cannot stay in one small
+    voxel for that long, a static false detection (a sync block, a reflection) seen by 2+ cameras
+    does. Returns ``(flags [N,J] bool, info dict)``."""
+    X = np.asarray(X, float)
+    sq = X.ndim == 2
+    if sq:
+        X = X[:, None]
+    N, J = X.shape[:2]
+    t = np.asarray(t, float).reshape(-1)
+    out = np.zeros((N, J), bool)
+    info = dict(voxel=float(voxel), n_static_voxels=0, n_points=0)
+    ok = np.isfinite(X).all(-1) & np.isfinite(t)[:, None]
+    if not ok.any() or not np.isfinite(voxel) or voxel <= 0:
+        return (out[:, 0] if sq else out), info
+    ut = np.unique(t[np.isfinite(t)])
+    d = np.diff(ut)
+    dt = float(np.median(d[d > 0])) if (d > 0).any() else 1.0
+    n_i, j_i = np.nonzero(ok)
+    v = np.floor(X[n_i, j_i] / voxel).astype(np.int64)
+    v -= v.min(0) - 1                                   # >= 1 so that the -1 neighbours stay >= 0
+    span = v.max(0) + 2
+    key = (v[:, 0] * span[1] + v[:, 1]) * span[2] + v[:, 2]
+    uk, inv = np.unique(key, return_inverse=True)
+    inv = inv.ravel()
+    fr = np.unique(inv.astype(np.int64) * (N + 1) + n_i)          # distinct (voxel, frame)
+    occ = np.bincount(fr // (N + 1), minlength=len(uk)) * dt
+    tb = np.floor((t[n_i] - np.nanmin(t)) / float(bin_s)).astype(np.int64)
+    vb = np.unique(inv.astype(np.int64) * (int(tb.max()) + 1) + tb)
+    nb = np.bincount(vb // (int(tb.max()) + 1), minlength=len(uk))
+    bad = uk[(occ >= float(min_s)) & (nb >= int(min_bins))]
+    info['n_static_voxels'] = int(len(bad))
+    if len(bad):
+        if dilate:
+            off = np.array([(a * span[1] + b) * span[2] + c for a in (-1, 0, 1) for b in (-1, 0, 1)
+                            for c in (-1, 0, 1)], np.int64)
+            bad = np.unique((bad[:, None] + off[None]).ravel())
+        out[n_i, j_i] = np.isin(key, bad)
+    info['n_points'] = int(out.sum())
+    return (out[:, 0] if sq else out), info
+
+
+def _mask_regions(pts, regions, names):
+    """Drop observations inside ``{cam: [(x, y, r), ...]}`` image circles; returns the count."""
+    n = 0
+    for cam, circles in (regions or {}).items():
+        c = names.index(str(cam)) if not isinstance(cam, (int, np.integer)) else int(cam)
+        if not 0 <= c < pts.shape[0]:
+            raise ValueError('mask_regions: camera {!r} out of range'.format(cam))
+        for x, y, r in circles:
+            m = ((pts[c, ..., 0] - x) ** 2 + (pts[c, ..., 1] - y) ** 2) <= float(r) ** 2
+            n += int(m.sum())
+            pts[c][m] = np.nan
+    return n
+
+
 def _group_on(cgroup, device):
     dev = _device(device)
     if str(cgroup.device) == dev or (dev == 'cuda' and str(cgroup.device).startswith('cuda')):
@@ -119,7 +180,8 @@ class Reconstruction(WorkflowResult):
     used, ``filled [N,J]`` cells filled (gap interpolation / optim_points) rather than
     triangulated, ``point_error [N,J]`` median reprojection error (px) of each triangulated
     point over its inlier views (NaN for filled / missing cells), ``out_of_image [C,N,J]``
-    observations outside the image (not used with ``mask_out_of_bounds``). ``report``:
+    observations outside the image (not used with ``mask_out_of_bounds``), ``static [N,J]``
+    triangulated points in a static voxel (``static_flag``; see :func:`static_flags`). ``report``:
     ``per_camera`` usage, ``gaps``, ``bones`` (length CV), ``noise_px``, ``tau_px``, ``rules``."""
     points3d: Any = None
     errors: Any = None
@@ -128,6 +190,7 @@ class Reconstruction(WorkflowResult):
     filled: Any = None
     point_error: Any = None
     out_of_image: Any = None
+    static: Any = None
 
     def save(self, out):
         save_arrays(self, out, {'points3d': self.points3d, 'errors': self.errors,
@@ -153,6 +216,14 @@ _W6_DEFAULTS = {
     'max_lr': 0.1,             # optim_points step (pixels)
     'chunk_frames': 2000,      # optim_points chunk length (frames) for long sequences
     'overlap_frames': 100,     # overlap between chunks (linear blending)
+    'mask_regions': None,      # {camera name or index: [(x, y, r), ...]}: observations inside these image circles (px) are dropped
+    'static_flag': True,       # flag points in 3D voxels occupied for long periods (static artifacts): res.static
+    'static_voxel': 0.011,     # voxel edge, x rig scale (outdoor mouse: 0.011 x 4.47 = 5 cm)
+    'static_min_s': 40.0,      # a voxel is static when occupied for at least this long (s, distinct frames x frame interval) ...
+    'static_bin_s': 3600.0,    # ... in at least static_min_bins distinct time bins of this length (s)
+    'static_min_bins': 5,
+    'static_remove': False,    # True: static points are removed (NaN) before filling / bones
+    'fps': None,               # frame rate when times= is not given (static flags; None = 30 Hz)
     'verdict': None,
 }
 
@@ -451,6 +522,7 @@ def _reconstruct_identities(cgroup, pts, scores, bones, smooth, fill, robust, op
     return Reconstruction(points3d=st('points3d', 1), errors=st('errors', 2), n_views=st('n_views', 1),
                           inliers=st('inliers', 2), filled=st('filled', 1),
                           point_error=st('point_error', 1), out_of_image=st('out_of_image', 2),
+                          static=st('static', 1),
                           report=report, verdict=worst(*[r.verdict for r in rs]), reasons=reasons,
                           settings=settings,
                           provenance=dict(rs[0].provenance, identities=P,
@@ -491,7 +563,14 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             ``point_error`` exceeds it are removed before filling), ``cam_names`` (camera order of
             ``points``; reindexed to the group, missing cameras are NaN), ``bone_weight``
             ('auto' or a float, the 1.1 fixed weight was 2.0), ``bone_max_reproj_rise`` (0.5
-            noise floors; None = never reject), ``n_iters``, ``chunk_frames``, ``verdict``, ...
+            noise floors; None = never reject), ``mask_regions`` (``{cam: [(x, y, r), ...]}``:
+            observations inside these image circles are dropped, e.g. a sync LED; counted in
+            ``report['n_removed']``), static artifacts (``static_flag`` True: ``res.static [N,J]``
+            flags triangulated points in a voxel of ``static_voxel`` (0.011) x rig scale occupied
+            for >= ``static_min_s`` (40) s in >= ``static_min_bins`` (5) distinct ``static_bin_s``
+            (3600) s bins, i.e. a false detection that stays put for hours; flag only unless
+            ``static_remove``; ``report['static']``; time from ``times=`` or the frame index at
+            ``fps`` (30)), ``n_iters``, ``chunk_frames``, ``verdict``, ...
         device: ``'auto'`` (cuda if available; ``optim_points`` chunks of fewer than
             ``OPTIM_GPU_MIN_CELLS`` frames x joints stay on the CPU, where they are faster),
             ``'cpu'``, ``'cuda'``.
@@ -510,6 +589,8 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         observations used; warn > 0); ``error_drift`` (largest / smallest median error over 8 blocks
         of frames, the smallest at least 0.5 px: errors that change over the recording mean
         moved cameras (pass ``extrinsics=``) or broken sync; warn > 3);
+        ``static_frac`` (share of the triangulated points flagged static, without
+        ``static_remove``; warn > 0.05);
         ``bone_cv`` (median robust bone-length CV 1.4826 MAD / median, with ``bones``; warn
         above max(0.1, the triangulated CV), fail above max(0.3, 2 x the triangulated CV)).
     """
@@ -570,6 +651,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         drop = (nj > 0) & (nj < k)
         n_sparse_views = int(drop.sum())
         pts[drop] = np.nan
+    n_masked = 0
+    if opts['mask_regions']:
+        n_masked = _mask_regions(pts, opts['mask_regions'], names)
     bones = [tuple(int(v) for v in b) for b in (bones or [])]
     for a, b in bones:
         if not (0 <= a < J and 0 <= b < J):
@@ -657,6 +741,25 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
 
     scale = _rig_scale(cgroup) if pin is None else float('nan')
     settings['rig_scale'] = scale
+    static = np.zeros((N, J), bool)
+    static_info = None
+    if opts['static_flag'] and np.isfinite(scale) and scale > 0 and have.any():
+        with timer('static'):
+            ts = tms if tms is not None else np.arange(N) / float(opts['fps'] or 30.0)
+            static, static_info = static_flags(
+                X, ts, float(opts['static_voxel']) * scale, min_s=float(opts['static_min_s']),
+                bin_s=float(opts['static_bin_s']), min_bins=int(opts['static_min_bins']))
+            static &= have
+            static_info.update(frac=float(static.sum() / max(have.sum(), 1)),
+                               removed=bool(opts['static_remove']))
+        if opts['static_remove'] and static.any():
+            X[static] = np.nan
+            inl = inl & ~static[None]
+            have = have & ~static
+    settings.update(static_flag=bool(opts['static_flag']), static_voxel=opts['static_voxel'],
+                    static_min_s=opts['static_min_s'], static_bin_s=opts['static_bin_s'],
+                    static_min_bins=opts['static_min_bins'], static_remove=bool(opts['static_remove']),
+                    mask_regions=opts['mask_regions'])
     optimise = bool(bones) or smooth is not None
     if optimise and E is not None:
         fallbacks.append('optim_points skipped: bones / smooth are not supported with per-frame '
@@ -769,7 +872,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                  'extrapolated': 0},
         'n_out_of_image': int(oob.sum()),
         'n_removed': {'min_score': n_low_score, 'min_joints_per_view': n_sparse_views,
-                      'max_point_err_px': n_point_err},
+                      'max_point_err_px': n_point_err, 'mask_regions': n_masked,
+                      'static': int(static.sum()) if opts['static_remove'] else 0},
+        'static': static_info,
         'noise_px': settings.get('noise_px'), 'tau_px': tau,
         'median_err_px': float(np.nanmedian(err[inl])) if inl.any() else None,
         'median_point_error_px': float(np.nanmedian(pe)) if np.isfinite(pe).any() else None,
@@ -790,6 +895,10 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
              'reprojection error changes over the recording (largest / smallest of 8 blocks): moved '
              'cameras (pass extrinsics= for moving cameras) or broken sync'),
     ]
+    if static_info is not None and not opts['static_remove']:
+        rules.append(Rule('static_frac', static_info['frac'], 0.05, None,
+                          'triangulated points in static voxels (res.static; static artifacts such as a '
+                          "sync LED or a reflection: options static_remove / mask_regions)"))
     if bones:
         cv_before = _bone_cv(X, bones)
         cv_after = _bone_cv(final, bones)
@@ -811,7 +920,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     sq = (lambda a: a[..., 0]) if squeeze else (lambda a: a)
     return Reconstruction(
         points3d=out, errors=sq(err), n_views=sq(n_views), inliers=sq(inl), filled=sq(filled),
-        point_error=sq(pe), out_of_image=sq(oob),
+        point_error=sq(pe), out_of_image=sq(oob), static=sq(static),
         report=report, verdict=verdict, reasons=reasons, settings=settings,
         provenance=provenance('reconstruct_3d',
                               inputs={'shape': [C, N, J], 'cameras': names,
