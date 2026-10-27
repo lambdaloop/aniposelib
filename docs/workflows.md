@@ -190,7 +190,13 @@ Some situations it handles for you:
   `init='vggt'` and `frames=` (or a calibration as `init=`), plus your tracker's IDs as
   `options={'track_ids': ...}`. The people are matched across cameras with that first calibration
   (`associate_views`), then the calibration is refined from them. If nobody can be matched, you get `'fail'` with
-  the reason: the first calibration was probably wrong.
+  the reason: the first calibration was probably wrong. Without any first calibration, use `init='people'`: the
+  people are matched across cameras from the geometry of each camera pair alone. A tracker usually cuts a person's
+  track into several pieces; the pieces are joined as long as two of them are never seen in the same frame.
+- **Noisy keypoints.** The reconstruction from the points alone measures the keypoint noise on its first camera
+  pair and loosens its tests to match, so noisy detections (people at 1080p, a few pixels off) no longer leave
+  cameras out. A camera that still fails gets a second try once the others are placed. To use the fixed 1.0 test,
+  pass `options={'sfm_kwargs': {'noise_mult': None}}` (or `'people_kwargs'` with `init='people'`).
 - **Cameras that were bumped.** Give `stations=` (for example from `evaluate_calibration(...).moves.stations`) and the
   frame times in `groups={'time': ...}`. Each position of a bumped camera gets its own pose. `result.rig_at(t)` gives
   you the calibration at time `t`.

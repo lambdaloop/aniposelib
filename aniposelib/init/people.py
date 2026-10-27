@@ -17,10 +17,12 @@ Per camera pair (disco ``hypotheses`` / ``solve_pair`` / ``match_tracklets``):
 3. with the best E, tracks are matched by votes of those anchors (a track anchored to several
    partners keeps one only if it dominates), and E is re-estimated from all matched joints.
 
-Accepted track pairs are merged across all pairs by union-find on ``(camera, track)`` nodes;
-groups that would contain two tracks of the same camera in the same frame are split off
-(dropped). Track ids must be consistent within a camera (``track_ids``; default: the slot
-index ``p`` is the track).
+Accepted track pairs are merged across all pairs on ``(camera, track)`` nodes, strongest
+(most votes) first; a merge that would put two tracks of one camera visible in the same frame
+into one identity is refused (``report.dropped``). Tracks of one camera that never share a frame
+(fragments of one person, cut by the tracker) do not compete in step 3 and may join one identity.
+Track ids must be consistent within a camera (``track_ids``; default: the slot index ``p`` is
+the track). The camera pairs run on threads with seeds drawn from ``rng`` in pair order.
 """
 
 from dataclasses import dataclass, field, fields

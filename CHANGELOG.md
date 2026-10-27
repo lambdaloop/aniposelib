@@ -103,6 +103,20 @@ dancing). Behaviour changes say how to get the previous behaviour.
   (never 1.8e308); W4 names cameras with a low inlier rate as the likely cause of a low LOO coverage.
 - `init.sfm.from_correspondences`: when the best seed pair triangulates fewer than `min_pair_points` points, the next
   pairs are tried (`stats['seed_tried']`); this made `test_w2_bad_inputs` flaky across machines.
+- **W2 `init='people'` (EvoVision, Panoptic 5 cameras: 2 of 5 were unplaced, 102 s).** `init.people.associate_people`:
+  a person's track fragments (an IoU tracker cuts tracks at occlusions) are joined: fragments of one camera that are
+  never visible in the same frame do not compete in the pair matching, and the matched track pairs are merged
+  strongest first, refusing only merges that put two tracks of one camera in the same frame (before: any identity with
+  two tracks of one camera was dropped whole, which left 3 small identities). `report.groups` values are a track id or
+  a list of them. The camera pairs run on threads with per-pair seeds; W2 associates once (it ran twice) and passes its
+  `rng` / `device` (the association was unseeded). `from_people(association=)` reuses an association. Panoptic per-camera
+  K: all 5 cameras, centres 11.9 mm median / 15.6 mm max (seed route 17.9 mm, EvoVision 13.2 mm), 27 s.
+- `init.sfm.from_correspondences(noise_mult=2.5)`: the frame-RANSAC threshold is `max(pnp_thresh, noise_mult x noise)`,
+  with the noise the median symmetric epipolar distance of the seed pair (`stats['noise_px']`,
+  `stats['pnp_thresh_px']`). At ~2 px noise nothing changes (8 px); at 4-7 px the fixed 8 px rejected correctly posed
+  cameras or made them passengers. Old: `sfm_kwargs={'noise_mult': None}` (or `people_kwargs` for `init='people'`).
+- `init.sfm.from_correspondences`: a camera rejected for too few agreeing frames is retried once against the final
+  cloud (after a local BA), instead of being rejected for good; `report.rejected` lists it only if the retry fails.
 - W3 lengths: MSAC threshold an absolute 5 px (was 10 noise units: +16 % scale on Emory; 5 noise units still gave +2 %;
   `options['noise_unit']` makes it 5 x that unit), and the bones are re-measured on the scaled
   rig at half the threshold (`report['lengths_check']`, rule `lengths_check`, warn above `options['lengths_check']`

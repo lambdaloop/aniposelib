@@ -528,14 +528,14 @@ def test_people_association_merges_track_fragments():
 
 
 def test_sfm_pnp_threshold_follows_the_keypoint_noise():
-    """4 px keypoint noise: the fixed 8 px frame test rejected 3 of 5 cameras; the threshold now
+    """5 px keypoint noise: the fixed 8 px frame test placed 2 of 5 cameras; the threshold now
     scales with the noise measured on the seed pair (noise_mult=None: the old behaviour)."""
     from aniposelib.init import sfm
     true = synth.load_rig('fisheye_5cam')
-    p3d, _ = synth.skeleton(true, 60, model=synth.PERSON, size=3.5, spread=0.15, seed=3)
-    p2d = synth.add_noise(synth.project(true, p3d), 4.0, seed=4)
+    p3d, _ = synth.skeleton(true, 40, model=synth.PERSON, size=3.5, spread=0.15, seed=3)
+    p2d = synth.add_noise(synth.project(true, p3d), 5.0, seed=4)
     cg, rep = sfm.from_correspondences(WC_no_extrinsics(true), p2d, rng=0)
-    assert len(rep.placed) == 5 and 3 < rep.stats['noise_px'] < 5 and rep.stats['pnp_thresh_px'] > 8
+    assert len(rep.placed) == 5 and 4 < rep.stats['noise_px'] < 6 and rep.stats['pnp_thresh_px'] > 8
     assert synth.center_error(cg, true).max() < 0.03
     _, rep0 = sfm.from_correspondences(WC_no_extrinsics(true), p2d, rng=0, noise_mult=None)
     assert len(rep0.placed) < 5
