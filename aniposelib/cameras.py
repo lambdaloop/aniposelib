@@ -2502,8 +2502,13 @@ class CameraGroup(nn.Module):
         p3ds_intp = np.apply_along_axis(interpolate_data, 0, p3ds)
 
         if normalize:
-            unit, center = self._optim_unit(p3ds_intp, points)
+            unit, center = self._optim_unit(p3ds, points)
             center_np = center.detach().cpu().numpy()
+            # never-triangulated columns start at the scene centre, not at the world origin
+            never = ~np.isfinite(p3ds).all(-1).any(axis=0)   # (J,)
+            if never.any():
+                p3ds_intp = p3ds_intp.copy()
+                p3ds_intp[:, never] = center_np
             q_intp = (p3ds_intp - center_np) / unit
         else:
             unit, center = None, None
