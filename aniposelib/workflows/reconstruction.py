@@ -458,7 +458,7 @@ def _parse_extrinsics(ext, C, N):
     raise ValueError('extrinsics {} match neither [C,N]=({},{}) nor [N,C]'.format(E.shape[:2], C, N))
 
 
-def _affine_group(cgroup, flat):
+def _affine_group(cgroup, flat, what='reconstruct_3d'):
     """All-AffineCamera group -> (telephoto pinhole group, affine projection fn). The pinholes
     (``AffineCamera.to_pinhole``) match the affine cameras to 0.01 px on the linear affine
     triangulation of the data; final errors use the exact affine projection."""
@@ -469,12 +469,12 @@ def _affine_group(cgroup, flat):
     if not any(aff):
         return None, None
     if not all(aff):
-        raise ValueError('reconstruct_3d: the group mixes AffineCamera and pinhole cameras; convert '
+        raise ValueError(what + ': the group mixes AffineCamera and pinhole cameras; convert '
                          'the affine ones with AffineCamera.to_pinhole(support_points)')
     X = to_numpy(triangulate_affine(cams, flat, min_cams=2)).reshape(-1, 3)
     X = X[np.isfinite(X).all(-1)]
     if len(X) < 4:
-        raise ValueError('reconstruct_3d: AffineCamera group but fewer than 4 points seen by 2 '
+        raise ValueError(what + ': AffineCamera group but fewer than 4 points seen by 2 '
                          'cameras; convert with AffineCamera.to_pinhole(support_points)')
     lo, hi = np.percentile(X, 1, axis=0), np.percentile(X, 99, axis=0)
     ext = hi - lo

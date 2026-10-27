@@ -1787,6 +1787,19 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     return res
 
 
+def _all_affine(cg):
+    cams = list(getattr(cg, 'cameras', []))
+    return bool(cams) and all(type(c).__name__ == 'AffineCamera' for c in cams)
+
+
+def _affine_pinholes(cg, flat, what):
+    """All-AffineCamera group -> the equivalent telephoto pinhole group (``AffineCamera.to_pinhole``,
+    <= 0.01 px over the data; see ``reconstruct_3d``)."""
+    from .reconstruction import _affine_group
+    pin, _ = _affine_group(cg, flat, what)
+    return pin
+
+
 def _check_cameras(cg, what):
     """Workflows need pinhole / fisheye cameras: a clear error for affine (telecentric) ones."""
     bad = [getattr(c, 'name', i) for i, c in enumerate(getattr(cg, 'cameras', [])) if type(c).__name__ == 'AffineCamera']
@@ -2227,6 +2240,11 @@ W4_DEFAULTS = dict(
     frame_ids=None,           # ... frame id of each point row (or of each frame for C x F x P x J x 2 points)
     recover_kwargs=None,      # ... passed to stations.recover_moves
     moves_bad_window_frac=0.8,  # a step whose shorter side has this share of its observations in bad windows is dropped (None: off)
+    yardstick_px=(5, 8, 10),  # standard LOO agreement thresholds in absolute px (per_camera 'loo_agree@8px', report['summary'],
+                              # compare_to 'agree@8px'); None = off
+    yardstick_tau_px=5.0,     # ... their LOO triangulation threshold (absolute px; the Emory / tailcyclenet yardstick)
+    rank_by=8,                # ... compare_to ranks by agree@<rank_by>px (report['ranking'], 'better')
+    rank_min_delta=0.01,      # ... rule compare_to_better: another calibration agrees >= this much more (CI > 0)
     verdict=None,
 )
 
@@ -2315,8 +2333,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
 
     Parameters
     ----------
-    cgroup : the calibration to evaluate (pinhole / fisheye cameras; convert an AffineCamera group
-        with ``AffineCamera.to_pinhole`` first).
+    cgroup : the calibration to evaluate: pinhole / fisheye cameras, or an all-``AffineCamera``
+        (telecentric) group, which is evaluated through exact telephoto pinholes
+        (``AffineCamera.to_pinhole`` over the data, <= 0.01 px; as ``reconstruct_3d``).
     points : ``C x N x 2`` / ``C x N x J x 2`` pixels in ``cgroup`` order (NaN missing), or in the
         order of ``options['cam_names']``: then only the group's cameras are kept
         (``report['cameras_dropped']``) and group cameras without points are left out of the
@@ -2332,10 +2351,16 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
 
     Options (besides the verdict overrides): ``noise_unit`` ('auto' or a float: 1 = the 1.0
     absolute pixel defaults), ``tau_px`` / ``tau_tri_px`` / ``thresholds_px`` (the robust and LOO
-    triangulation thresholds and the LOO agreement thresholds in px, e.g. Emory's yardstick
-    ``tau_tri_px=5, thresholds_px=(5, 8, 10)``), ``loo_window_s`` (time-blocked LOO window with
+    triangulation thresholds and the LOO agreement thresholds in px; default 10 / 5 / (5, 8, 10)
+    noise units), ``yardstick_px`` / ``yardstick_tau_px`` (the standard yardstick, in absolute px
+    whatever the noise: LOO agreement at (5, 8, 10) px with an MSAC 5 px triangulation, Emory's
+    agree@8; per camera ``loo_agree@8px``, means in ``report['summary']``; None = off),
+    ``rank_by`` (8: ``compare_to`` ranks by ``agree@8px``), ``rank_min_delta``, ``loo_window_s`` (time-blocked LOO window with
     ``times=``; 'auto' ~ 20 windows), ``compare_to={name: CameraGroup}`` with ``clusters=[N]``
-    (paired LOO agreement difference with a cluster bootstrap: ``report['compare_to']``),
+    (paired LOO agreement difference with a cluster bootstrap: ``report['compare_to'][name]``, with
+    ``agree@T`` / ``agree@Tpx`` entries ``a`` (this), ``b`` (other), ``delta`` = b - a,
+    ``this_minus_other`` = a - b (the sign of Emory's ``paired_compare``), ``ci95``, plus
+    ``better`` = 'this' / 'other' / 'tie'; ``report['ranking']`` orders all of them),
     ``detect_moves_kwargs`` (``z_thr`` defaults to 10), ``cam_names``, ``recover_moves`` (True: with
     ``times=``, cameras whose LOO coverage collapses for good are re-placed by
     :func:`aniposelib.stations.recover_moves` and get a station in ``moves``; details in
@@ -2348,7 +2373,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     identity), ``times`` may be given per frame.
 
     Contents: LOO per camera (fixed denominator), coverage, inlier rates, lens validity, ray
-    angles, plus moves / comparison / board shape when their inputs are given. Project policy
+    angles, ``report['summary']`` (one number per metric: ``loo_agree@8px`` etc., higher is better;
+    compare calibrations evaluated on the same points by it), plus moves / comparison / board shape when their inputs are given. Project policy
     (e.g. a reuse ladder) belongs downstream, on top of ``per_camera``. With 2 cameras there is no
     LOO: the 2-view reprojection error is reported instead.
 
@@ -2371,6 +2397,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
       warn 1 % (warn only: a reference is often rougher than the calibration under test);
     - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
+    - ``compare_to_better`` (with ``compare_to``): calibrations whose ``agree@8px`` is significantly
+      higher (bootstrap CI95 > 0) by >= ``rank_min_delta`` (0.01) (warn);
     - ``two_view_only`` / ``two_view_px`` (2 cameras): no LOO (warn); worst per-camera 2-view
       reprojection median, warn above 0.5 %, fail above 2 % of the image diagonal.
     """
@@ -2379,7 +2407,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     opts = merge_options(W4_DEFAULTS, options)
     _check_noise_unit(opts['noise_unit'])
     timer = Timer()
-    _check_cameras(cgroup, 'evaluate_calibration')
+    if not _all_affine(cgroup):
+        _check_cameras(cgroup, 'evaluate_calibration')
     if object is not None:
         board, board_points = object, object_points if object_points is not None else board_points
     p = np.asarray(to_numpy(points), dtype='float64')
@@ -2414,6 +2443,11 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         raise ValueError('board= needs board_points= (rows or corners)')
     C = len(names)
     J = p.shape[2] if p.ndim == 4 else 1
+    affine = _all_affine(cgroup)
+    if affine:
+        # AffineCamera group: evaluated through exact telephoto pinholes (as reconstruct_3d)
+        with timer('affine'):
+            cgroup = _affine_pinholes(cgroup, p.reshape(C, -1, 2), 'evaluate_calibration')
     diag = _diag(cgroup, p) or 1000.0
     cg = _on_device(cgroup, device)
     with timer('noise'):
@@ -2428,6 +2462,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     use_loo = C >= 3
     settings = dict(image_diag_px=diag, noise_floor_px=nf, noise_unit=u, tau_px=tau, tau_tri_px=tau_tri,
                     thresholds_px=list(thr), min_others=min_others, loo_warn_px=3 * nf, loo_fail_px=10 * nf)
+    if affine:
+        settings['cameras'] = 'affine (exact telephoto pinholes, AffineCamera.to_pinhole)'
     # time windows of the blocked LOO
     win = None
     if times is not None and use_loo and opts['loo_window_s'] is not None:
@@ -2444,6 +2480,15 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                       min_others=min_others, loo=use_loo, min_views=min(3, C),
                       groups=None if win is None else np.repeat(win, J))
     per = {n: dict(qr.per_camera[n]) for n in names}
+    ys = None
+    if use_loo and qr.loo is not None and opts['yardstick_px']:
+        # the standard yardstick (absolute px, the same for every calibration and data set): ranks
+        # calibrations where the noise-scaled thresholds above differ between data sets
+        with timer('yardstick'):
+            ys = _yardstick(cg, p, qr, opts, tau_tri, min_others, names)
+        settings.update(yardstick_tau_px=ys['tau'], yardstick_px=list(ys['thr']))
+        for n in names:
+            per[n].update(ys['per'][n])
     with timer('lens'):
         n_lens_bad = 0
         for n, cam in zip(names, cgroup.cameras):
@@ -2591,7 +2636,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 report['compare_error'] = str(exc)
     if opts['compare_to']:
         with timer('compare_to'):
-            report['compare_to'] = _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device)
+            report['compare_to'] = _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device, ys)
     if board is not None:
         with timer('board'):
             bs = Q.board_shape_residual(cg, board_points, board)
@@ -2648,6 +2693,15 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     ]
     if missing:
         rules.append(Rule('cameras_missing', len(missing), 0, None, 'group cameras without points: {}'.format(missing)))
+    # ranking-friendly summary: one number per calibration on the standard yardstick
+    report['summary'] = _summary(per, names, ys, loo, covs, opts)
+    if report.get('compare_to'):
+        report['ranking'] = _ranking(report['summary'], report['compare_to'], opts)
+        rk = report['ranking']
+        rules.append(Rule('compare_to_better', len(rk['better_others']), 0, None,
+                          'significantly higher {} than this calibration: {}'.format(
+                              rk['by'], ', '.join('{} ({:+.3f})'.format(k, v) for k, v in rk['better_others'].items()))
+                          if rk['better_others'] else ''))
     if not use_loo:
         rules.append(Rule('two_view_only', True, None, None,
                           'only {} cameras: no leave-one-camera-out check, only the 2-view reprojection error'.format(C)))
@@ -2685,9 +2739,13 @@ def _demote_moves(moves, demoted):
                        info=dict(moves.info, demoted=[d['camera'] for d in demoted]))
 
 
-def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device):
+def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device, ys=None):
     """``options['compare_to']``: paired LOO agreement of this calibration vs each other one, on
-    the same observations (other - this; positive = the other one agrees more)."""
+    the same observations. ``delta`` = other - this (positive = the other one agrees more);
+    ``this_minus_other`` / ``this_minus_other_ci95`` = this - other (the sign of Emory's
+    ``paired_compare(e_other, e_this)``: candidate - reference). Keys ``agree@T`` use the
+    noise-scaled thresholds, ``agree@Tpx`` the standard yardstick (``ys``). ``better``: 'this',
+    'other' or 'tie' (CI covers 0) on ``agree@<rank_by>px``."""
     from .. import quality as Q
     names = cg.get_names()
     N = p.shape[1]
@@ -2713,10 +2771,100 @@ def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device):
             if miss:
                 raise ValueError('cameras {} are not in {!r}'.format(miss, name))
             og = other if on == names else other.subset_cameras_names(names)
+            if _all_affine(og):
+                og = _affine_pinholes(og, p.reshape(len(names), -1, 2), 'evaluate_calibration')
             og = _on_device(og, device)
             e1, _ = Q.loo_errors(og, p, tau_tri=tau_tri, min_others=min_others)
             d = _paired_agree(e0, e1, el, cl, thr, opts['n_boot'])
+            if ys is not None:
+                e1y = e1 if ys['shared'] else Q.loo_errors(og, p, tau_tri=ys['tau'], min_others=min_others)[0]
+                dy = _paired_agree(ys['errors'], e1y, ys['eligible'], cl, ys['thr'], opts['n_boot'])
+                d.update({k + 'px': v for k, v in dy.items()})
+            for v in d.values():
+                v['this_minus_other'] = -v['delta']
+                v['this_minus_other_ci95'] = None if v['ci95'] is None else [-v['ci95'][1], -v['ci95'][0]]
+            key = _rank_key(opts) if ys is not None else None
+            if key not in d:
+                key = 'agree@{:.4g}'.format(thr[1] if len(thr) >= 3 else thr[len(thr) // 2])
+            ci = d[key]['ci95']
+            d['rank_by'] = key
+            d['better'] = 'tie' if ci is None or (ci[0] <= 0 <= ci[1]) else ('other' if ci[0] > 0 else 'this')
             out[str(name)] = d
         except Exception as exc:
             out[str(name)] = dict(error='{}: {}'.format(type(exc).__name__, exc))
     return out
+
+
+def _rank_key(opts):
+    return 'agree@{:.4g}px'.format(float(opts['rank_by']))
+
+
+def _yardstick(cg, p, qr, opts, tau_tri, min_others, names):
+    """Standard LOO yardstick: fixed-denominator LOO agreement at absolute pixel thresholds
+    (``yardstick_px``) with an absolute MSAC threshold (``yardstick_tau_px``); reuses the
+    verdict LOO when the thresholds coincide (noise unit 1)."""
+    from .. import quality as Q
+    ytau = float(opts['yardstick_tau_px'])
+    ythr = tuple(float(t) for t in opts['yardstick_px'])
+    shared = abs(ytau - float(tau_tri)) < 1e-9
+    if shared:
+        e, el = qr.loo.errors, qr.loo.eligible
+    else:
+        e, el = Q.loo_errors(cg, p, tau_tri=ytau, min_others=min_others)
+    lp, _ = Q._summarize_loo(e, el, names, ythr)
+    per = {}
+    for n in names:
+        d = {'loo_agree@{:g}px'.format(t): lp[n]['agree@{:g}'.format(t)] for t in ythr}
+        d['yardstick_loo_median_px'] = lp[n]['median_px']
+        d['yardstick_loo_coverage'] = lp[n]['coverage']
+        per[n] = d
+    return dict(tau=ytau, thr=ythr, shared=shared, errors=e, eligible=el, per=per)
+
+
+def _summary(per, names, ys, loo, covs, opts):
+    """``report['summary']``: one value per metric for this calibration (means over cameras) to
+    rank calibrations on the same observations; higher ``loo_agree@Tpx`` is better."""
+    fin = np.isfinite(loo)
+    s = dict(loo_median_px=float(np.median(loo[fin])) if fin.any() else None,
+             loo_worst_px=float(np.max(loo[fin])) if fin.any() else None,
+             loo_coverage_mean=float(np.nanmean(covs)) if np.isfinite(covs).any() else None)
+    if ys is not None:
+        for t in ys['thr']:
+            k = 'loo_agree@{:g}px'.format(t)
+            v = [per[n][k] for n in names if per[n].get(k) is not None]
+            s[k] = float(np.mean(v)) if v else None
+        s['yardstick'] = ('fixed-denominator leave-one-camera-out agreement: share of the eligible held-out '
+                          'observations within T px of the point triangulated (MSAC {:g} px) from the other '
+                          'cameras, mean over cameras'.format(ys['tau']))
+        s['rank_by'] = 'loo_' + _rank_key(opts)
+    return s
+
+
+def _ranking(summary, cmp, opts):
+    """``report['ranking']``: this calibration and the ``compare_to`` ones ordered by the rank
+    metric (best first), with the paired bootstrap verdict of each against this one."""
+    rows = {'this': None}
+    better, worse, ties = {}, {}, []
+    by = None
+    for name, d in cmp.items():
+        if 'error' in d:
+            continue
+        by = d['rank_by']
+        m = d[by]
+        rows['this'] = m['a']
+        rows[name] = m['b']
+        if d['better'] == 'other':
+            if m['delta'] >= float(opts['rank_min_delta']):
+                better[name] = m['delta']
+            else:
+                ties.append(name)
+        elif d['better'] == 'this':
+            worse[name] = m['delta']
+        else:
+            ties.append(name)
+    if rows['this'] is None:
+        rows['this'] = summary.get('loo_' + _rank_key(opts))
+    order = sorted(rows, key=lambda k: np.inf if rows[k] is None else -rows[k])
+    return dict(by=by, order=order, values=rows, better_others=better, worse_others=worse, ties=ties,
+                note="'this' = the evaluated calibration; better_others / worse_others: CI95 of the paired "
+                     "block bootstrap excludes 0 (better_others also needs >= rank_min_delta)")

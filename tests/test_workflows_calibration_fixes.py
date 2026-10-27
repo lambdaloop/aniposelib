@@ -274,9 +274,83 @@ def test_w4_cam_names_and_affine(mo):
     assert any('cameras_missing' in r for r in ev.reasons)
     from aniposelib.affine import AffineCamera
     from aniposelib.cameras import CameraGroup
-    aff = CameraGroup([AffineCamera(name=str(i)) for i in range(3)])
+    mixed = CameraGroup([AffineCamera(name='a'), true.cameras[0], true.cameras[1]])
     with pytest.raises(ValueError, match='to_pinhole'):
-        evaluate_calibration(aff, np.zeros((3, 4, 2)))
+        evaluate_calibration(mixed, np.zeros((3, 4, 2)))
+
+
+def _affine_rig(n=4, seed=0):
+    from aniposelib.affine import AffineCamera
+    from aniposelib.cameras import CameraGroup
+    rng = np.random.default_rng(seed)
+    cams = []
+    for c in range(n):
+        a = 2 * np.pi * c / n
+        d = np.array([np.cos(a), np.sin(a), 0.4])
+        d /= np.linalg.norm(d)
+        u = np.cross(d, [0, 0, 1.0]); u /= np.linalg.norm(u)
+        v = np.cross(d, u)
+        A = 900 * np.stack([u, v]) + rng.normal(scale=5, size=(2, 3))
+        cams.append(AffineCamera(A, np.array([640.0, 512.0]), size=(1280, 1024), name='c{}'.format(c)))
+    X = rng.normal(scale=0.2, size=(80, 3))
+    p2d = np.stack([X @ c.A.detach().numpy().T + c.b.detach().numpy() for c in cams])
+    p2d += rng.normal(scale=0.3, size=p2d.shape)
+    return CameraGroup(cams), X, p2d
+
+
+def test_w4_affine_group_native():
+    # tailcycle johnson-fly: W4 takes an AffineCamera group (exact telephoto pinholes, as W6) and
+    # gives the same LOO as the user's own to_pinhole conversion
+    from aniposelib.cameras import CameraGroup
+    cg, X, p2d = _affine_rig()
+    ev = evaluate_calibration(cg, p2d)
+    assert 'affine' in ev.settings['cameras'] and ev.verdict == 'ok', ev.summary()
+    pin = CameraGroup([c.to_pinhole(X, max_error_px=0.01) for c in cg.cameras])
+    ref = evaluate_calibration(pin, p2d)
+    for n in cg.get_names():
+        assert ev.per_camera[n]['loo_median_px'] == pytest.approx(ref.per_camera[n]['loo_median_px'], abs=0.02)
+    bad = copy.deepcopy(cg)
+    with torch.no_grad():
+        bad.cameras[1].b.add_(torch.tensor([6.0, 0.0], dtype=bad.cameras[1].b.dtype))
+    ev2 = evaluate_calibration(cg, p2d, options={'compare_to': {'shifted': bad}, 'n_boot': 100})
+    assert 'error' not in ev2.report['compare_to']['shifted']
+
+
+def test_w4_yardstick_summary_and_ranking(mo):
+    # Emory: the default W4 reports the standard yardstick (LOO agree@5/8/10 px, MSAC 5 px) whatever
+    # the noise unit, and compare_to ranks calibrations by agree@8px (paired block bootstrap)
+    from aniposelib import quality as Q
+    true, p3, _, _ = mo
+    p2 = synth.add_noise(synth.project(true, p3), 3.0, seed=4)       # noisy: noise unit 2
+    rough = synth.perturb_extrinsics(true, 1.5, 0.03, seed=5)
+    ev = evaluate_calibration(true, p2, options={'compare_to': {'rough': rough, 'same': true}, 'n_boot': 200})
+    assert ev.settings['noise_unit'] > 1 and ev.settings['tau_tri_px'] > 5
+    assert ev.settings['yardstick_tau_px'] == 5.0 and ev.settings['yardstick_px'] == [5, 8, 10]
+    e, el = Q.loo_errors(true, p2, tau_tri=5.0, min_others=3)
+    for c, n in enumerate(true.get_names()):
+        want = float(np.sum(el[c] & np.isfinite(e[c]) & (e[c] < 8)) / el[c].sum())
+        assert ev.per_camera[n]['loo_agree@8px'] == pytest.approx(want)
+    s = ev.report['summary']
+    assert s['rank_by'] == 'loo_agree@8px' and 0 < s['loo_agree@8px'] < 1
+    pc = ev.report['compare_to']
+    assert pc['same']['better'] == 'tie' and pc['same']['agree@8px']['delta'] == 0
+    r = pc['rough']
+    assert r['rank_by'] == 'agree@8px' and r['better'] == 'this'
+    assert r['agree@8px']['a'] == pytest.approx(s['loo_agree@8px'])
+    assert r['agree@8px']['this_minus_other'] == -r['agree@8px']['delta'] > 0
+    lo, hi = r['agree@8px']['ci95']
+    assert r['agree@8px']['this_minus_other_ci95'] == [-hi, -lo]
+    rk = ev.report['ranking']
+    assert rk['order'][-1] == 'rough' and 'rough' in rk['worse_others'] and not rk['better_others']
+    assert not any('compare_to_better' in x for x in ev.reasons)
+    # evaluating the worse calibration: the verdict says a compared calibration is better
+    evr = evaluate_calibration(rough, p2, options={'compare_to': {'true': true}, 'n_boot': 200})
+    assert evr.report['ranking']['order'][0] == 'true' and 'true' in evr.report['ranking']['better_others']
+    assert any('compare_to_better' in x for x in evr.reasons) and evr.verdict != 'ok'
+    json.loads(evr.to_json())
+    # yardstick off: no extra keys
+    ev0 = evaluate_calibration(true, p2, options={'yardstick_px': None})
+    assert 'loo_agree@8px' not in ev0.per_camera[true.get_names()[0]]
 
 
 @pytest.mark.slow
