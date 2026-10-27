@@ -60,7 +60,7 @@ dancing). Behaviour changes say how to get the previous behaviour.
   absolute pixels). Default `'auto'` = the capped unit (base commit).
 - W2 fine threshold schedule: thresholds above the last coarse threshold are dropped instead of clipped to it, so the
   rounds keep their ratios (`min(t*u, coarse)` flattened every round to one threshold).
-- W2 verdict noise floor (`settings['noise_floor_px']`, the `loo_worst_px` limits and the intrinsics gate): measured on
+- W2 verdict noise floor (`settings['noise_floor_px']`, the `loo_worst_px` limits and the quality thresholds): measured on
   the points under the refined rig at 2 % of the diagonal (as W4), not at the last schedule threshold (that one is
   ~threshold / 3 by construction); the old value is `settings['noise_floor_fit_px']`.
 - W2 `refine_intrinsics='auto'`: a refined lens that is not invertible over the image (`quality.lens_validity`) is put

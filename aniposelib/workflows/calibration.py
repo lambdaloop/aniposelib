@@ -1500,10 +1500,11 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
                            cands, dict(init=key))
     # verdict noise floor: the points under the refined rig at a loose threshold (as W4), not the
     # errors at the last schedule threshold (that one is ~threshold / 3 by construction)
+    # (the fit's own floor still sets the intrinsics gate and the station fit, as before)
     with timer('noise'):
         nf, _ = _points_noise(cg, pc, diag)
-    if 'noise_floor_px' in settings:
-        settings['noise_floor_fit_px'] = settings['noise_floor_px']
+    nf_fit = float(settings.get('noise_floor_px', nf))
+    settings['noise_floor_fit_px'] = nf_fit
     settings['noise_floor_px'] = nf
     u = _noise_unit(nf, opts['noise_unit'])
     settings['noise_unit_final'] = u
@@ -1512,13 +1513,13 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         if refine_intrinsics in (False, None):
             res.intrinsics = dict(decision='kept', reason='refine_intrinsics=False')
         elif refine_intrinsics in ('auto', True):
-            cg, res.intrinsics = _gate_intrinsics(cg, pc, gr, refine_intrinsics, nf, opts, rng)
+            cg, res.intrinsics = _gate_intrinsics(cg, pc, gr, refine_intrinsics, nf_fit, opts, rng)
         else:
             raise ValueError("refine_intrinsics must be 'auto', True or False")
     # ---- stations
     if stations is not None:
         with timer('stations'):
-            res.report['stations'] = _stations_ba(cg, pc, gr, stations, nf, rng, opts['noise_unit'])
+            res.report['stations'] = _stations_ba(cg, pc, gr, stations, nf_fit, rng, opts['noise_unit'])
     if dev != 'cpu':
         cg = cg.to('cpu')
     # ---- scale
@@ -2366,6 +2367,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
              cov_note, higher_is_worse=False),
         Rule('loo_unsupported', len(unsupported) if use_loo else None, 0, None,
              'cameras whose LOO is unsupported: {}'.format(unsupported) if unsupported else ''),
+        Rule('loo_unmeasured', (use_loo and not np.isfinite(loo).any() and not unsupported) or None, 0, None,
+             'no point is seen by {} other cameras: no leave-one-camera-out check'.format(min_others)),
         Rule('lens_invalid', n_lens_bad, 0, None, 'lens model not invertible over the image'),
         Rule('grazing_frac', grazing, 0.5, None, 'points with all ray angles < {} deg'.format(opts['min_ray_deg'])),
         Rule('moved_cameras', len(moved) if times is not None else None, None, 0,
