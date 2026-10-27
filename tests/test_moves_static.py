@@ -150,3 +150,19 @@ def test_recover_without_detections_and_station_ba(lost_camera):
     rep = B.bundle_adjust_lm(rig, obs, stations=rec.moves.stations, only_extrinsics=True, return_report=True,
                              inplace=False)
     assert rep.error < 1.0 and sn in rep.stations['names']
+
+
+def test_w4_lost_but_unmoved_camera_is_reassociated_not_moved(lost_camera):
+    rig, rigb, cb, tb, t, p, assoc, det = lost_camera
+    a2 = assoc.copy()
+    a2[0, t >= tb] = np.nan                  # the association also dropped an unmoved camera
+    names = rig.get_names()
+    ev = W.evaluate_calibration(rig, a2, times=t, options={'detections': det})
+    assert ev.moves.moved == [names[cb]]
+    (r0,) = ev.report['recovered_moves'][names[0]]
+    assert r0['status'].startswith('not moved') and r0['n_reassociated'] > 0
+    assert names[0] not in ev.moves.stations.moved
+    post = t >= tb + 0.2
+    got = ev.points[0, post]
+    assert np.isfinite(got).mean() > 0.9
+    np.testing.assert_allclose(got[np.isfinite(got)], p[0, post][np.isfinite(got)])

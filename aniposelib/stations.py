@@ -33,6 +33,7 @@ Windows with less than ``min_support_frac`` of the median window support are ign
 
 import dataclasses
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -894,7 +895,7 @@ def _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support, max_n=5)
 def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=None, window_s=None,
                   tau=10.0, agree_px=None, gate_px=None, min_other=2, collapse_ratio=0.3, min_windows=3,
                   min_support=20, max_deg=15.0, grid_step_deg=2.5, max_instances=600, cameras=None,
-                  device=None, rng=0):
+                  device=None, rng=0, persistent=True, min_step_deg=0.5):
     """Re-place cameras that were bumped so hard that their LOO coverage collapses.
 
     A camera whose share of the points supported by the other cameras that it also sees and agrees
@@ -912,6 +913,16 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
     ``data``. With ``detections`` the camera is then re-associated after ``t`` (Hungarian per
     frame on the median keypoint distance, gate ``2 x gate_px``) and the returned ``points``
     carry its observations.
+
+    Coverage is the share of the cells the other cameras support (>= ``min_other`` views) where the
+    camera agrees; without ``detections`` only cells the camera observes count (a camera that stops
+    seeing the animal has not moved, and cannot be re-placed from its own data anyway). With
+    ``persistent`` (default) only collapses that last to the end of the data are moves (a coverage
+    that comes back by itself is broken data or sync, not a bump). Collapses are handled earliest
+    first, then the most complete; a camera already re-placed is used at its new pose (and with its
+    re-associated detections) for the next ones. A camera that still fits at its old pose (people
+    data whose association dropped it), or whose recovered rotation is below ``min_step_deg``, is
+    'not moved' (with ``detections`` it is still re-associated).
 
     A recovered camera gets a new station from ``t`` (an existing change point of ``moves`` within
     two windows is reused). It is accepted when its coverage after recovery is at least half its
@@ -951,16 +962,21 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
     lc = getattr(moves, '_loo', None)
     if not (lc and lc['tau'] == float(tau) and lc['n'] == N * J and lc['min_other'] == int(min_other)):
         lc = None
+    # phase 1: collapsed runs per camera
+    jobs = []
     for c in cams:
         sup, hit = _loo_quality(P, flat, c, tau, min_other, agree_px,
                                 cache=None if lc is None else lc['cams'].get(c))
+        if detections is None:
+            # only the camera's own data: judge its agreement where it sees the point (a camera
+            # that stops seeing the animal is not a moved camera, and cannot be re-placed anyway)
+            sup = sup & np.isfinite(flat[c]).all(-1)
         ns = np.bincount(wf, weights=sup, minlength=W)
         nh = np.bincount(wf, weights=hit, minlength=W)
         judged = ns >= min_support
         if judged.sum() < 2 * min_windows:
             continue
         q = np.where(judged, nh / np.maximum(ns, 1), np.nan)
-        # runs of windows where the camera's coverage collapsed
         jw = np.flatnonzero(judged)
         for cand, end, before in _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support):
             k0 = jw[cand]
@@ -970,81 +986,128 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             t_cp = float(0.5 * (t_last + t[rows_after].min())) if len(rows_after) else t0 + k0 * ws
             t_end = INF if end >= len(jw) else t0 + jw[end] * ws
             lost = float(np.nanmedian(q[jw[cand:end]]))
-            rows = np.flatnonzero((t >= t_cp) & (t < t_end))
             d = dict(time=t_cp, t_end=t_end, coverage_before=before, coverage_lost=lost, status='failed')
             info.setdefault(names[c], []).append(d)
-            # points of the other cameras after the move
-            others = [o for o in range(C) if o != c]
-            r = T.triangulate_robust(P.subset(others), p2d[others][:, rows].reshape(len(others), -1, 2),
-                                     method='msac', tau=tau)
-            Xr = np.asarray(r.p3d, float).reshape(len(rows), J, 3)
-            inst = np.flatnonzero(np.isfinite(Xr).all(-1).sum(-1) >= min(3, J))
-            # candidate detections of camera c per instance
-            if detections is not None:
-                dc = _frame_detections(detections, names, c)
-                dl = [_get_frame(dc, frame_ids[rows[i]]) for i in inst]
-            else:
-                dl = [p2d[c, rows[i]][None] if np.isfinite(p2d[c, rows[i]]).any() else None for i in inst]
-            has = np.array([x is not None for x in dl], bool)
-            inst = inst[has]
-            dl = [x for x in dl if x is not None]
-            d['n_instances'] = int(len(inst))
-            if len(inst) < max(3, min_support // max(J, 1)):
-                d['status'] = 'failed: too few points from the other cameras with detections'
+            if persistent and np.isfinite(t_end):
+                d['status'] = 'skipped: coverage came back at {:.6g} s (not a lasting move)'.format(t_end)
                 continue
-            if len(inst) > max_instances:
-                pick = np.sort(gen.choice(len(inst), max_instances, replace=False))
-            else:
-                pick = np.arange(len(inst))
-            Dm = max(x.shape[0] for x in dl)
+            jobs.append((k0, lost / max(before, 1e-9), c, t_cp, t_end, before, d))
+    # phase 2: earliest first, then the most collapsed; each recovered camera's pose and data are
+    # used when the next cameras are re-placed
+    work = p2d.copy()
+    overrides = {}                      # cam -> (t0, t1, E [4,4] torch)
+    jobs.sort(key=lambda j: (j[0], j[1]))
+    zero3 = torch.zeros(3, dtype=dt, device=dev)
+    eye3 = torch.eye(3, dtype=dt, device=dev)
+    for k0, _, c, t_cp, t_end, before, d in jobs:
+        name = names[c]
+        rows = np.flatnonzero((t >= t_cp) & (t < t_end))
+        others = [o for o in range(C) if o != c]
+        # points of the other cameras after the move (recovered cameras at their new pose)
+        Xr = np.full((len(rows), J, 3), np.nan)
+        keys = np.zeros((len(rows), 0), bool)
+        ovs = [o for o in others if o in overrides]
+        if ovs:
+            keys = np.stack([(t[rows] >= overrides[o][0]) & (t[rows] < overrides[o][1]) for o in ovs], 1)
+        ukeys, kinv = np.unique(keys, axis=0, return_inverse=True)
+        kinv = np.asarray(kinv).reshape(-1)
+        for kk, key in enumerate(ukeys):
+            m = kinv == kk
+            Pk = P
+            on = [o for o, b in zip(ovs, key) if b]
+            if on:
+                cgk = cgroup.copy()
+                for o in on:
+                    E = overrides[o][2].cpu().numpy()
+                    cgk.cameras[o].set_rotation(_rotvec(E[:3, :3]))
+                    cgk.cameras[o].set_translation(E[:3, 3])
+                Pk = G.pack(cgk, device=dev)
+            r = T.triangulate_robust(Pk.subset(others), work[others][:, rows[m]].reshape(len(others), -1, 2),
+                                     method='msac', tau=tau)
+            Xr[m] = np.asarray(r.p3d, float).reshape(int(m.sum()), J, 3)
+        inst = np.flatnonzero(np.isfinite(Xr).all(-1).sum(-1) >= min(3, J))
+        # candidate detections of camera c per instance
+        if detections is not None:
+            dc = _frame_detections(detections, names, c)
+            dl = [_get_frame(dc, frame_ids[rows[i]]) for i in inst]
+        else:
+            dl = [p2d[c, rows[i]][None] if np.isfinite(p2d[c, rows[i]]).any() else None for i in inst]
+        has = np.array([x is not None for x in dl], bool)
+        inst = inst[has]
+        dl = [x for x in dl if x is not None]
+        d['n_instances'] = int(len(inst))
+        if len(inst) < max(3, min_support // max(J, 1)):
+            d['status'] = 'failed: too few points from the other cameras with detections'
+            continue
+        pick = np.sort(gen.choice(len(inst), max_instances, replace=False)) if len(inst) > max_instances \
+            else np.arange(len(inst))
+        Dm = max(x.shape[0] for x in dl)
 
-            def pad(ix):
-                a = np.full((len(ix), Dm, J, 2), np.nan)
-                for k, i in enumerate(ix):
-                    a[k, :dl[i].shape[0]] = dl[i]
-                return torch.as_tensor(a, dtype=dt, device=dev)
-            Xs = torch.as_tensor(Xr[inst[pick]], dtype=dt, device=dev)
-            Ds = pad(pick)
-            f = float(P.K[c, 0, 0])
-            coarse_gate = max(gate, 0.6 * np.radians(grid_step_deg) * f)
-            rv, s1 = _grid_search(P, c, Xs, Ds, coarse_gate, max_deg, grid_step_deg)
-            rv, s2 = _grid_search(P, c, Xs, Ds, max(gate, coarse_gate / 4), grid_step_deg, grid_step_deg / 4, center=rv)
-            R0 = G.rodrigues(torch.as_tensor(rv, dtype=dt, device=dev))
-            z3 = torch.zeros(3, dtype=dt, device=dev)
-            Rr, tr, cost_r, nin_r, _ = _refine_pose(P, c, Xs, Ds, R0, z3, 2 * gate, full=False)
-            Rr, tr, cost_r, nin_r, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=False)
-            Rf, tf_, cost_f, nin_f, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=True)
-            full = cost_f < 0.8 * cost_r and nin_f >= nin_r
-            Rb, tb = (Rf, tf_) if full else (Rr, tr)
-            # coverage after recovery on all instances of the interval
-            Xa = torch.as_tensor(Xr[inst], dtype=dt, device=dev)
-            Da = pad(np.arange(len(inst)))
-            uv, z, _ = _proj_pose(P, c, Rb, tb, Xa.reshape(-1, 3))
+        def pad(ix):
+            a = np.full((len(ix), Dm, J, 2), np.nan)
+            for k, i in enumerate(ix):
+                a[k, :dl[i].shape[0]] = dl[i]
+            return torch.as_tensor(a, dtype=dt, device=dev)
+        Xa = torch.as_tensor(Xr[inst], dtype=dt, device=dev)
+        Da = pad(np.arange(len(inst)))
+        cells = np.isfinite(Xr[inst]).all(-1)
+        n_sup = max(int(cells.sum()), 1) if detections is None else \
+            max(int(np.isfinite(Xr).all(-1).sum()), 1)
+
+        def coverage(R, tv):
+            uv, z, _ = _proj_pose(P, c, R, tv, Xa.reshape(-1, 3))
             sc = _match_score(uv.reshape(len(inst), J, 2), Da, gate)
             ch = sc.argmax(-1)
             tgt = Da[torch.arange(len(inst), device=dev), ch].reshape(-1, 2)
             e = (uv - tgt).norm(dim=-1).reshape(len(inst), J).cpu().numpy()
-            cells = np.isfinite(Xr[inst]).all(-1)
-            n_sup = int(sup.reshape(N, J)[rows].sum())
-            after = float(((e < agree_px) & cells).sum() / max(n_sup, 1))
+            return float(((e < agree_px) & cells).sum() / n_sup), e
+        cov0, _ = coverage(eye3, zero3)
+        d['coverage_unmoved'] = cov0
+        if cov0 >= 0.5 * before:
+            Rb, tb, moved_ = eye3, zero3, False
+            d.update(status='not moved: the camera still fits at its old pose (data lost, e.g. association)',
+                     step_deg=0.0)
+        else:
+            Xs, Ds = Xa[pick], pad(pick)
+            f = float(P.K[c, 0, 0])
+            coarse_gate = max(gate, 0.6 * np.radians(grid_step_deg) * f)
+            rv, _ = _grid_search(P, c, Xs, Ds, coarse_gate, max_deg, grid_step_deg)
+            rv, _ = _grid_search(P, c, Xs, Ds, max(gate, coarse_gate / 4), grid_step_deg, grid_step_deg / 4,
+                                 center=rv)
+            R0 = G.rodrigues(torch.as_tensor(rv, dtype=dt, device=dev))
+            Rr, tr, _, _, _ = _refine_pose(P, c, Xs, Ds, R0, zero3, 2 * gate, full=False)
+            Rr, tr, cost_r, nin_r, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=False)
+            Rf, tf_, cost_f, nin_f, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=True)
+            full = cost_f < 0.8 * cost_r and nin_f >= nin_r
+            Rb, tb = (Rf, tf_) if full else (Rr, tr)
+            after, e = coverage(Rb, tb)
+            step = float(np.degrees(np.linalg.norm(_rotvec(Rb.cpu().numpy()))))
+            E0 = E_all[c]
+            cen0 = -(E0[:3, :3].T @ E0[:3, 3])
+            E1 = torch.eye(4, dtype=dt, device=dev)
+            E1[:3, :3] = Rb @ E0[:3, :3]
+            E1[:3, 3] = Rb @ E0[:3, 3] + tb
+            cen1 = -(E1[:3, :3].T @ E1[:3, 3])
+            ok = (e < gate) & cells
+            d.update(coverage_after=after, step_deg=step, rotvec_deg=np.degrees(_rotvec(Rb.cpu().numpy())).tolist(),
+                     center_shift=float((cen1 - cen0).norm()), translation=bool(full),
+                     n_inliers=int(nin_f if full else nin_r), median_px=float(np.median(e[ok])) if ok.any() else None)
+            if not after >= 0.5 * before:
+                d['status'] = 'failed: coverage after recovery {:.3g} < half of {:.3g}'.format(after, before)
+                continue
+            if step < min_step_deg and not full:
+                d['status'] = 'not moved: recovered rotation {:.2g} deg < min_step_deg'.format(step)
+                Rb, tb, moved_ = eye3, zero3, False
+            else:
+                moved_ = True
+        if moved_:
+            d['status'] = 'recovered'
             E0 = E_all[c]
             E1 = torch.eye(4, dtype=dt, device=dev)
             E1[:3, :3] = Rb @ E0[:3, :3]
             E1[:3, 3] = Rb @ E0[:3, 3] + tb
             E1n = E1.cpu().numpy()
-            cen0 = -(E0[:3, :3].T @ E0[:3, 3]).cpu().numpy()
-            cen1 = -(E1n[:3, :3].T @ E1n[:3, 3])
-            step = float(np.degrees(np.linalg.norm(_rotvec(Rb.cpu().numpy()))))
-            d.update(coverage_after=after, step_deg=step, rotvec_deg=np.degrees(_rotvec(Rb.cpu().numpy())).tolist(),
-                     center_shift=float(np.linalg.norm(cen1 - cen0)), translation=bool(full),
-                     n_inliers=int(nin_f if full else nin_r), median_px=float(np.median(e[(e < gate) & cells]))
-                     if ((e < gate) & cells).any() else None)
-            if not after >= 0.5 * before:
-                d['status'] = 'failed: coverage after recovery {:.3g} < half of {:.3g}'.format(after, before)
-                continue
-            d['status'] = 'recovered'
-            # station: reuse an existing change point of this camera near t_cp
-            name = names[c]
+            overrides[c] = (t_cp, t_end, E1)
             exist = [cp for cp in cps if cp['camera'] == name and abs(cp['time'] - t_cp) <= 2 * ws]
             if exist:
                 t_cp = float(exist[0]['time'])
@@ -1062,36 +1125,39 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             rots.setdefault(name, {name: np.zeros(3)})
             rots[name][sn] = _rotvec(E1n[:3, :3] @ E0[:3, :3].T.cpu().numpy())
             poses.setdefault(name, {})[sn] = E1n
-            cps.append(dict(camera=name, time=float(t_cp), window=int(k0), step_deg=step, z=None, recovered=True,
-                            center_shift=d['center_shift'], left_deg=[0.0, 0.0, 0.0], right_deg=d['rotvec_deg']))
+            cps.append(dict(camera=name, time=float(t_cp), window=int(k0), step_deg=d['step_deg'], z=None,
+                            recovered=True, center_shift=d['center_shift'], left_deg=[0.0, 0.0, 0.0],
+                            right_deg=d['rotvec_deg']))
             d['station'] = sn
             d['time'] = float(t_cp)
-            # re-association of the camera's detections after the move
-            if detections is not None:
-                if new_pts is None:
-                    new_pts = p2d.copy()
-                dc = _frame_detections(detections, names, c)
-                Xall = torch.as_tensor(np.nan_to_num(Xr), dtype=dt, device=dev)
-                uva, za, _ = _proj_pose(P, c, Rb, tb, Xall.reshape(-1, 3))
-                uva = uva.reshape(len(rows), J, 2).cpu().numpy()
-                uva[~np.isfinite(Xr).all(-1)] = np.nan
-                new_pts[c, rows] = np.nan
-                fr = np.asarray(frame_ids)[rows]
-                n_as = 0
-                for fid in np.unique(fr):
-                    ri = np.flatnonzero(fr == fid)
-                    det = _get_frame(dc, fid)
-                    if det is None:
-                        continue
-                    e2 = np.linalg.norm(uva[ri][:, None] - det[None], axis=-1)       # [r, D, J]
-                    with np.errstate(all='ignore'):
-                        nj = np.isfinite(e2).sum(-1)
-                        cost = np.where(nj >= min(3, J), np.nanmedian(e2, -1), np.inf)
-                    a, b = _assign(cost, 2 * gate)
-                    for i, k in zip(a, b):
-                        new_pts[c, rows[ri[i]]] = det[k]
-                        n_as += 1
-                d['n_reassociated'] = int(n_as)
+        # re-association of the camera's detections after the move (or after the data loss)
+        if detections is not None:
+            if new_pts is None:
+                new_pts = p2d.copy()
+            dc = _frame_detections(detections, names, c)
+            Xall = torch.as_tensor(np.nan_to_num(Xr), dtype=dt, device=dev)
+            uva, _, _ = _proj_pose(P, c, Rb, tb, Xall.reshape(-1, 3))
+            uva = uva.reshape(len(rows), J, 2).cpu().numpy()
+            uva[~np.isfinite(Xr).all(-1)] = np.nan
+            new_pts[c, rows] = np.nan
+            fr = np.asarray(frame_ids)[rows]
+            n_as = 0
+            for fid in np.unique(fr):
+                ri = np.flatnonzero(fr == fid)
+                det = _get_frame(dc, fid)
+                if det is None:
+                    continue
+                e2 = np.linalg.norm(uva[ri][:, None] - det[None], axis=-1)       # [r, D, J]
+                with np.errstate(all='ignore'), warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    nj = np.isfinite(e2).sum(-1)
+                    cost = np.where(nj >= min(3, J), np.nanmedian(e2, -1), np.inf)
+                a_, b_ = _assign(cost, 2 * gate)
+                for i, k in zip(a_, b_):
+                    new_pts[c, rows[ri[i]]] = det[k]
+                    n_as += 1
+            work[c, rows] = new_pts[c, rows]
+            d['n_reassociated'] = int(n_as)
     if moves is not None or info:
         base = moves if moves is not None else MoveReport(
             cameras=names, window_t0=t0 + np.arange(W) * ws, window_s=ws, delta_deg=np.full((C, W, 3), np.nan),

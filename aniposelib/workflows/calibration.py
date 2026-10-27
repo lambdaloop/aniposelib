@@ -1594,6 +1594,15 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     if res.quality is not None and res.quality.loo is not None:
         le = np.asarray(res.quality.loo.errors, float)
         use = res.quality.loo.eligible & (fit_mask if fit_mask is not None else True)
+        if stations is not None and (res.report.get('stations') or {}).get('_relative') and 'time' in gr:
+            # moved cameras: each observation is judged with its station's pose, not the first one
+            try:
+                le, el = _station_loo(cg, pc, gr, stations, res.report['stations'], 5.0 * u,
+                                      min(3, max(Cp - 1, 1)), dev)
+                use = el & (fit_mask if fit_mask is not None else True)
+                settings['loo_per_station'] = True
+            except Exception as exc:  # pragma: no cover
+                rpt.errors['station_loo'] = '{}: {}'.format(type(exc).__name__, exc)
         meds = []
         for c, n in enumerate(present):
             ne = int(use[c].sum())
@@ -1815,6 +1824,40 @@ def _stations_ba(cg, pc, gr, stations, nf, rng, noise_unit=None):
         rel[str(sn)] = dict(camera=names[c], D=Es @ np.linalg.inv(E0))
     return dict(error_px=r.error, error_before_px=r.error_before, stations=r.stations, _relative=rel,
                 _scale=S._rig_scale(S.camera_centers(cg)))
+
+
+def _station_loo(cg, pc, gr, stations, srep, tau_tri, min_others, dev):
+    """LOO errors / eligibility ``[C, N*J]`` with every moved camera at its station's pose (W2
+    verdict with ``stations=``): one LOO per combination of stations over the frames."""
+    from .. import quality as Q
+    poses = _station_poses(cg, srep)
+    flat = _flat(pc)
+    t = np.asarray(gr['time'], float)
+    if pc.ndim == 4 and t.ndim == 1:
+        t = np.broadcast_to(t[:, None], pc.shape[1:3])
+    t = t.reshape(-1)
+    names = cg.get_names()
+    moved = [n for n in names if n in stations and len(stations.intervals(n)) > 1]
+    le = np.full(flat.shape[:2], np.nan)
+    el = np.zeros(flat.shape[:2], bool)
+    keys = np.stack([stations.lookup_name(n, t) for n in moved], 1).astype(str) if moved \
+        else np.zeros((len(t), 1), str)
+    combos, inv = np.unique(keys, axis=0, return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)
+    for k, combo in enumerate(combos):
+        m = inv == k
+        rig = cg.copy()
+        for n, sn in zip(moved, combo):
+            p = poses.get(str(sn))
+            if p is not None and p.get('camera') == n:
+                cam = rig.cameras[names.index(n)]
+                cam.set_rotation(np.asarray(p['rvec'], float))
+                cam.set_translation(np.asarray(p['tvec'], float))
+        r = Q.loo_reprojection(_on_device(rig, dev), flat[:, m], tau_tri=tau_tri, min_others=min_others,
+                               thresholds=(8.0 * tau_tri / 5.0,))
+        le[:, m] = np.asarray(r.errors, float)
+        el[:, m] = np.asarray(r.eligible, bool)
+    return le, el
 
 
 def _station_poses(cg, srep):
