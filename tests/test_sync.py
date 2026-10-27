@@ -108,6 +108,73 @@ def test_audio_offset_methods(method, tol, offset):
     json.dumps(est.to_dict())
 
 
+def test_xcorr_fast_paths_match_masked():
+    # the prefix-sum / narrow-range / batched-row correlations give the six-FFT reference scores
+    rng = np.random.default_rng(3)
+    a = rng.normal(size=3000)
+    b = np.r_[rng.normal(size=200), 0.6 * a + 0.4 * rng.normal(size=3000)][:2900]
+    l0, c0, n0 = sync._xcorr_ncc_masked(a, b)
+    l1, c1, n1 = sync._xcorr_ncc(a, b)
+    assert np.array_equal(l0, l1) and np.array_equal(n0, n1)
+    assert np.allclose(c0, c1, atol=1e-9, equal_nan=True)
+    for lo, hi in [(150, 260), (-4000, 4000), (-10, 10)]:
+        l2, c2, n2 = sync._xcorr_ncc_range(a, b, lo, hi)
+        k = (l0 >= lo) & (l0 <= hi)
+        assert np.array_equal(l0[k], l2) and np.array_equal(n0[k], n2)
+        assert np.allclose(c0[k], c2, atol=1e-9, equal_nan=True)
+    l6, c6, _ = sync._xcorr_ncc_range(a, b, 0, 400)
+    assert l6[np.nanargmax(c6)] == 200
+    an = a.copy()
+    an[100:120] = np.nan                       # NaN inputs: the masked path
+    l3, c3, n3 = sync._xcorr_ncc_range(an, b, 150, 260)
+    l4, c4, n4 = sync._xcorr_ncc_masked(an, b)
+    k = (l4 >= 150) & (l4 <= 260)
+    assert np.allclose(c4[k], c3, equal_nan=True) and np.array_equal(n4[k], n3)
+    Sa, Sb = rng.normal(size=(11, 300)), rng.normal(size=(11, 280))
+    acc = 0.0
+    for rows, lags, n in sync._xcorr_ncc_rows(Sa, Sb):
+        acc = acc + np.nan_to_num(rows).sum(0)
+    acc = acc / 11
+    l5, s5, n5 = sync._spec_rows_score(Sa, Sb, block=4)
+    assert np.array_equal(l5, lags) and np.array_equal(n5, n) and np.allclose(s5, acc, atol=1e-9)
+
+
+def test_audio_offset_cache_reuse():
+    # per-signal caches (estimate_offsets passes them) give the same estimates and are reused
+    sr = 4000
+    rng = np.random.default_rng(5)
+    a = _bursts(sr * 60, sr, rng, n_events=120)
+    b = _delayed(a, sr, 2.3456, rate=20e-6, rng=rng)
+    ca, cb = {}, {}
+    for method in ('gcc', 'spectrogram', 'onset'):
+        ref = sync.audio_offset(a, b, sr, max_lag=5, method=method)
+        got = sync.audio_offset(a, b, sr, max_lag=5, method=method, _cache=(ca, cb))
+        assert got.offset == pytest.approx(ref.offset, abs=1e-9) and got.sigma == pytest.approx(ref.sigma)
+        assert got.identifiable == ref.identifiable
+    assert {k[0] for k in ca} == {'bandpass', 'spectrogram', 'onset'}
+    ref = sync.audio_offset_windowed(a, b, sr, windows=6, min_window=8.0, min_overlap=20)
+    got = sync.audio_offset_windowed(a, b, sr, windows=6, min_window=8.0, min_overlap=20, _cache=(ca, cb))
+    assert got.offset == pytest.approx(ref.offset, abs=1e-9)
+    assert np.allclose(got.diagnostics['window_offsets'], ref.diagnostics['window_offsets'], atol=1e-9)
+    assert abs(got.offset - 2.3456) < 2e-3
+
+
+def test_audio_offset_spectrogram_pool_multiscale():
+    # every lag on 8x longer frames, then the short frames near that peak: the same estimate
+    sr = 4000
+    rng = np.random.default_rng(6)
+    a = _bursts(sr * 90, sr, rng, n_events=200)
+    b = _delayed(a, sr, -3.21, rng=rng)
+    ref = sync.audio_offset(a, b, sr, method='spectrogram', windows=0)
+    got = sync.audio_offset(a, b, sr, method='spectrogram', windows=0, pool=8)
+    assert got.offset == pytest.approx(ref.offset, abs=1e-9) and got.identifiable
+    assert got.diagnostics['coarse']['pool'] == 8 and 'pooled' in got.diagnostics['coarse']
+    assert got.diagnostics['coarse_offset'] == pytest.approx(ref.diagnostics['coarse_offset'], abs=1e-9)
+    noise = sync.audio_offset(rng.normal(size=sr * 60), rng.normal(size=sr * 60), sr, method='spectrogram',
+                              windows=0, pool=8)
+    assert not noise.identifiable
+
+
 def test_audio_offset_reports_unidentifiable():
     sr = 8000
     rng = np.random.default_rng(3)

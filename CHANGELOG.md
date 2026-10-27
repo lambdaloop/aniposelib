@@ -64,6 +64,23 @@ Same results (bitwise, or within float rounding where noted), less time and memo
   uses it and only associates frames that have detections (frame ids around 1e5 no longer cost minutes).
 - `sync.audio_offset(method='spectrogram')`: batched per-frequency correlations; `_lm` Schur blocks via a flat
   `index_add_`.
+- **`estimate_offsets` audio 36x faster** on long clips (dancing replay, 7 clips x ~3400 s at 4 kHz: 440 -> 12 s on
+  an 8-CPU L4 node; peak memory 7.2 -> 5.8 GB; tailcycle mouse-sync 10 -> 3 s). Offsets and clock rates are
+  bitwise the same on both; only an unidentifiable pair (two clips that do not overlap) lands on another random
+  peak. What changed:
+  - the overlap-normalised correlation gets the overlap sums from prefix sums (one FFT correlation instead of
+    six); the gcc refinement and the window searches only compute the lags they search (overlap-save over
+    blocks), not the whole correlation of two hour-long signals;
+  - each stream is band-passed, its spectrogram and onset envelope computed once per call (per-stream caches,
+    `audio_offset(..., _cache=)`), not once or twice per pair;
+  - **`options['audio_threads']`** (new, default `'auto'`): the audio pairs run in a thread pool (thread cap,
+    limited to ~4 GB of working memory); results do not depend on it. Old behaviour: `audio_threads=1`;
+  - **`options['audio_coarse_pool']`** (new, default 8; `sync.audio_offset(pool=)`,
+    `sync.audio_offset_windowed(coarse_pool=)`): the windowed strategy's coarse lag searches every lag on
+    8x longer spectrogram frames (~0.5 s), then the ~64 ms frames only near that peak (Lili's legacy multiscale
+    sync). Same estimates on the dancing replay; second-peak ambiguity is now judged on the long frames. Old
+    behaviour: `audio_coarse_pool=1`;
+  - scipy.fft uses the workflow thread cap (`ANIPOSELIB_NUM_THREADS` / `OMP_NUM_THREADS`).
 
 ### Calibration workflows: real-data fixes (1.1)
 

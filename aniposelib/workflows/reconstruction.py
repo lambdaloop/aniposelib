@@ -60,6 +60,7 @@ Conventions
 """
 
 import itertools
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -68,7 +69,7 @@ import torch
 
 from ._common import (MIN_NOISE_PX, NOISE_DIAG_FRAC, Rule, Timer, WorkflowResult, evaluate_rules,
                       image_diagonal, merge_options, noise_floor, provenance, reindex_cameras,
-                      save_arrays, thread_guard, to_numpy, worst)
+                      max_threads, save_arrays, thread_guard, to_numpy, worst)
 
 __all__ = ['estimate_offsets', 'OffsetEstimation', 'reconstruct_3d', 'Reconstruction',
            'associate_views', 'Association']
@@ -1466,6 +1467,8 @@ _W5_DEFAULTS = {
     'audio_strategy': 'auto',     # 'global' | 'windowed' | 'auto' (= 'windowed' for clips > audio_windowed_min_s)
     'audio_windowed_min_s': 300.0,
     'audio_window_s': 20.0,       # windowed strategy: shortest window (s)
+    'audio_coarse_pool': 8,       # windowed strategy: coarse lag on 8x longer frames first (1 = all lags, short frames)
+    'audio_threads': 'auto',      # audio pairs in parallel: 'auto' (thread cap, ~2 GB of working memory) | int (1 = serial)
     'cross_check_frames': 1.0,    # disagreement tolerance, in frame periods (or 1/30 s)
     'fps': None,                  # frame rate (Hz, or {stream: Hz}) for the frame-unit verdicts; None = from the data
     'max_time_jitter': 0.05,      # points with per-frame times: share of irregular frame steps before the rate comes from the mean step (warning)
@@ -1629,6 +1632,23 @@ def _timemap_parts(tm):
     return -tm.c / tm.beta, rate
 
 
+def _audio_threads(opt, pairs, data):
+    """Threads for the audio pairs of ``estimate_offsets``: an int, or 'auto' = the workflow thread
+    cap, limited so that the per-pair working memory (~16 bytes per sample of both signals + 256 MB)
+    stays under min(4 GB, a quarter of the available memory)."""
+    if not pairs:
+        return 1
+    if opt != 'auto':
+        return max(1, int(opt))
+    per = max(16 * (len(data[a]['audio'][0]) + len(data[b]['audio'][0])) + (256 << 20) for a, b in pairs)
+    budget = 4 << 30
+    try:
+        budget = min(budget, os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') // 4)
+    except (ValueError, OSError, AttributeError):  # pragma: no cover
+        pass
+    return int(max(1, min(max_threads(), len(pairs), budget // per)))
+
+
 def _windows_of(est):
     if est.diagnostics.get('windows_failed'):
         return None
@@ -1661,7 +1681,9 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         options: overrides of ``_W5_DEFAULTS``: ``audio_strategy`` ('auto': clips longer than
             ``audio_windowed_min_s`` = 300 s use a coarse spectrogram lag plus gcc in windows and a
             robust line through them, ``sync.audio_offset_windowed``; 'global'; 'windowed'),
-            ``audio_min_overlap_frac`` (0.25 of the shorter clip), ``fps`` (frame rate for the
+            ``audio_min_overlap_frac`` (0.25 of the shorter clip), ``audio_coarse_pool`` (8: the
+            windowed coarse lag on 8x longer spectrogram frames first; 1 = every lag on ~64 ms frames),
+            ``audio_threads`` ('auto': audio pairs in a thread pool, same results; 1 = serial), ``fps`` (frame rate for the
             frame-unit verdicts; default: from the points / motion, else the video's
             ``avg_frame_rate``, else 30), ``epipolar_F`` ('auto' = the calibrated F with ``cgroup``,
             else F fitted per offset; 'calibrated', 'self', 'both'), ``stream_camera``
@@ -1811,44 +1833,79 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             d['note'] = note
         pairs.append(d)
 
-    def audio_pair(a, b):
+    # per-stream caches (resampled signal, band-passed signal, spectrogram / onset features): each
+    # stream is filtered once, not once per pair
+    audio_cache = {n: {} for n in names}
+
+    def audio_setup(a, b):
         (xa, sra, ta), (xb, srb, tb) = data[a]['audio'], data[b]['audio']
         sr = min(sra, srb)
-        xa, xb = _resample(xa, sra, sr), _resample(xb, srb, sr)
-        shift = tb - ta      # source time of sample 0
-        dur = min(len(xa), len(xb)) / sr
-        mo = min(max(opts['audio_min_overlap'], opts['audio_min_overlap_frac'] * dur), 0.5 * dur)
-        kw = dict(max_lag=opts['audio_max_lag'], min_overlap=mo, pair=(a, b))
+        dur = min(len(xa) / sra, len(xb) / srb)
         strategy = opts['audio_strategy']
         if strategy == 'auto':
             strategy = 'windowed' if dur > opts['audio_windowed_min_s'] else 'global'
-        tol = opts['cross_check_frames'] * frame_s
+        return sr, strategy
+
+    def audio_signal(n, sr):
+        x, sr_n, _ = data[n]['audio']
+        cache = audio_cache[n].setdefault(sr, {})
+        if 'signal' not in cache:
+            cache['signal'] = _resample(x, sr_n, sr)
+        return cache['signal'], cache
+
+    def audio_compute(a, b):
+        """The audio estimates of pair (a, b) (no bookkeeping: safe to run in a thread)."""
+        sr, strategy = audio_setup(a, b)
+        (xa, cache_a), (xb, cache_b) = audio_signal(a, sr), audio_signal(b, sr)
+        kw_cache = dict(_cache=(cache_a, cache_b))
+        dur = min(len(xa), len(xb)) / sr
+        mo = min(max(opts['audio_min_overlap'], opts['audio_min_overlap_frac'] * dur), 0.5 * dur)
+        kw = dict(max_lag=opts['audio_max_lag'], min_overlap=mo, pair=(a, b))
+        out = {'sr': sr, 'strategy': strategy, 'errors': []}
         if strategy == 'windowed':
             nw = int(np.clip(dur // 120, max(3, opts['audio_windows']), 48))
-            best = S.audio_offset_windowed(xa, xb, sr, windows=nw, min_window=opts['audio_window_s'],
-                                           **kw)
+            out['best'] = S.audio_offset_windowed(xa, xb, sr, windows=nw, min_window=opts['audio_window_s'],
+                                                  coarse_pool=opts['audio_coarse_pool'], **kw, **kw_cache)
+            return out
+        out['g'] = g = S.audio_offset(xa, xb, sr, method='gcc', windows=opts['audio_windows'], **kw,
+                                      **kw_cache)
+        out['checks'] = checks = []
+        if opts['audio_cross_check']:
+            for m in ('spectrogram', 'onset'):
+                try:
+                    checks.append(S.audio_offset(xa, xb, sr, method=m, windows=0, **kw, **kw_cache))
+                except Exception as e:  # pragma: no cover - defensive
+                    out['errors'].append('audio {} {}-{}: {}'.format(m, a, b, e))
+        out['alt'] = None
+        if not g.identifiable and any(c.identifiable and c.method == 'spectrogram' for c in checks):
+            # gcc failed: an identifiable spectrogram estimate stands in (re-run with windows, so
+            # its sigma and the drift fit have windowed estimates)
+            out['alt'] = S.audio_offset(xa, xb, sr, method='spectrogram', windows=opts['audio_windows'],
+                                        **kw, **kw_cache)
+        return out
+
+    audio_done = {}
+
+    def audio_pair(a, b):
+        res = audio_done.pop((a, b), None) or audio_compute(a, b)
+        ta, tb = data[a]['audio'][2], data[b]['audio'][2]
+        shift = tb - ta      # source time of sample 0
+        sr = res['sr']
+        fallbacks.extend(res['errors'])
+        tol = opts['cross_check_frames'] * frame_s
+        if res['strategy'] == 'windowed':
+            best = res['best']
             if opts['audio_delay_sigma']:
                 best = _edge(best, (a, b), 0.0, sigma=np.hypot(best.sigma, opts['audio_delay_sigma']))
             record(a, b, best, 'audio', used=True, shift=shift)
             return best, shift, ta
-        g = S.audio_offset(xa, xb, sr, method='gcc', windows=opts['audio_windows'], **kw)
-        checks = []
-        if opts['audio_cross_check']:
-            for m in ('spectrogram', 'onset'):
-                try:
-                    checks.append(S.audio_offset(xa, xb, sr, method=m, windows=0, **kw))
-                except Exception as e:  # pragma: no cover - defensive
-                    fallbacks.append('audio {} {}-{}: {}'.format(m, a, b, e))
+        g, checks = res['g'], res['checks']
         best = g
         agree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) <= tol]
         disagree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) > tol]
         if not g.identifiable:
-            # gcc failed: an identifiable spectrogram estimate stands in (re-run with windows, so
-            # its sigma and the drift fit have windowed estimates)
-            alt = [c for c in checks if c.identifiable and c.method == 'spectrogram']
-            if alt:
-                best = S.audio_offset(xa, xb, sr, method='spectrogram', windows=opts['audio_windows'],
-                                      **kw)
+            if res['alt'] is not None:
+                best = res['alt']
                 fallbacks.append('audio {}-{}: gcc unidentifiable, spectrogram used'.format(a, b))
         elif disagree and not agree:
             disagreements.append({'pair': [a, b], 'gcc': float(g.offset),
@@ -1872,6 +1929,38 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             record(a, b, c, 'audio', used=best.method == c.method, note='cross-check', shift=shift,
                    sigma=sig if best.method == c.method else None)
         return best, shift, ta
+
+    # audio pairs in parallel (threads; numpy / scipy release the GIL): per-stream features first, then
+    # the pairs, each with a share of the FFT threads. The estimates do not depend on the thread count.
+    audio_pairs = [(a, b) for a, b in itertools.combinations(names, 2)
+                   if seed is None and data[a]['audio'] is not None and data[b]['audio'] is not None]
+    n_thr = _audio_threads(opts['audio_threads'], audio_pairs, data)
+    settings['audio_threads'] = n_thr
+    if n_thr > 1 and audio_pairs:
+        from concurrent.futures import ThreadPoolExecutor
+        share = max(1, max_threads() // n_thr)
+
+        def prepare(n, sr, strategies):
+            x, cache = audio_signal(n, sr)
+            with S._fft_threads(share):
+                if 'windowed' in strategies:
+                    S._audio_prepare(x, sr, cache, pool=opts['audio_coarse_pool'])
+                if 'global' in strategies:
+                    S._audio_prepare(x, sr, cache, spectrogram=bool(opts['audio_cross_check']),
+                                     onset=bool(opts['audio_cross_check']))
+
+        def compute(p):
+            with S._fft_threads(share):
+                return audio_compute(*p)
+        with timer('audio'):
+            need = {}
+            for a, b in audio_pairs:
+                sr, strategy = audio_setup(a, b)
+                for n in (a, b):
+                    need.setdefault((n, sr), set()).add(strategy)
+            with ThreadPoolExecutor(n_thr) as ex:
+                list(ex.map(lambda kv: prepare(kv[0][0], kv[0][1], kv[1]), need.items()))
+                audio_done.update(zip(audio_pairs, ex.map(compute, audio_pairs)))
 
     # ---------------------------------------------------------------- pair estimates
     for a, b in (itertools.combinations(names, 2) if seed is None else []):
