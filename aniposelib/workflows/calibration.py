@@ -1262,8 +1262,7 @@ def _drop_bad_windows(cg, pc, times, u, opts, names):
     nobs = np.isfinite(pc).all(-1).reshape(C, len(tt), J).any(-1).sum(0)        # observations per point
     drop = np.isin(win, labs[bad])
     frac = float(nobs[drop].sum() / max(nobs.sum(), 1))
-    rep.update(dropped=['{:.6g}'.format(t0 + int(l) * ws) for l in labs[bad]], n_obs_dropped=int(nobs[drop].sum()),
-               frac_obs_dropped=frac)
+    rep.update(bad=['{:.6g}'.format(t0 + int(l) * ws) for l in labs[bad]], bad_obs_frac=frac)
     # confident: enough judged windows, the bad ones clearly worse than the good ones, and most data kept
     if okw.sum() < opts['bad_window_min_judged']:
         rep['reason'] = 'fewer than {} judged windows'.format(opts['bad_window_min_judged'])
@@ -1276,7 +1275,7 @@ def _drop_bad_windows(cg, pc, times, u, opts, names):
         rep['reason'] = 'bad windows hold {:.0%} of the observations (> {:.0%})'.format(
             frac, opts['bad_window_max_frac'])
     else:
-        rep['applied'] = True
+        rep.update(applied=True, dropped=list(rep['bad']), n_obs_dropped=int(nobs[drop].sum()), frac_obs_dropped=frac)
         return drop, rep
     return None, rep
 
@@ -1539,7 +1538,8 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         or broken hours) are dropped and the rig is refitted without them
         (``options={'drop_bad_windows': False}``: off; not with ``stations=``, whose moved cameras
         would look like bad windows). ``report['bad_windows']`` says what was
-        judged and dropped (``applied``, ``dropped`` window starts, ``frac_obs_dropped``, ``reason``);
+        judged (``bad`` window starts, ``bad_obs_frac``) and dropped (``applied``, ``dropped``,
+        ``frac_obs_dropped``; else ``reason``);
         the intrinsics gate, quality and verdict then use the kept observations.
 
     Returns :class:`PointCalibration` (``cgroup, res = calibrate_from_points(...)``).

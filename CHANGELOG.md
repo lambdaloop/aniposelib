@@ -281,8 +281,10 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   (>= `bad_window_min_judged` (5) judged windows, the bad windows' LOO agreement < `bad_window_ratio` (0.5) x the
   good windows', <= `bad_window_max_frac` (0.5) of the observations in them) their observations are dropped and the
   rig is refitted; the intrinsics gate, quality and verdict use the kept observations. `report['bad_windows']`
-  (`applied`, `dropped` window starts, `frac_obs_dropped`, `reason`), a fallback line. Outdoor mouse 05_04: 11 / 20
-  windows (39 % of the points) dropped, project metrics unchanged (LOO agree@8 0.726 / 0.457). Who passed
+  (`bad` window starts, `bad_obs_frac`; `applied`, `dropped`, `frac_obs_dropped`, else `reason`), a fallback line.
+  Outdoor mouse 05_04: 9 / 20 windows (28 % of the observations; LOO agreement 0.03 vs 0.93) dropped, project metrics
+  unchanged (LOO agree@8 0.726 / 0.457, >= 3-view points 286.4k); 5_19 part 1: 2 / 23 windows dropped, unchanged;
+  dancing (no stations): 2 candidate windows, not clearly worse (0.58 vs 0.94), nothing dropped. Who passed
   `groups['time']` without `stations=` gets this too. Old behaviour: `options={'drop_bad_windows': False}`.
 - `reconstruct_3d` `options['surface_flag']` (new, default False; port of the outdoor-mouse `surface_residual` ground
   QC): a height map (median height per `surface_cell` (0.045) x rig scale cell above the principal plane) is fitted to
