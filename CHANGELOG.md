@@ -50,6 +50,75 @@ Same results (bitwise, or within float rounding where noted), less time and memo
 - `sync.audio_offset(method='spectrogram')`: batched per-frequency correlations; `_lm` Schur blocks via a flat
   `index_add_`.
 
+### Data workflows W5-W7: real-data fixes (1.1)
+
+Tested on the reference projects' data (`dev/scratch/realdata`). Every new default says how to get the earlier
+1.1 development behaviour.
+
+- **`reconstruct_3d` (W6)**
+  - Default MSAC threshold `tau = clip(3 x noise floor, 10 px, 1 % of the diagonal)` (`tau_noise_mult` 5 -> 3;
+    motor observatory median reprojection 3.75 -> 3.31 px vs 3.07 px for the project's IRLS, EvoVision/Panoptic
+    MPJPE unchanged to better, other datasets sit at the 10 px floor). Old: `options={'tau_noise_mult': 5}`.
+  - `fill='interior'` fills gaps of at most `options['max_gap']=10` frames (it filled 90 % of a sparse outdoor
+    trajectory, runs up to 4 minutes). New `times=` (interpolate on time; `options['max_gap_s']`). Old:
+    `options={'max_gap': None}`. For label frames that are not consecutive, use `fill='none'` (or pass `times=`).
+  - New `segments=` (clip / window id per frame): filling, smoothing (masked at the boundaries, one
+    `optim_points` call), bones and chunks never cross a segment.
+  - New `extrinsics=` (per-frame cameras `[C,N,4,4]` / `[N,C,4,4]` / a list of groups) for moving rigs, and a
+    verdict rule `error_drift` (largest / smallest median error over 8 blocks of frames; warn > 3) that catches
+    a static rig used on moving cameras (or broken sync).
+  - Bones: `options['bone_weight']='auto'` (default) gives each bone a weight from its measured length spread
+    minus the expected triangulation noise (non-rigid "bones" are barely enforced; capped at the old 2.0), and a
+    chunk whose refinement raises the median inlier error by more than `bone_max_reproj_rise=0.5` noise floors
+    keeps the triangulated points. `report['bones']` CVs are now robust (1.4826 MAD / median; the std/mean CV is
+    `cv_std`), and the `bone_cv` rule is relative to the triangulated CV (warn > max(0.1, CV_tri), fail >
+    max(0.3, 2 CV_tri)). Old: `options={'bone_weight': 2.0, 'bone_max_reproj_rise': None}`.
+  - New outputs: `point_error [N,J]` (median inlier error per point) with `options['max_point_err_px']`,
+    `out_of_image [C,N,J]` and `report['n_out_of_image']` / per-camera `n_out_of_image` (out-of-image
+    observations no longer count as rejections; `inlier_rate` uses the in-image observations);
+    `options['mask_out_of_bounds']` (True), `options['min_joints_per_view']`, `options['cam_names']`,
+    `report['two_view_frac']`.
+  - `AffineCamera` groups are supported (exact telephoto pinholes from `AffineCamera.to_pinhole`, errors from the
+    affine projection); mixed affine / pinhole groups raise a `ValueError` pointing to `to_pinhole` (both
+    crashed in `geometry.pack`).
+  - `points` may have an identity axis (`C x F x P x J x 2`, `associate_views` output): one reconstruction per
+    identity.
+  - `CameraGroup.optim_points`: `scale_length` may be one weight per bone; new `segments=`.
+- **`estimate_offsets` (W5)**
+  - Bug: audio decoded from a path ignored the audio stream's start time (1.1 frames off on the mouse-sync
+    GoPros, verdict ok). `audio_t0` now defaults to audio start minus video start from the container (new
+    `sync.media_info`); an explicit `audio_t0` wins.
+  - Long clips (> `audio_windowed_min_s=300` s): `options['audio_strategy']='auto'` uses a coarse spectrogram lag
+    plus gcc in windows and a robust line through them (`sync.audio_offset_windowed`; full-length gcc was
+    unidentifiable under tens of ppm of drift). The minimum overlap is also relative
+    (`audio_min_overlap_frac=0.25` of the shorter clip; edge lags won on hour-long clips). Old:
+    `options={'audio_strategy': 'global', 'audio_min_overlap_frac': 0}`.
+  - Audio sigmas are floored by the window scatter, the agreement of the audio methods and one sample (the
+    spectrogram fallback reported 1.8e-5 s for ~5 ms of scatter); the fallback runs with windows, so `drift=True`
+    can fit it; streams with audio and no windowed estimate are listed by `drift_unidentifiable` (it was silent);
+    a fitted rate below `drift_min_z=3` sigmas is no drift (rate 0; 6 noisy windows over 2 minutes gave a spurious
+    100 ppm). Old: `options={'drift_min_z': 0}`.
+  - The STBA frees the clock rate only with a drift fit (or seed) and points spanning
+    `refine_free_rate_min_s=60` s (`options['refine_rate']='auto'`; a 10-30 s window gave spurious rates). Old:
+    `options={'refine_rate': 'free'}` (with `drift=True`).
+  - New: `seed=` (a previous result or time maps: skip the audio/graph, refine only), `options['epipolar_F']`
+    (`'auto'`: calibrated with `cgroup`, else F fitted per offset, so points-only pairs get epipolar estimates;
+    `'self'`, `'both'`), `options['stream_camera']` (clips of one camera), `options['fps']` / per-stream `fps`
+    (else the video's `avg_frame_rate`), epipolar pairs at different frame rates (resampled; were skipped),
+    irregular per-frame times use the mean rate and warn (`irregular_times`), `pairs` report the raw and the
+    shifted offset (`offset_raw`, `offset`).
+- **`associate_views` (W7)**
+  - Defaults: `gate_noise_mult` 80 -> 10 (the second, tighter pass never fired on real 3-4 px detections),
+    `link_max_gap` 10 -> 30 frame ids (also `link_max_gap_s` with `fps`), `min_identity_frames=5` (1-3-frame ghost
+    identities are dropped). Old: `options={'gate_noise_mult': 80, 'link_max_gap': 10, 'min_identity_frames': 0}`.
+  - Tracklets: `split_on_switch=True` cuts a tracklet where the verification drops a run of its frames (an identity
+    switch) and associates again; `stitch=True` joins identities that follow each other in time and space. New
+    rule `verify_dropped_frac`. Old: `options={'split_on_switch': False, 'stitch': False}`.
+  - `options['n_identities']`: known number of animals (at most that many per frame; re-entry instead of new ids).
+  - Frame ids: linking uses frame-id differences; `options['frame_axis']='auto'` returns only the frames with
+    detections (`frame_ids`) when the dense axis would be > 2x larger and > 1000 frames (ids around 1e5 took
+    hundreds of MB). Old: `options={'frame_axis': 'dense'}`.
+
 ### Removed
 
 - **`aniposelib.io`.** The file formats are gone: MATLAB (`from/to_matlab`), OpenCV YAML
