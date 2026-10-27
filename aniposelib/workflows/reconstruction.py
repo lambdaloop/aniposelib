@@ -428,6 +428,35 @@ def _error_drift(err, use, n_blocks=8, min_frames=3):
     return max(meds) / max(min(meds), MIN_NOISE_PX)
 
 
+def _reconstruct_identities(cgroup, pts, scores, bones, smooth, fill, robust, options, device,
+                            times, segments, extrinsics):
+    """reconstruct_3d per identity of ``C x F x P x J x 2`` points; arrays gain a P axis after F."""
+    from ._common import worst
+    sw = None if scores is None else np.asarray(to_numpy(scores), dtype=float)
+    P = pts.shape[2]
+    rs = []
+    for p in range(P):
+        rs.append(reconstruct_3d(cgroup, pts[:, :, p], scores=None if sw is None else sw[:, :, p],
+                                 bones=bones, smooth=smooth, fill=fill, robust=robust,
+                                 options=options, device=device, times=times, segments=segments,
+                                 extrinsics=extrinsics))
+    if not rs:
+        raise ValueError('points have no identities (axis 2 is empty)')
+    st = lambda name, ax: np.stack([getattr(r, name) for r in rs], ax)
+    reasons = ['identity {}: {}'.format(p, x) for p, r in enumerate(rs) for x in r.reasons]
+    report = {'n_identities': P, 'per_identity': [r.report for r in rs],
+              'rules': [dict(t, identity=p) for p, r in enumerate(rs) for t in r.report['rules']]}
+    settings = dict(rs[0].settings, per_identity_tau_px=[r.settings.get('tau_px') for r in rs],
+                    per_identity_noise_px=[r.settings.get('noise_px') for r in rs])
+    return Reconstruction(points3d=st('points3d', 1), errors=st('errors', 2), n_views=st('n_views', 1),
+                          inliers=st('inliers', 2), filled=st('filled', 1),
+                          point_error=st('point_error', 1), out_of_image=st('out_of_image', 2),
+                          report=report, verdict=worst(*[r.verdict for r in rs]), reasons=reasons,
+                          settings=settings,
+                          provenance=dict(rs[0].provenance, identities=P,
+                                          timings={'per_identity': [r.provenance['timings'] for r in rs]}))
+
+
 @thread_guard
 def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
                    robust=True, options=None, device='auto', times=None, segments=None,
@@ -437,8 +466,11 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     Args:
         cgroup: calibrated ``CameraGroup`` (pinhole / fisheye cameras, or only
             ``AffineCamera`` s: these are triangulated through exact telephoto pinholes).
-        points: ``C x N x J x 2`` (or ``C x N x 2``) pixels, NaN = missing.
-        scores: optional ``C x N x J`` confidences: soft observation weights (clipped to [0, 1]).
+        points: ``C x N x J x 2`` (or ``C x N x 2``) pixels, NaN = missing; or ``C x N x P x J
+            x 2`` with an identity axis (``associate_views``' output): each identity is
+            reconstructed separately (bones and smoothing never mix animals), the arrays get a
+            ``P`` axis after ``N`` and ``report['per_identity']`` holds each report.
+        scores: optional ``C x N x J`` (``C x N x P x J``) confidences: soft observation weights (clipped to [0, 1]).
         bones: optional ``[(a, b), ...]`` joint pairs with constant length (optim_points).
             With ``bone_weight='auto'`` each bone's weight follows its measured length spread,
             so non-rigid "bones" are barely enforced; a chunk whose refinement raises the
@@ -489,6 +521,10 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         raise ValueError("fill must be 'interior' or 'none' (reconstruct_3d never extrapolates), "
                          "got {!r}".format(fill))
     pts = np.array(to_numpy(points), dtype=float)
+    if pts.ndim == 5:
+        # identity axis (associate_views output C x F x P x J x 2): one reconstruction per identity
+        return _reconstruct_identities(cgroup, pts, scores, bones, smooth, fill, robust, options,
+                                       device, times, segments, extrinsics)
     squeeze = pts.ndim == 3
     if squeeze:
         pts = pts[:, :, None]

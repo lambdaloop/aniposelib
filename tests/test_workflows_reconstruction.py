@@ -574,3 +574,14 @@ def test_associate_tracklet_switch_split_stitch(crowd):
     b = W.associate_views(cg, bd, track_ids=br)
     assert a.report['n_identities'] == 4 and b.report['n_identities'] == 3
     assert b.report['n_stitched'] == 1 and _purity(b, truth, C, b.frame_ids) > 0.99
+
+
+def test_reconstruct_identity_axis(crowd):
+    cg, P3, dets, ids, truth = crowd
+    res = W.associate_views(cg, dets)
+    r = W.reconstruct_3d(cg, res.points, bones=[(0, 1), (1, 2)], options={'n_iters': 30})
+    C, F, P, J, _ = res.points.shape
+    assert r.points3d.shape == (F, P, J, 3) and r.errors.shape == (C, F, P, J)
+    assert r.report['n_identities'] == P and len(r.report['per_identity']) == P
+    one = W.reconstruct_3d(cg, res.points[:, :, 1], bones=[(0, 1), (1, 2)], options={'n_iters': 30})
+    np.testing.assert_allclose(r.points3d[:, 1], one.points3d, equal_nan=True)
