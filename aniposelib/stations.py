@@ -965,6 +965,7 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
     # phase 1: collapsed runs per camera
     jobs = []
     overall = {}
+    transient = {}
     for c in cams:
         sup, hit = _loo_quality(P, flat, c, tau, min_other, agree_px,
                                 cache=None if lc is None else lc['cams'].get(c))
@@ -988,11 +989,11 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             t_cp = float(0.5 * (t_last + t[rows_after].min())) if len(rows_after) else t0 + k0 * ws
             t_end = INF if end >= len(jw) else t0 + jw[end] * ws
             lost = float(np.nanmedian(q[jw[cand:end]]))
+            if persistent and np.isfinite(t_end):
+                transient[names[c]] = transient.get(names[c], 0) + 1      # came back: not a lasting move
+                continue
             d = dict(time=t_cp, t_end=t_end, coverage_before=before, coverage_lost=lost, status='failed')
             info.setdefault(names[c], []).append(d)
-            if persistent and np.isfinite(t_end):
-                d['status'] = 'skipped: coverage came back at {:.6g} s (not a lasting move)'.format(t_end)
-                continue
             jobs.append((k0, lost / max(before, 1e-9), c, t_cp, t_end, before, d))
     # cameras the association lost from the start (people data with detections): every window is
     # re-placed on its own (or found unmoved), equal neighbours share a station
@@ -1190,14 +1191,15 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
                     n_as += 1
             work[c, rows] = new_pts[c, rows]
             d['n_reassociated'] = int(n_as)
-    if moves is not None or info:
+    if moves is not None or info or transient:
         base = moves if moves is not None else MoveReport(
             cameras=names, window_t0=t0 + np.arange(W) * ws, window_s=ws, delta_deg=np.full((C, W, 3), np.nan),
             n_points=np.zeros((C, W), int), resid_px=np.full((C, W), np.nan), change_points=[], stations=st,
             station_rotations={}, info={})
         out_moves = dataclasses.replace(base, stations=st, station_rotations=rots,
                                         change_points=sorted(cps, key=lambda d: (d['time'], d['camera'])),
-                                        station_poses=poses, info=dict(base.info, recovered=_jsonable(info)))
+                                        station_poses=poses, info=dict(base.info, recovered=_jsonable(info),
+                                                                       transient_collapses=transient))
         out_moves.stations.poses.update(_relative_poses(cgroup, out_moves))
     return Recovery(moves=out_moves, points=None if new_pts is None else (new_pts[:, :, 0] if squeeze else new_pts),
                     cameras=_jsonable(info))
