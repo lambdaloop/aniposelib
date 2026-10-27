@@ -802,7 +802,7 @@ class _quiet:
 class Association(WorkflowResult):
     """Result of :func:`associate_views`.
 
-    ``points [C,F,P,J,2]`` per identity (frame axis = frame id; NaN where unmatched),
+    ``points [C,F,P,J,2]`` per identity (frame axis: ``frame_ids``; NaN where unmatched),
     ``labels``: per camera, a list over frames of ``(D,)`` int arrays (identity of each input
     detection, -1 = unassigned), ``groups``: the backend result (``matching.Groups`` for
     tracklets, a list of per-frame ``matching.Association`` otherwise), ``frame_ids [F]``.
@@ -821,14 +821,25 @@ class Association(WorkflowResult):
 
 _W7_DEFAULTS = {
     'gate_diag_frac': 0.02,     # first-pass pixel gate: this x image diagonal (>= 10 px)
-    'gate_noise_mult': 80.0,    # second-pass gate: this x noise floor (40 px at 0.5 px noise)
+    'gate_noise_mult': 10.0,    # second-pass gate: this x noise floor (1.1: 80, which never tightened on real data)
     'min_gate_px': 10.0,
     'verify_gate_mult': 2.5,    # tracklets: verify_floor = this x gate
     'min_score': None,          # keypoint score cut (third channel)
     'min_points': 4,            # finite keypoints for a detection to count
     'min_len': 10,              # tracklets: shortest tracklet (frames)
     'link_frac': 0.05,          # per-frame: max 3D jump between frames, x rig scale
-    'link_max_gap': 10,         # per-frame: frames an identity may go unseen and still continue
+    'link_max_gap': 30,         # frames an identity may go unseen and still continue (frame ids)
+    'link_max_gap_s': None,     # same in seconds (needs fps)
+    'fps': None,                # frame rate (Hz) of the frame ids, for link_max_gap_s
+    'min_identity_frames': 5,   # per-frame: identities seen in fewer frames are dropped (labels -1)
+    'n_identities': None,       # known number of animals: at most this many per frame, and new
+                                # instances re-enter the nearest dormant identity instead of a new one
+    'split_on_switch': True,    # tracklets: split a tracklet where the verification drops a run of
+                                # its frames (an identity switch), associate again
+    'switch_min_frames': 3,     # shortest dropped run treated as a switch
+    'stitch': True,             # tracklets: join identities that follow each other in time and space
+    'frame_axis': 'auto',       # 'dense' (axis = frame id 0..max), 'sparse' (frames with detections,
+                                # see frame_ids), 'auto' (sparse when dense would be > 2x larger and > 1000 frames)
     'verdict': None,
 }
 
@@ -864,12 +875,18 @@ def _clean(d, min_score):
     return xy
 
 
-def _link_instances(frames_inst, gate, max_gap):
-    """frames_inst: list over frames of [M_f,3] instance points -> list of [M_f] identity ids."""
+def _link_instances(frames_inst, gate, max_gap, frame_ids=None, n_identities=None):
+    """frames_inst: list over frames of [M_f,3] instance points -> list of [M_f] identity ids.
+    ``frame_ids`` (default 0..F-1): the gap test uses frame-id differences. ``n_identities``:
+    once that many identities exist, unmatched instances re-enter the nearest identity not seen
+    in this frame (no gate) instead of starting a new one."""
     from scipy.optimize import linear_sum_assignment
+    if frame_ids is None:
+        frame_ids = np.arange(len(frames_inst))
     last_pos, last_f, n_id = [], [], 0
     out = []
-    for f, X in enumerate(frames_inst):
+    for k, X in enumerate(frames_inst):
+        f = int(frame_ids[k])
         ids = np.full(len(X), -1, dtype=np.int64)
         act = [i for i in range(n_id) if f - last_f[i] <= max_gap]
         okX = np.isfinite(X).all(-1) if len(X) else np.zeros(0, bool)
@@ -882,8 +899,17 @@ def _link_instances(frames_inst, gate, max_gap):
             for a, b in zip(r, c):
                 if D[a, b] <= gate:
                     ids[a] = act[b]
+        if n_identities and n_id >= n_identities:
+            free = [i for i in range(n_id) if i not in set(ids.tolist())]
+            rest = [m for m in range(len(X)) if ids[m] < 0 and okX[m]]
+            if free and rest:
+                A = np.array([last_pos[i] for i in free])
+                D = np.linalg.norm(X[rest][:, None] - A[None], axis=-1)
+                r, c = linear_sum_assignment(np.nan_to_num(D, nan=1e30, posinf=1e30))
+                for a, b in zip(r, c):
+                    ids[rest[a]] = free[b]
         for m in range(len(X)):
-            if ids[m] < 0 and okX[m]:
+            if ids[m] < 0 and okX[m] and not (n_identities and n_id >= n_identities):
                 ids[m] = n_id
                 last_pos.append(X[m]); last_f.append(f)
                 n_id += 1
@@ -891,6 +917,98 @@ def _link_instances(frames_inst, gate, max_gap):
                 last_pos[ids[m]] = X[m]; last_f[ids[m]] = f
         out.append(ids)
     return out, n_id
+
+
+def _split_tracks(track_ids, names, groups, min_run):
+    """New per-camera track ids: each member tracklet of a group is cut where the group's
+    verification dropped a run of >= ``min_run`` of its frames (an identity switch)."""
+    from .. import matching as M
+    per = M._per_camera(track_ids, names, 'track_ids')
+    cuts = {}         # (c, track) -> sorted frame ids where a new piece starts
+    for g in groups:
+        for c, fr in (g.dropped or {}).items():
+            fr = np.asarray(sorted(int(x) for x in fr))
+            if len(fr) < min_run:
+                continue
+            br = np.nonzero(np.diff(fr) > 1)[0]
+            starts, ends = np.r_[fr[0], fr[br + 1]], np.r_[fr[br], fr[-1]]
+            for s, e in zip(starts, ends):
+                if e - s + 1 < min_run:
+                    continue
+                for cc, t in g.members:
+                    if cc == c:
+                        cuts.setdefault((c, t), set()).update({int(s), int(e) + 1})
+    if not cuts:
+        return None, 0
+    out = []
+    for c, dc in enumerate(per):
+        items = []
+        top = -1
+        for f, v in M._frame_items(dc):
+            ids = np.asarray(to_numpy(v)).reshape(-1).astype(np.int64)
+            items.append((int(f), ids))
+            if len(ids):
+                top = max(top, int(ids.max()))
+        fresh = {}
+        new = {}
+        for f, ids in items:
+            res = ids.copy()
+            for k, t in enumerate(ids.tolist()):
+                cs = cuts.get((c, int(t)))
+                if cs:
+                    piece = int(np.searchsorted(np.array(sorted(cs)), f, side='right'))
+                    if piece:          # piece 0 keeps the original id
+                        key = (int(t), piece)
+                        if key not in fresh:
+                            top += 1
+                            fresh[key] = top
+                        res[k] = fresh[key]
+            new[f] = res
+        out.append(new)
+    return out, sum(len(v) for v in cuts.values())
+
+
+def _stitch(cents, link_gate, max_gap):
+    """cents: list over identities of (frame ids [n], centroids [n,3]) -> identity -> new id.
+    Identities that do not overlap in time are joined when one starts within ``max_gap`` frames
+    of the other's end and within ``link_gate`` of its last position (greedy, closest first)."""
+    P = len(cents)
+    span = [(int(f[0]), int(f[-1])) if len(f) else (0, -1) for f, _ in cents]
+    cand = []
+    for a in range(P):
+        for b in range(P):
+            if a == b or not len(cents[a][0]) or not len(cents[b][0]):
+                continue
+            gap = span[b][0] - span[a][1]
+            if 0 < gap <= max_gap:
+                d = float(np.linalg.norm(cents[a][1][-1] - cents[b][1][0]))
+                if d <= link_gate:
+                    cand.append((d, a, b))
+    root = list(range(P))
+
+    def find(x):
+        while root[x] != x:
+            x = root[x]
+        return x
+    nxt, prv = {}, {}
+    members = {p: [p] for p in range(P)}
+    for d, a, b in sorted(cand):
+        if a in nxt or b in prv:
+            continue
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        # no temporal overlap between the joined chains
+        fa = np.concatenate([cents[m][0] for m in members[ra]])
+        fb = np.concatenate([cents[m][0] for m in members[rb]])
+        if np.intersect1d(fa, fb).size:
+            continue
+        nxt[a], prv[b] = b, a
+        root[rb] = ra
+        members[ra] += members.pop(rb)
+    roots = sorted({find(p) for p in range(P)})
+    new = {r: i for i, r in enumerate(roots)}
+    return [new[find(p)] for p in range(P)], P - len(roots)
 
 
 @thread_guard
@@ -906,15 +1024,30 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
             association (``matching.associate_tracklets``); otherwise per-frame association
             (``matching.associate_points`` on detection centroids) and linking over time.
         min_views: minimum cameras per identity (tracklets) / per instance (per frame).
-        options: overrides of ``_W7_DEFAULTS``.
+        options: overrides of ``_W7_DEFAULTS``: ``gate_noise_mult`` (10), ``link_max_gap`` (30
+            frame ids) or ``link_max_gap_s`` (seconds, with ``fps``), ``min_identity_frames`` (5;
+            per-frame mode), ``n_identities`` (known number of animals), ``split_on_switch``
+            (True; tracklets), ``stitch`` (True; tracklets), ``frame_axis`` ('auto', 'dense',
+            'sparse'), ...
 
     Gates: a first pass with ``gate_diag_frac x image diagonal`` (>= ``min_gate_px``); the noise
     floor of the associated observations then gives ``gate_noise_mult x noise`` and, if that is
-    tighter, a second pass. Per-frame linking accepts 3D jumps up to ``link_frac x rig scale``.
+    tighter, a second pass. Per-frame linking accepts 3D jumps up to ``link_frac x rig scale``
+    between frames at most ``link_max_gap`` frame ids apart; with tracklets, identities that
+    follow each other within the same limits are stitched (``stitch``), and tracklets whose
+    frames the verification drops in a run (an identity switch inside the tracklet) are cut
+    there and associated again (``split_on_switch``).
+
+    Output frame axis: ``points[:, i]`` / ``labels[c][i]`` are the frame ``frame_ids[i]``.
+    With ``frame_axis='dense'`` (and 'auto' for compact ids) ``frame_ids = 0..max id``;
+    'sparse' keeps only the frames with detections (ids around 1e5 would otherwise take
+    hundreds of MB).
 
     Verdict rules: ``no_identities`` (fail); ``assigned_frac`` (detections assigned to an
     identity; warn < 0.5, fail < 0.1); ``fragmentation`` (per-frame mode: identities / most
-    simultaneous instances; warn > 2).
+    simultaneous instances; warn > 2); ``verify_dropped_frac`` (tracklets: share of the
+    associated camera-frames the verification dropped, a sign of identity switches inside
+    tracklets; warn > 0.05).
     """
     from .. import geometry as G
     from .. import matching as M
@@ -926,29 +1059,45 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
     parsed, fids, K = _parse_frames(names, detections)
     if track_ids is not None:
         M._per_camera(track_ids, names, 'track_ids')       # shape check (raises)
+    if opts['frame_axis'] not in ('auto', 'dense', 'sparse'):
+        raise ValueError("options['frame_axis'] must be 'auto', 'dense' or 'sparse'")
+    if opts['link_max_gap_s'] is not None and not opts['fps']:
+        raise ValueError("options['link_max_gap_s'] needs options['fps']")
+    max_gap = int(round(float(opts['link_max_gap_s']) * float(opts['fps']))) \
+        if opts['link_max_gap_s'] is not None else int(opts['link_max_gap'])
     diag = image_diagonal(cgroup)
     gate1 = max(float(opts['min_gate_px']), opts['gate_diag_frac'] * diag) if diag else 40.0
     min_views = max(1, int(min_views))
+    n_ident = None if opts['n_identities'] is None else int(opts['n_identities'])
     settings = {'image_diagonal_px': diag, 'first_gate_px': gate1, 'min_views': min_views,
                 'mode': 'tracklets' if track_ids is not None else 'per_frame',
-                'min_score': opts['min_score'], 'min_points': int(opts['min_points'])}
+                'min_score': opts['min_score'], 'min_points': int(opts['min_points']),
+                'link_max_gap_frames': max_gap, 'n_identities': n_ident}
     P = G.pack(cgroup)
-    F = int(fids.max()) + 1 if len(fids) else 0
+    F_dense = int(fids.max()) + 1 if len(fids) else 0
+    axis = opts['frame_axis']
+    if axis == 'auto':
+        axis = 'sparse' if F_dense > max(1000, 2 * len(fids)) else 'dense'
+    out_ids = np.arange(F_dense) if axis == 'dense' else fids
+    F = len(out_ids)
+    fpos = {int(f): i for i, f in enumerate(out_ids)}
+    settings['frame_axis'] = axis
     n_dets_total = 0
-    countable = []
     for c in range(C):
         for f, d in parsed[c].items():
             ok = np.isfinite(_clean(d, opts['min_score'])).all(-1).sum(-1) >= int(opts['min_points'])
             n_dets_total += int(ok.sum())
-            countable.append(ok)
-    labels = [[np.full(len(parsed[c][f]) if f in parsed[c] else 0, -1, dtype=np.int64)
-               for f in range(F)] for c in range(C)]
+    labels = [[np.full(len(parsed[c][int(f)]) if int(f) in parsed[c] else 0, -1, dtype=np.int64)
+               for f in out_ids] for c in range(C)]
     rules_extra = []
+    scale = _rig_scale(cgroup)
+    link_gate = opts['link_frac'] * scale
+    settings.update(link_gate=link_gate, link_frac=opts['link_frac'], rig_scale=scale)
 
     if track_ids is not None:
-        def run(gate):
+        def run(gate, tids):
             return M.associate_tracklets(
-                cgroup, detections, track_ids, min_cams=max(2, min_views), max_pair_error=gate,
+                cgroup, detections, tids, min_cams=max(2, min_views), max_pair_error=gate,
                 verify_floor=opts['verify_gate_mult'] * gate, min_score=opts['min_score'],
                 min_points=int(opts['min_points']), min_len=int(opts['min_len']))
 
@@ -960,32 +1109,80 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
                 return None
             r = T.triangulate_robust(P, pts.reshape(C, -1, 2), tau=gate1)
             return noise_floor(r.errors, r.inliers, diag)
+        tids = track_ids
+        n_cuts = 0
         with timer('associate'):
-            groups = run(gate1)
+            groups = run(gate1, tids)
             nf = noise_of(groups)
             gate = gate1
             if nf is not None:
                 g2 = float(np.clip(opts['gate_noise_mult'] * nf, opts['min_gate_px'], gate1))
                 if g2 < 0.75 * gate1:
                     gate = g2
-                    groups = run(gate)
-        P_ = len(groups)
+                    groups = run(gate, tids)
+            if opts['split_on_switch']:
+                new, n_cuts = _split_tracks(tids, names, groups, int(opts['switch_min_frames']))
+                if new is not None:
+                    tids = new
+                    groups = run(gate, tids)
+        settings['tracklet_cuts'] = n_cuts
+        P0 = len(groups)
+        obs_g = [[g.observations(c) for c in range(C)] for g in groups]
+        ident = list(range(P0))
+        n_stitched = 0
+        if opts['stitch'] and P0 > 1:
+            with timer('stitch'):
+                cents = []
+                for gi in range(P0):
+                    fr_all = np.unique(np.concatenate([np.asarray(o[0]) for o in obs_g[gi]
+                                                       if o[2] is not None] or [np.zeros(0, int)]))
+                    if not len(fr_all):
+                        cents.append((fr_all, np.zeros((0, 3))))
+                        continue
+                    sel = np.unique(np.r_[fr_all[:3], fr_all[-3:]])
+                    pts = np.full((C, len(sel), K, 2), np.nan)
+                    for c, (fr, di, xyz) in enumerate(obs_g[gi]):
+                        if xyz is None:
+                            continue
+                        for k, f in enumerate(sel):
+                            hit = np.nonzero(np.asarray(fr) == f)[0]
+                            if len(hit):
+                                pts[c, k] = _clean(np.asarray(xyz)[hit[0]][None], opts['min_score'])[0]
+                    X = to_numpy(T.triangulate_linear(P, pts.reshape(C, -1, 2))).reshape(len(sel), K, 3)
+                    with np.errstate(all='ignore'), _quiet():
+                        ce = np.nanmedian(X, axis=1)
+                    ok = np.isfinite(ce).all(-1)
+                    cents.append((sel[ok], ce[ok]))
+                # the centroids of each identity's first and last 3 frames decide the joins
+                ident, n_stitched = _stitch(cents, link_gate, max_gap)
+        P_ = (max(ident) + 1) if ident else 0
         points = np.full((C, F, P_, K, 2), np.nan)
-        for gi, g in enumerate(groups):
+        frames_of = [set() for _ in range(P_)]
+        cams_of = [set() for _ in range(P_)]
+        for gi in range(P0):
+            p = ident[gi]
             for c in range(C):
-                fr, di, xyz = g.observations(c)
+                fr, di, xyz = obs_g[gi][c]
                 if xyz is None:
                     continue
-                points[c, fr, gi] = _clean(xyz, opts['min_score'])
+                pos = np.array([fpos[int(f)] for f in fr], dtype=np.int64)
+                points[c, pos, p] = _clean(np.asarray(xyz), opts['min_score'])
                 for f, i in zip(fr, di):
-                    labels[c][int(f)][int(i)] = gi
-        identities = [{'frames': int(g.n_frames), 'cameras': [names[c] for c in g.cameras]}
-                      for g in groups]
-        extra = {'tracklets': _jsonable_info(groups.info)}
+                    labels[c][fpos[int(f)]][int(i)] = p
+                frames_of[p].update(int(f) for f in fr)
+                cams_of[p].add(names[c])
+        identities = [{'frames': len(frames_of[p]), 'cameras': sorted(cams_of[p])} for p in range(P_)]
+        info = groups.info
+        n_cells = sum(len(np.asarray(o[0])) for og in obs_g for o in og if o[2] is not None)
+        drop_frac = float(info.get('n_verify_dropped', 0)) / max(n_cells + info.get('n_verify_dropped', 0), 1)
+        extra = {'tracklets': _jsonable_info(info), 'n_tracklet_cuts': int(n_cuts),
+                 'n_stitched': int(n_stitched), 'n_groups': int(P0)}
+        rules_extra.append(Rule('verify_dropped_frac', drop_frac, 0.05, None,
+                                'share of associated camera-frames the verification dropped '
+                                '(identity switches inside tracklets?)'))
         backend = groups
     else:
-        # only the frames with detections are associated (frame ids may be sparse, e.g. 1e5
-        # apart); the others get an empty association
+        # only the frames with detections are associated (frame ids may be sparse, e.g. 1e5 apart)
         cent = []
         for f in fids:
             per = []
@@ -996,22 +1193,15 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
                     continue
                 xy = _clean(d, opts['min_score'])
                 ok = np.isfinite(xy).all(-1)
-                with np.errstate(invalid='ignore'):
+                with np.errstate(invalid='ignore'), _quiet():
                     cen = np.nanmean(np.where(ok[..., None], xy, np.nan), axis=1)
                 cen[ok.sum(-1) < int(opts['min_points'])] = np.nan
                 per.append(cen)
             cent.append(per)
 
-        def empty():
-            return M.Association(np.zeros((0, 3)), [], np.zeros(0), np.zeros(0, dtype=np.int64),
-                                 [np.full(0, -1, dtype=np.int64) for _ in range(C)])
-
         def run(gate):
-            out = [None] * F
-            res = M.associate_points_frames(P, cent, max_res_px=gate, min_views=max(2, min_views))
-            for f, a in zip(fids, res):
-                out[int(f)] = a
-            return [a if a is not None else empty() for a in out]
+            return M.associate_points_frames(P, cent, max_res_px=gate, min_views=max(2, min_views),
+                                             max_instances=n_ident or 0)
         with timer('associate'):
             assoc = run(gate1)
             res = np.concatenate([np.asarray(a.residuals, float) for a in assoc]) if assoc else \
@@ -1023,31 +1213,43 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
                 if g2 < 0.75 * gate1:
                     gate = g2
                     assoc = run(gate)
-        scale = _rig_scale(cgroup)
-        link_gate = opts['link_frac'] * scale
         with timer('link'):
-            ids, P_ = _link_instances([np.asarray(a.points3d, float).reshape(-1, 3) for a in assoc],
-                                      link_gate, int(opts['link_max_gap']))
+            ids, P0 = _link_instances([np.asarray(a.points3d, float).reshape(-1, 3) for a in assoc],
+                                      link_gate, max_gap, frame_ids=fids, n_identities=n_ident)
+        # short-lived identities (ghost pairs, 1-3 frames) are dropped
+        cnt = np.zeros(P0, int)
+        for idf in ids:
+            for p in idf[idf >= 0]:
+                cnt[p] += 1
+        keep_id = cnt >= int(opts['min_identity_frames'] or 0)
+        remap = np.full(P0, -1, dtype=np.int64)
+        remap[keep_id] = np.arange(int(keep_id.sum()))
+        P_ = int(keep_id.sum())
         points = np.full((C, F, P_, K, 2), np.nan)
         n_frames_id = np.zeros(P_, int)
         cams_id = [set() for _ in range(P_)]
-        for f, (a, idf) in enumerate(zip(assoc, ids)):
+        n_inst_kept = []
+        for f, a, idf in zip(fids, assoc, ids):
+            fi = fpos[int(f)]
+            kept = 0
             for m, mem in enumerate(a.members):
-                p = int(idf[m])
+                p = int(remap[idf[m]]) if idf[m] >= 0 else -1
                 if p < 0:
                     continue
+                kept += 1
                 n_frames_id[p] += 1
                 for c, i in mem.items():
-                    points[c, f, p] = _clean(parsed[c][f][int(i)][None], opts['min_score'])[0]
-                    labels[c][f][int(i)] = p
+                    points[c, fi, p] = _clean(parsed[c][int(f)][int(i)][None], opts['min_score'])[0]
+                    labels[c][fi][int(i)] = p
                     cams_id[p].add(names[c])
+            n_inst_kept.append(kept)
         identities = [{'frames': int(n_frames_id[p]), 'cameras': sorted(cams_id[p])}
                       for p in range(P_)]
-        most = max([len(a) for a in assoc], default=0)
+        most = max(n_inst_kept, default=0)
         frag = P_ / most if most else float('inf')
-        settings.update(link_gate=link_gate, link_frac=opts['link_frac'], rig_scale=scale,
-                        link_max_gap=int(opts['link_max_gap']))
-        extra = {'max_simultaneous': int(most), 'fragmentation': frag}
+        settings.update(min_identity_frames=int(opts['min_identity_frames'] or 0))
+        extra = {'max_simultaneous': int(most), 'fragmentation': frag,
+                 'n_short_identities_dropped': int((~keep_id).sum())}
         rules_extra.append(Rule('fragmentation', frag if P_ else 0.0, 2.0, None,
                                 'identities per simultaneous instance (track breaks)'))
         backend = assoc
@@ -1064,10 +1266,11 @@ def associate_views(cgroup, detections, track_ids=None, min_views=2, options=Non
                   higher_is_worse=False)] + rules_extra
     verdict, reasons, table = evaluate_rules(rules, opts['verdict'])
     report['rules'] = table
-    return Association(points=points, labels=labels, groups=backend, frame_ids=np.arange(F),
+    return Association(points=points, labels=labels, groups=backend, frame_ids=out_ids,
                        report=report, verdict=verdict, reasons=reasons, settings=settings,
                        provenance=provenance('associate_views',
-                                             inputs={'cameras': names, 'n_frames': int(F),
+                                             inputs={'cameras': names, 'n_frames': int(len(fids)),
+                                                     'max_frame_id': int(F_dense - 1),
                                                      'n_keypoints': int(K),
                                                      'track_ids': track_ids is not None},
                                              timings=timer.times))

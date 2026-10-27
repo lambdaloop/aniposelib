@@ -499,3 +499,78 @@ def test_reconstruct_smooth_segments_no_crosstalk(person):
     b = W.reconstruct_3d(true, obs, segments=seg, **kw)
     e = lambda r: np.nanmedian(np.linalg.norm(r.points3d[48:52] - q[48:52], axis=-1)) / synth.rig_scale(true)
     assert e(b) < 0.5 * e(a)
+
+
+# ------------------------------------------------------------------ W7 options (1.1 real-data fixes)
+
+def _purity(res, truth, C, frames):
+    """Share of labelled detections whose identity's majority person matches."""
+    from collections import Counter
+    who = {}
+    for c in range(C):
+        for k, f in enumerate(frames):
+            if f not in truth[c]:
+                continue
+            for i, p in enumerate(res.labels[c][k]):
+                if p >= 0:
+                    who.setdefault(int(p), []).append(int(truth[c][f][i]))
+    n = sum(len(v) for v in who.values())
+    return sum(Counter(v).most_common(1)[0][1] for v in who.values()) / max(n, 1)
+
+
+def test_associate_sparse_ids_ghosts_n_identities(crowd):
+    cg, P3, dets, ids, truth = crowd
+    C, T = len(cg.cameras), P3.shape[1]
+    off = 100000
+    shifted = [{f + off: d for f, d in dc.items()} for dc in dets]
+    res = W.associate_views(cg, shifted)
+    assert res.settings['frame_axis'] == 'sparse'
+    assert res.points.shape[1] == T and res.frame_ids[0] == off
+    assert res.report['n_identities'] == 3, res.report['n_identities']
+    # ghosts: a fake person seen in 2 frames by all cameras is dropped as a short identity
+    fake = P3[0, :2] + 2.0 * synth.rig_scale(cg)
+    g2 = synth.project(cg, fake)
+    ghost = [{f: (np.concatenate([d, g2[c, f][None]]) if f < 2 else d) for f, d in dc.items()}
+             for c, dc in enumerate(dets)]
+    res = W.associate_views(cg, ghost)
+    assert res.report['n_short_identities_dropped'] >= 1 and res.report['n_identities'] == 3
+    assert all(res.labels[c][f][-1] == -1 for c in range(C) for f in range(2))
+    # a long break: without n_identities a person gets a second identity; with it, re-entry
+    gap = [{f: (d[[i for i in range(len(d)) if truth[c][f][i] != 0]] if 20 <= f < 50 else d)
+            for f, d in dc.items()} for c, dc in enumerate(dets)]
+    gtruth = [{f: (np.array([t for t in truth[c][f] if t != 0]) if 20 <= f < 50 else truth[c][f])
+               for f in truth[c]} for c in range(C)]
+    a = W.associate_views(cg, gap, options={'link_max_gap': 5})
+    b = W.associate_views(cg, gap, options={'link_max_gap': 5, 'n_identities': 3})
+    assert a.report['n_identities'] > 3 and b.report['n_identities'] == 3
+    assert _purity(b, gtruth, C, range(T)) > 0.99
+    with pytest.raises(ValueError):
+        W.associate_views(cg, dets, options={'link_max_gap_s': 1.0})
+    r = W.associate_views(cg, dets, options={'link_max_gap_s': 1.0, 'fps': 30.0})
+    assert r.settings['link_max_gap_frames'] == 30
+
+
+def test_associate_tracklet_switch_split_stitch(crowd):
+    """A tracker swaps two people in one camera: the tracklets are cut at the switch and the pieces
+    associated again. A person whose tracklets all restart (new ids) is stitched over time."""
+    cg, P3, dets, ids, truth = crowd
+    C, T = len(cg.cameras), P3.shape[1]
+    sw = [dict(i) for i in ids]
+    for f in range(45, T):                       # camera 0: persons 0 and 1 swap track ids
+        t = sw[0][f].copy()
+        p0, p1 = np.nonzero(truth[0][f] == 0)[0][0], np.nonzero(truth[0][f] == 1)[0][0]
+        t[p0], t[p1] = ids[0][f][p1], ids[0][f][p0]
+        sw[0][f] = t
+    off = W.associate_views(cg, dets, track_ids=sw, options={'split_on_switch': False, 'stitch': False})
+    on = W.associate_views(cg, dets, track_ids=sw)
+    assert on.report['n_tracklet_cuts'] > 0
+    assert on.report['assigned_frac'] > off.report['assigned_frac']
+    assert _purity(on, truth, C, range(T)) > 0.99 and on.report['n_identities'] == 3
+    # every camera restarts person 0's track at frame 30 (after a 5-frame occlusion)
+    br = [{f: np.where(truth[c][f] == 0, ids[c][f] + 1000, ids[c][f]) if f >= 30 else ids[c][f]
+           for f in ids[c] if not 25 <= f < 30} for c in range(C)]
+    bd = [{f: d for f, d in dets[c].items() if not 25 <= f < 30} for c in range(C)]
+    a = W.associate_views(cg, bd, track_ids=br, options={'stitch': False})
+    b = W.associate_views(cg, bd, track_ids=br)
+    assert a.report['n_identities'] == 4 and b.report['n_identities'] == 3
+    assert b.report['n_stitched'] == 1 and _purity(b, truth, C, b.frame_ids) > 0.99
