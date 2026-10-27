@@ -147,6 +147,76 @@ def test_place_with_rotation_prior():
     assert np.allclose(t, M[:3, 3], atol=1e-6 * np.linalg.norm(M[:3, 3]))
 
 
+
+# ------------------------------------------------------------------ SfM speed-ups (1.1): parallel RANSAC
+
+def test_frame_pnp_ransac_independent_of_threads():
+    """The PnP RANSAC streams have seeds drawn from rng: same result with 1 or 4 threads, and
+    the true pose is found."""
+    true = synth.load_rig('motobs_7cam')
+    p3d, _ = synth.skeleton(true, 40, model=synth.MOUSE, seed=5)
+    X = p3d.reshape(-1, 3)
+    u, f = sfm.ideal_points(true, synth.add_noise(synth.project(true, p3d), 0.5, seed=1).reshape(7, -1, 2))
+    fid = np.repeat(np.arange(40), p3d.shape[1])
+    M = get_extrinsics(true)[3]
+    rs = [sfm.frame_pnp_ransac(X, u[3], fid, f[3], n_iters=120, rng=7, n_jobs=n) for n in (1, 4)]
+    for k in ('rvec', 'tvec', 'inlier_frames'):
+        assert np.array_equal(rs[0][k], rs[1][k])
+    assert rs[0]['n_inlier_frames'] == 40
+    assert np.allclose(rodrigues(rs[0]['rvec']), M[:3, :3], atol=1e-2)
+
+
+def test_frames_sample_whole_frames():
+    fid = np.repeat(np.arange(50), 4)
+    valid = np.ones(200, bool)
+    valid[::7] = False
+    fr = sfm._Frames(valid, fid, 2)
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        sel = fr.sample(rng, 3)
+        frames = np.unique(fid[sel])
+        assert len(frames) >= 3 and len(sel) >= 6
+        # every valid point of a sampled frame is in the sample
+        assert set(sel) == set(np.nonzero(valid & np.isin(fid, frames))[0])
+
+
+def test_pairwise_poses_usac_vs_ransac():
+    """USAC (default) and the 1.0 RANSAC find poses of the same quality; deterministic."""
+    true = synth.load_rig('motobs_7cam')
+    M = get_extrinsics(true)
+    p3d, _ = synth.skeleton(true, 200, model=synth.MOUSE, seed=2)
+    p2 = synth.add_outliers(synth.add_noise(synth.project(true, p3d), 0.5, seed=3), frac=0.1, cgroup=true, seed=4)
+    u, f = sfm.ideal_points(true, p2.reshape(7, -1, 2))
+    prs = [(0, 1), (2, 5), (1, 4)]
+    res = {m: sfm.pairwise_poses(u, f, rng=0, pairs=prs, method=m) for m in ('usac', 'ransac')}
+    again = sfm.pairwise_poses(u, f, rng=0, pairs=prs, n_jobs=1)
+    for i, j in prs:
+        assert np.array_equal(again[(i, j)]['R'], res['usac'][(i, j)]['R'])
+        Rt = M[j][:3, :3] @ M[i][:3, :3].T
+        errs = {m: np.degrees(np.arccos(np.clip((np.trace(Rt.T @ r[(i, j)]['R']) - 1) / 2, -1, 1)))
+                for m, r in res.items()}
+        # a compact mouse scene: pair rotations are only a seed (a few degrees)
+        assert errs['usac'] < max(2 * errs['ransac'], 5.0)
+        assert res['usac'][(i, j)]['n_in'] >= 0.95 * res['ransac'][(i, j)]['n_in']
+    with pytest.raises(ValueError):
+        sfm.pairwise_poses(u, f, pairs=prs, method='lmeds')
+
+
+def test_sfm_deterministic_threads_and_device(mouse_scene):
+    """Same rng -> same rig, whatever the number of threads; device= runs the robust
+    re-triangulations there (CUDA when available) with the same result to rounding."""
+    import torch
+    true, _, p2d_decoy = mouse_scene
+    a, ra = sfm.from_correspondences(blank(true), p2d_decoy, rng=3, n_jobs=1)
+    b, rb = sfm.from_correspondences(blank(true), p2d_decoy, rng=3, n_jobs=4)
+    assert ra.placed == rb.placed
+    assert np.array_equal(get_extrinsics(a), get_extrinsics(b))
+    if torch.cuda.is_available():
+        c, rc = sfm.from_correspondences(blank(true), p2d_decoy, rng=3, device='cuda')
+        assert rc.placed == ra.placed
+        assert np.allclose(get_extrinsics(c), get_extrinsics(a), atol=1e-6)
+
+
 def test_people_bootstrap():
     """Two people, detection slots shuffled per camera: identities are recovered from
     epipolar geometry, then SfM recovers the rig."""

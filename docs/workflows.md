@@ -178,6 +178,9 @@ Some situations it handles for you:
 
 - **A good starting calibration.** If the calibration you pass in already explains most of the points, the slower
   reconstruction from the points alone is skipped.
+- **Speed of the reconstruction from the points alone.** Its random searches run on several threads and its 3D steps on
+  `device`. The result depends only on `rng`, not on the number of threads. To get the slower pair search of 1.0
+  back, pass `options={'sfm_kwargs': {'pair_method': 'ransac'}}`.
 - **Lens refinement.** A refined lens is only kept if it predicts held-out data better on every count (the typical
   error, how many points agree, how many can be checked) and if the lens model still behaves well over the whole
   image. A camera whose refined lens doesn't is put back to the lens you gave.

@@ -1105,7 +1105,7 @@ def _parse_groups(groups, pshape):
     return out
 
 
-def _candidates(base, p, init, frames, gr, opts, rng, rpt, names):
+def _candidates(base, p, init, frames, gr, opts, rng, rpt, names, dev=None):
     """Candidate inits (the 1.0 recipe of ``init.calibrate_from_points``)."""
     from ..cameras import CameraGroup
     from ..init import _has_extrinsics, from_extrinsics, sfm
@@ -1137,7 +1137,7 @@ def _candidates(base, p, init, frames, gr, opts, rng, rpt, names):
                 priors = V.pairwise_rotations(pred)
                 rpt.init_reports['vggt'] = dict(stats=agg.stats)
             elif spec == 'sfm':
-                kw = dict(frame_id=frame_id, window_id=window_id, rotation_priors=priors, rng=rng)
+                kw = dict(frame_id=frame_id, window_id=window_id, rotation_priors=priors, rng=rng, device=dev)
                 kw.update(opts['sfm_kwargs'] or {})
                 cg, ir = sfm.from_correspondences(base, p, **kw)
                 cands['sfm'] = cg
@@ -1545,7 +1545,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
                              'observations (worst camera {:.0%})'.format(ref_support['overall'],
                                                                          ref_support['min_camera']))
     with timer('init'):
-        cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names)
+        cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names, dev=dev)
         if p.ndim == 5 and 'people' in cands:
             from ..init import people
             akw = dict(pk.get('association_kwargs') or {})

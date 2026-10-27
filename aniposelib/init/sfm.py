@@ -84,13 +84,13 @@ def _flatten(p2ds, frame_id, window_id):
     return flat, fid, wid
 
 
-def ideal_points(cgroup, p2ds):
+def ideal_points(cgroup, p2ds, device='cpu'):
     """Undistort ``p2ds [C,M,2]`` with each camera's intrinsics and return ideal pinhole pixels
-    ``u = f_c * x_norm`` (principal point at 0) and the focal lengths ``f [C]``.
-    Points that cannot be undistorted are NaN."""
+    ``u = f_c * x_norm`` (principal point at 0) and the focal lengths ``f [C]`` (numpy; the
+    undistortion runs on ``device``). Points that cannot be undistorted are NaN."""
     from aniposelib import geometry as G
-    P = G.pack(cgroup, device='cpu')
-    x = to_np(G.undistort(P, torch.as_tensor(p2ds, dtype=torch.float64)))
+    P = G.pack(cgroup, device=device)
+    x = to_np(G.undistort(P, torch.as_tensor(p2ds, dtype=torch.float64, device=P.K.device)))
     K = to_np(P.K)
     f = np.sqrt(np.abs(K[:, 0, 0] * K[:, 1, 1]))
     u = x * f[:, None, None]
@@ -98,15 +98,16 @@ def ideal_points(cgroup, p2ds):
     return u, f
 
 
-def _ideal_packed(f, Ms):
+def _ideal_packed(f, Ms, device='cpu'):
     from aniposelib.geometry import PackedCameras
     C = len(f)
     K = np.tile(np.eye(3), (C, 1, 1))
     K[:, 0, 0] = f
     K[:, 1, 1] = f
-    return PackedCameras(K=torch.as_tensor(K), dist=torch.zeros(C, 8, dtype=torch.float64),
-                         model=torch.zeros(C, dtype=torch.long),
-                         ext=torch.as_tensor(np.asarray(Ms, dtype='float64')))
+    return PackedCameras(K=torch.as_tensor(K, device=device),
+                         dist=torch.zeros(C, 8, dtype=torch.float64, device=device),
+                         model=torch.zeros(C, dtype=torch.long, device=device),
+                         ext=torch.as_tensor(np.asarray(Ms, dtype='float64'), device=device))
 
 
 def _Kf(f):
@@ -161,9 +162,14 @@ class _Frames:
         self.counts = counts
         self.keep = counts >= min_frame_pts
         self.usable = self.frames[self.keep]
-        starts = np.r_[0, np.cumsum(counts)[:-1]] if len(counts) else np.zeros(0, int)
-        self.members = {int(fr): self.all_idx[self.order[s:s + c]]
-                        for fr, s, c, k in zip(self.frames, starts, counts, self.keep) if k}
+        self.starts = starts0
+        self.usable_pos = np.nonzero(self.keep)[0]   # positions of the usable frames in .frames
+        self.sorted_idx = self.all_idx[self.order]    # point indices grouped by frame
+
+    def members(self, pos):
+        """Point indices of the frame at position ``pos`` (in ``.frames``)."""
+        s = self.starts[pos]
+        return self.sorted_idx[s:s + self.counts[pos]]
 
     def score(self, res, thresh):
         """Number of usable frames with median residual < thresh, and those frames."""
@@ -184,16 +190,21 @@ class _Frames:
         return int(ok.sum()), self.frames[ok]
 
     def sample(self, rng, k, min_points=6):
-        """Indices of >= k whole frames holding >= min_points points."""
-        order = rng.permutation(len(self.usable))
+        """Indices of >= k whole frames holding >= min_points points (frames drawn uniformly
+        without replacement; every usable frame has >= 1 point, so ``max(k, min_points)``
+        draws always suffice)."""
+        n_use = len(self.usable_pos)
+        if n_use == 0:
+            return np.zeros(0, int)
+        draw = rng.choice(n_use, size=min(n_use, max(k, min_points)), replace=False)
         sel, n = [], 0
-        for i in order:
-            pts = self.members[int(self.usable[i])]
+        for i in draw:
+            pts = self.members(self.usable_pos[i])
             sel.append(pts)
             n += len(pts)
             if len(sel) >= k and n >= min_points:
                 break
-        return np.concatenate(sel) if sel else np.zeros(0, int)
+        return np.concatenate(sel)
 
 
 def _auto_min_frame_pts(frame_id):
@@ -201,50 +212,127 @@ def _auto_min_frame_pts(frame_id):
     return int(np.clip(round(0.5 * np.median(counts)), 1, 8))
 
 
+_CHUNK = 50   # RANSAC iterations per independent random stream (fixed: results do not depend on threads)
+
+
 def frame_pnp_ransac(p3d, u, frame_id, f, n_frames_sample=3, n_iters=300, thresh=8.0, rng=None,
-                     min_frame_pts=None, inner_iters=80):
+                     min_frame_pts=None, inner_iters=80, n_jobs=None):
     """RANSAC PnP whose minimal sample is whole frames, scored by inlier frames (motor
     ``frame_pnp_ransac``). ``p3d [M,3]`` (NaN = no point), ``u [M,2]`` ideal pixels of one
     camera, ``f`` its focal length. Returns a dict (rvec, tvec, n_inlier_frames, n_frames,
-    inlier_frames, n_inliers) or None."""
-    rng = as_rng(rng)
+    inlier_frames, n_inliers) or None.
+
+    The ``n_iters`` hypotheses are drawn in independent streams of 50 iterations whose seeds come
+    from ``rng`` (one draw), and the streams run on ``n_jobs`` threads (None: torch's thread
+    count, at most 16; OpenCV releases the GIL). The result depends on ``rng`` only, not on
+    ``n_jobs``."""
+    return _frame_pnp_batch([dict(p3d=p3d, u=u, f=f, seed=_seed(rng))], frame_id,
+                            n_frames_sample=n_frames_sample, n_iters=n_iters, thresh=thresh,
+                            min_frame_pts=min_frame_pts, inner_iters=inner_iters, n_jobs=n_jobs)[0]
+
+
+def _seed(rng):
+    return int(as_rng(rng).integers(2 ** 31 - 1))
+
+
+def _pmap(fn, jobs, n_jobs=None):
+    """``[fn(j) for j in jobs]`` on a thread pool (cv2 and large numpy ops release the GIL)."""
+    jobs = list(jobs)
+    workers = min(len(jobs), _n_workers() if n_jobs is None else max(1, int(n_jobs)))
+    if workers <= 1:
+        return [fn(j) for j in jobs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(workers) as ex:
+        return list(ex.map(fn, jobs))
+
+
+class _PnPProblem:
+    """One camera's frame-RANSAC PnP: data, frame grouping and the per-stream results."""
+
+    def __init__(self, p3d, u, frame_id, f, seed, min_frame_pts, n_iters):
+        self.ok = False
+        self.p3d, self.u, self.frame_id, self.f = p3d, u, frame_id, f
+        self.valid = np.all(np.isfinite(p3d), -1) & np.all(np.isfinite(u), -1)
+        if self.valid.sum() < 12:
+            return
+        self.fr = _Frames(self.valid, frame_id, min_frame_pts)
+        if len(self.fr.usable) < 2:
+            return
+        self.ok = True
+        self.K = _Kf(f)
+        self.P3a, self.P2a = p3d[self.fr.all_idx], u[self.fr.all_idx]
+        n_chunks = max(1, -(-int(n_iters) // _CHUNK))
+        sizes = np.full(n_chunks, int(n_iters) // n_chunks)
+        sizes[:int(n_iters) % n_chunks] += 1
+        self.chunks = [(k, int(n), int(s)) for k, (n, s) in enumerate(
+            zip(sizes, np.random.default_rng(seed).integers(2 ** 31 - 1, size=n_chunks)))]
+        self.polish_seed = int(seed)
+        self.results = [None] * n_chunks
+        self.perfect = n_chunks   # lowest chunk index that reached a perfect score
+
+    def run_chunk(self, k, n, seed, n_frames_sample, thresh, inner_iters):
+        rng = np.random.default_rng(seed)
+        cv2.setRNGSeed(seed)   # per thread: OpenCV's RNG is thread local
+        fr, f = self.fr, self.f
+        best = None
+        for _ in range(n):
+            if k > self.perfect:   # a lower stream is perfect: this one cannot win the tie
+                return
+            sel = fr.sample(rng, n_frames_sample)
+            if len(sel) < 6:
+                continue
+            try:
+                ok, rvec, tvec, _inl = cv2.solvePnPRansac(
+                    self.p3d[sel], self.u[sel], self.K, None, reprojectionError=thresh, confidence=0.999,
+                    iterationsCount=inner_iters, flags=cv2.SOLVEPNP_EPNP)
+            except cv2.error:
+                continue
+            if not ok:
+                continue
+            res = np.linalg.norm(project_ideal(self.P3a, rodrigues(rvec), tvec, f) - self.P2a, axis=1)
+            score, inl = fr.score(res, thresh)
+            if best is None or score > best[0]:
+                best = (score, rvec.copy(), tvec.copy(), inl)
+                if score == len(fr.usable):
+                    self.perfect = min(self.perfect, k)
+                    break
+        self.results[k] = best
+
+    def best(self):
+        best = None
+        for k, b in enumerate(self.results):
+            if k > self.perfect:
+                break
+            if b is not None and (best is None or b[0] > best[0]):
+                best = b
+        return best
+
+
+def _frame_pnp_batch(items, frame_id, n_frames_sample=3, n_iters=300, thresh=8.0, min_frame_pts=None,
+                     inner_iters=80, n_jobs=None):
+    """:func:`frame_pnp_ransac` of several cameras against one cloud (``items``: dicts with
+    ``p3d, u, f, seed``); all their RANSAC streams share one thread pool."""
     if min_frame_pts is None:
         min_frame_pts = _auto_min_frame_pts(frame_id)
-    valid = np.all(np.isfinite(p3d), -1) & np.all(np.isfinite(u), -1)
-    if valid.sum() < 12:
-        return None
-    fr = _Frames(valid, frame_id, min_frame_pts)
-    if len(fr.usable) < 2:
-        return None
-    K = _Kf(f)
-    P3a, P2a = p3d[fr.all_idx], u[fr.all_idx]
-    best = None
-    for _ in range(n_iters):
-        sel = fr.sample(rng, n_frames_sample)
-        if len(sel) < 6:
-            continue
-        try:
-            ok, rvec, tvec, _inl = cv2.solvePnPRansac(
-                p3d[sel], u[sel], K, None, reprojectionError=thresh, confidence=0.999,
-                iterationsCount=inner_iters, flags=cv2.SOLVEPNP_EPNP)
-        except cv2.error:
-            continue
-        if not ok:
-            continue
-        res = np.linalg.norm(project_ideal(P3a, rodrigues(rvec), tvec, f) - P2a, axis=1)
-        score, inl = fr.score(res, thresh)
-        if best is None or score > best[0]:
-            best = (score, rvec.copy(), tvec.copy(), inl)
-            if score == len(fr.usable):
-                break
-    if best is None or best[0] < 2:
-        return None
-    score, rvec, tvec, inl_frames = best
-    rvec, tvec, score, inl_frames, n_in = _polish(p3d, u, valid, frame_id, fr, K, f, rvec, tvec,
-                                                  score, inl_frames, thresh)
-    return dict(rvec=np.ravel(rvec), tvec=np.ravel(tvec), n_inlier_frames=int(score),
-                n_frames=int(len(fr.usable)), inlier_frames=np.asarray(inl_frames),
-                n_inliers=int(n_in), n_points=int(valid.sum()))
+    probs = [_PnPProblem(it['p3d'], it['u'], frame_id, it['f'], it['seed'], min_frame_pts, n_iters)
+             for it in items]
+    jobs = [(pb, ch) for pb in probs if pb.ok for ch in pb.chunks]
+    _pmap(lambda j: j[0].run_chunk(*j[1], n_frames_sample, thresh, inner_iters), jobs, n_jobs)
+
+    def finish(pb):
+        if not pb.ok:
+            return None
+        best = pb.best()
+        if best is None or best[0] < 2:
+            return None
+        score, rvec, tvec, inl_frames = best
+        cv2.setRNGSeed(pb.polish_seed)
+        rvec, tvec, score, inl_frames, n_in = _polish(pb.p3d, pb.u, pb.valid, frame_id, pb.fr, pb.K, pb.f,
+                                                      rvec, tvec, score, inl_frames, thresh)
+        return dict(rvec=np.ravel(rvec), tvec=np.ravel(tvec), n_inlier_frames=int(score),
+                    n_frames=int(len(pb.fr.usable)), inlier_frames=np.asarray(inl_frames),
+                    n_inliers=int(n_in), n_points=int(pb.valid.sum()))
+    return _pmap(finish, probs, n_jobs)
 
 
 def _polish(p3d, u, valid, frame_id, fr, K, f, rvec, tvec, score, inl_frames, thresh):
@@ -310,12 +398,20 @@ def place_with_rotation_prior(p3d, u, frame_id, f, R_hyps, thresh=8.0, n_iters=4
                 n_inliers=int(n_in), hypothesis=int(hi), via_prior=True)
 
 
-def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pairs=None):
+def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pairs=None, n_jobs=None,
+                   method='usac'):
     """RANSAC essential-matrix relative pose of every camera pair (motor ``pairwise_poses``).
 
     ``u [C,M,2]`` ideal pixels (:func:`ideal_points`), ``f [C]`` focal lengths. Returns
-    ``{(i, j): dict(R, t, idx, inl, n_in, ratio)}`` with ``x_j = R x_i + t`` (``|t| = 1``)."""
+    ``{(i, j): dict(R, t, idx, inl, n_in, ratio)}`` with ``x_j = R x_i + t`` (``|t| = 1``).
+    ``method``: 'usac' (OpenCV ``USAC_DEFAULT``: LO-RANSAC with SPRT early rejection; 5-10x
+    faster on real keypoints, more inliers) or 'ransac' (``cv2.RANSAC``, the 1.0 behaviour).
+    The pairs run on ``n_jobs`` threads (None: torch's thread count, at most 16) with seeds
+    drawn from ``rng`` in pair order."""
     rng = as_rng(rng)
+    if method not in ('usac', 'ransac'):
+        raise ValueError("method must be 'usac' or 'ransac', got {!r}".format(method))
+    flag = cv2.USAC_DEFAULT if method == 'usac' else cv2.RANSAC
     C = u.shape[0]
     todo = pairs if pairs is not None else [(i, j) for i in range(C) for j in range(i + 1, C)]
     jobs = []
@@ -331,7 +427,7 @@ def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pa
         a, b = u[i, idx] / f[i], u[j, idx] / f[j]
         cv2.setRNGSeed(seed)      # per thread: the same RANSAC stream as a serial loop
         try:
-            E, mask = cv2.findEssentialMat(a, b, np.eye(3), method=cv2.RANSAC, prob=0.9999,
+            E, mask = cv2.findEssentialMat(a, b, np.eye(3), method=flag, prob=0.9999,
                                            threshold=thresh / np.sqrt(f[i] * f[j]), maxIters=max_iters)
         except cv2.error:
             return None
@@ -345,14 +441,17 @@ def pairwise_poses(u, f, thresh=2.0, min_points=30, max_iters=4000, rng=None, pa
                     inl=mp.ravel().astype(bool), n_in=int(n_in), ratio=n_in / len(idx))
 
     # the pairs are independent and cv2 releases the GIL: run them on a thread pool
-    workers = min(len(jobs), _n_workers())
-    if workers > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(workers) as ex:
-            results = list(ex.map(one, jobs))
-    else:
-        results = [one(jb) for jb in jobs]
+    results = _pmap(one, jobs, n_jobs)
     return {(jb[0], jb[1]): r for jb, r in zip(jobs, results) if r is not None}
+
+
+def _resolve_device(cgroup, device):
+    """``device`` (None: the group's device; 'auto': CUDA if available) as a torch device string."""
+    if device is None:
+        return str(cgroup.device)
+    if device == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return str(device)
 
 
 def _n_workers():
@@ -365,29 +464,47 @@ def _n_workers():
 # ------------------------------------------------------------------ robust cloud
 
 def _retriangulate(u, f, Ms, ks, drivers, frame_id, decoy_thresh, point_max_err, sigma=8.0,
-                   min_frame_pts=1):
+                   min_frame_pts=1, device='cpu', u_dev=None):
     """Robust (IRLS) cloud from placed cameras ``ks``; (camera, frame) blocks with median error
     above ``decoy_thresh`` are masked and the cloud refit. Returns p3d [M,3], good [M],
-    errors [len(ks), M] (px), the masked observations."""
+    errors [len(ks), M] (px), the masked observations (numpy). The triangulation runs on
+    ``device``; ``u_dev`` is ``u`` already there (avoids a copy per call)."""
     from aniposelib.triangulation import triangulate_robust
-    P = _ideal_packed(f[ks], Ms)
+    P = _ideal_packed(f[ks], Ms, device)
     sub = u[ks]
+    sub_d = (torch.as_tensor(sub, device=device) if u_dev is None
+             else u_dev[torch.as_tensor(ks, device=u_dev.device)])
     contrib = np.array([k in drivers for k in ks])
     # tau only decides which views count towards min_inliers; IRLS handles the outliers
     kw = dict(method='irls', sigma=sigma, contrib=contrib, mask_out_of_bounds=False, tau=1e12)
-    res = triangulate_robust(P, sub, **kw)
-    err = np.asarray(res.errors)
+    M = sub.shape[1]
+
+    def tri(obs_d):
+        # points seen by fewer than 2 cameras give no point and no errors: fit only the others
+        cols = torch.nonzero(torch.isfinite(obs_d).all(-1).sum(0) >= 2).ravel()
+        p3d = np.full((M, 3), np.nan)
+        err = np.full((len(ks), M), np.nan)
+        if len(cols):
+            r = triangulate_robust(P, obs_d[:, cols], **kw)
+            c = to_np(cols)
+            p3d[c] = to_np(r.p3d)
+            err[:, c] = to_np(r.errors)
+        return p3d, err
+
+    _, err = tri(sub_d)
     work = _frame_mask(sub, frame_id, err, decoy_thresh, min_frame_pts)
-    res = triangulate_robust(P, work, **kw)
-    p3d, err = np.asarray(res.p3d), np.asarray(res.errors)
-    nobs = np.all(np.isfinite(work[contrib]), -1).sum(0)
+    masked = ~np.all(np.isfinite(work), -1)
+    work_d = sub_d.clone()
+    work_d[torch.as_tensor(masked, device=sub_d.device)] = float('nan')
+    p3d, err = tri(work_d)
+    nobs = (~masked[contrib]).sum(0)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         e = np.where(np.isfinite(err), err, np.nan)
-        e[~np.all(np.isfinite(work), -1)] = np.nan
+        e[masked] = np.nan
         ptmed = np.nanmedian(e, axis=0)
     good = np.all(np.isfinite(p3d), -1) & (nobs >= 2) & (ptmed <= point_max_err)
-    e = np.where(np.all(np.isfinite(work), -1), err, np.nan)
+    e = np.where(~masked, err, np.nan)
     return p3d, good, e, work
 
 
@@ -441,9 +558,10 @@ def _prior_table(rotation_priors, names):
 def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier_frames=8,
                          min_inlier_windows=4, driver_frac=0.25, max_center_ratio=3.0,
                          rotation_priors=None, local_ba_every=3, rng=None, *,
-                         pair_thresh=2.0, pnp_thresh=8.0, point_max_err=12.0, decoy_thresh=25.0,
+                         pair_thresh=2.0, pair_method='usac', pnp_thresh=8.0, point_max_err=12.0, decoy_thresh=25.0,
                          min_pair_points=30, scan_iters=60, place_iters=400,
-                         min_frame_points=None, local_ba_kwargs=None, pairs=None, verbose=False):
+                         min_frame_points=None, local_ba_kwargs=None, pairs=None, device=None,
+                         n_jobs=None, verbose=False):
     """Initial extrinsics from 2D correspondences and per-camera intrinsics (see module doc).
 
     Parameters
@@ -461,7 +579,14 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
     local_ba_every : sparse extrinsics + points bundle adjustment (:func:`refine_extrinsics`,
         on decoy-masked ideal pixels, with outlier trimming) after every this many placements and
         after the last one (0/None: never). ``local_ba_kwargs`` are passed to it.
-    rng : Generator, int or None.
+    pair_method : 'usac' (default since 1.1: OpenCV ``USAC_DEFAULT`` essential matrices, 5-10x
+        faster on real keypoints) or 'ransac' (``cv2.RANSAC``, 1.0), see :func:`pairwise_poses`.
+    rng : Generator, int or None. The RANSAC streams (pairs, per-camera PnP scans) get
+        independent seeds drawn from it, so the result depends on ``rng`` only, not on threads.
+    device : torch device of the robust re-triangulations (None: the group's device, 'auto':
+        CUDA if available). The RANSAC itself is OpenCV on the CPU.
+    n_jobs : threads for the RANSAC (pairs, per-camera PnP); None: torch's thread count, at
+        most 16. Does not change the result.
 
     Returns
     -------
@@ -478,10 +603,13 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
     if flat.shape[0] != C:
         raise ValueError('p2ds has {} cameras, cgroup has {}'.format(flat.shape[0], C))
     mfp = _auto_min_frame_pts(fid) if min_frame_points is None else int(min_frame_points)
-    u, f = ideal_points(cgroup, flat)
+    dev = _resolve_device(cgroup, device)
+    u, f = ideal_points(cgroup, flat, device=dev)
+    u_dev = torch.as_tensor(u, device=dev)
 
     if pairs is None:
-        pairs = pairwise_poses(u, f, thresh=pair_thresh, min_points=min_pair_points, rng=rng)
+        pairs = pairwise_poses(u, f, thresh=pair_thresh, min_points=min_pair_points, rng=rng, n_jobs=n_jobs,
+                               method=pair_method)
     if not pairs:
         raise RuntimeError('from_correspondences: no camera pair shares enough correspondences '
                            '(min_pair_points={}) for an essential-matrix seed'.format(min_pair_points))
@@ -494,7 +622,8 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         ks = sorted(e)
         p3d, good, err, work = _retriangulate(u, f, np.stack([e[k] for k in ks]), ks,
                                               drivers if drv is None else drv, fid,
-                                              decoy_thresh, point_max_err, min_frame_pts=mfp)
+                                              decoy_thresh, point_max_err, min_frame_pts=mfp,
+                                              device=dev, u_dev=u_dev)
         return p3d, good, err, ks
 
     # seed: the pair with the most essential-matrix inliers whose two-view reconstruction keeps
@@ -549,10 +678,14 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
     order = 0
     while remaining:
         cloud = np.where(good[:, None], p3d, np.nan)
+        # scan: every remaining camera against the cloud, in parallel (independent seeds drawn
+        # from rng in camera order, so the result depends on rng only)
+        rem = sorted(remaining)
+        seeds = rng.integers(2 ** 31 - 1, size=len(rem))
+        scan = _frame_pnp_batch([dict(p3d=cloud, u=u[c], f=f[c], seed=int(s)) for c, s in zip(rem, seeds)],
+                                fid, n_iters=scan_iters, thresh=pnp_thresh, min_frame_pts=mfp, n_jobs=n_jobs)
         cands = []
-        for c in sorted(remaining):
-            r = frame_pnp_ransac(cloud, u[c], fid, f[c], thresh=pnp_thresh, n_iters=scan_iters,
-                                 rng=rng, min_frame_pts=mfp)
+        for c, r in zip(rem, scan):
             if r is not None:
                 r['cam'] = c
                 cands.append(r)
@@ -561,7 +694,7 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
         cands.sort(key=lambda r: -(r['n_inlier_frames'] + r['n_inlier_frames'] / max(1, r['n_frames'])))
         c = cands[0]['cam']
         r = frame_pnp_ransac(cloud, u[c], fid, f[c], thresh=pnp_thresh, n_iters=place_iters,
-                             rng=rng, min_frame_pts=mfp)
+                             rng=rng, min_frame_pts=mfp, n_jobs=n_jobs)
         if r is None or r['n_inlier_frames'] < cands[0]['n_inlier_frames']:
             r = cands[0]
         remaining.discard(c)
@@ -584,7 +717,8 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
             # detection put on a fixed spot all agree with it: retry without those frames
             masked = np.isin(fid, r['inlier_frames'])
             r2 = frame_pnp_ransac(np.where(masked[:, None], np.nan, cloud), u[c], fid, f[c],
-                                  thresh=pnp_thresh, n_iters=place_iters, rng=rng, min_frame_pts=mfp)
+                                  thresh=pnp_thresh, n_iters=place_iters, rng=rng, min_frame_pts=mfp,
+                                  n_jobs=n_jobs)
             if r2 is not None and not weak(r2):
                 M2 = make_M(rodrigues(r2['rvec']), r2['tvec'])
                 if not implausible(M2, p3d, good)[0]:
