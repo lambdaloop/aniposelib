@@ -225,3 +225,26 @@ def test_w4_translated_camera_station_has_the_translation():
     sn = ev.moves.stations.lookup_name(name, [30.0])[0]
     E = ev.moves.corrected_extrinsics(rig)[name][sn]
     np.testing.assert_allclose(E[:3, 3], synth.to_np(rb.cameras[3].get_extrinsics_mat())[:3, 3], atol=0.003 * s)
+
+
+def test_w4_recovery_splits_a_second_bump():
+    rig = synth.load_rig('fisheye_5cam')
+    F, Pn, cb = 300, 3, 2
+    X = synth.crowd(rig, Pn, F, size=3.5, sep=1.5, seed=0)
+    t = np.arange(F) / 10.0
+    r1, r2 = [3.0, -4.5, 2.0], [3.0, -4.5, 4.5]          # 5.8 deg at 12 s, then +2.5 deg at 22 s
+    p = np.stack([synth.project(rig, X[i]) for i in range(Pn)], 2)
+    for tb, rot in ((12.0, r1), (22.0, r2)):
+        pb = np.stack([synth.project(_bumped(rig, cb, rot), X[i]) for i in range(Pn)], 2)
+        p[cb, t >= tb] = pb[cb, t >= tb]
+    p = synth.add_noise(p, 1.0, seed=1)
+    rng = np.random.default_rng(0)
+    det = [{f: p[c, f][rng.permutation(Pn)] for f in range(F)} for c in range(p.shape[0])]
+    assoc = p.copy()
+    assoc[cb, t >= 12.0] = np.nan
+    name = rig.get_names()[cb]
+    ev = W.evaluate_calibration(rig, assoc, times=t, options={'detections': det})
+    cps = [cp for cp in ev.moves.change_points if cp['camera'] == name]
+    assert len(cps) == 2, ev.report['recovered_moves']
+    assert abs(cps[0]['time'] - 12.0) < 0.15 and abs(cps[1]['time'] - 22.0) <= 4.0
+    np.testing.assert_allclose([cp['step_deg'] for cp in cps], [np.linalg.norm(r1), np.linalg.norm(r2)], atol=0.15)

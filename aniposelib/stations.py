@@ -1014,7 +1014,7 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
     # phase 2: earliest first, then the most collapsed; each recovered camera's pose and data are
     # used when the next cameras are re-placed
     work = p2d.copy()
-    overrides = {}                      # cam -> (t0, t1, E [4,4] torch)
+    overrides = []                      # (cam, t0, t1, E [4,4] torch) of the re-placed cameras
     jobs.sort(key=lambda j: (j[0], j[1]))
     zero3 = torch.zeros(3, dtype=dt, device=dev)
     eye3 = torch.eye(3, dtype=dt, device=dev)
@@ -1025,19 +1025,19 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
         # points of the other cameras after the move (recovered cameras at their new pose)
         Xr = np.full((len(rows), J, 3), np.nan)
         keys = np.zeros((len(rows), 0), bool)
-        ovs = [o for o in others if o in overrides]
+        ovs = [ov for ov in overrides if ov[0] != c]
         if ovs:
-            keys = np.stack([(t[rows] >= overrides[o][0]) & (t[rows] < overrides[o][1]) for o in ovs], 1)
+            keys = np.stack([(t[rows] >= ov[1]) & (t[rows] < ov[2]) for ov in ovs], 1)
         ukeys, kinv = np.unique(keys, axis=0, return_inverse=True)
         kinv = np.asarray(kinv).reshape(-1)
         for kk, key in enumerate(ukeys):
             m = kinv == kk
             Pk = P
-            on = [o for o, b in zip(ovs, key) if b]
+            on = [ov for ov, b in zip(ovs, key) if b]
             if on:
                 cgk = cgroup.copy()
-                for o in on:
-                    E = overrides[o][2].cpu().numpy()
+                for o, _, _, E in on:
+                    E = E.cpu().numpy()
                     cgk.cameras[o].set_rotation(_rotvec(E[:3, :3]))
                     cgk.cameras[o].set_translation(E[:3, 3])
                 Pk = G.pack(cgk, device=dev)
@@ -1124,73 +1124,121 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
                 Rb, tb, moved_ = eye3, zero3, False
             else:
                 moved_ = True
+        segs = [(t_cp, t_end, Rb, tb)]
         if moved_:
-            d['status'] = 'recovered'
-            E0 = E_all[c]
-            E1 = torch.eye(4, dtype=dt, device=dev)
-            E1[:3, :3] = Rb @ E0[:3, :3]
-            E1[:3, 3] = Rb @ E0[:3, 3] + tb
-            E1n = E1.cpu().numpy()
-            overrides[c] = (t_cp, t_end, E1)
-            exist = [cp for cp in cps if cp['camera'] == name and abs(cp['time'] - t_cp) <= 2 * ws]
-            same = [k_ for k_, E_ in poses.get(name, {}).items()
-                    if np.degrees(np.linalg.norm(_rotvec(np.asarray(E_)[:3, :3] @ E1n[:3, :3].T))) < min_step_deg
-                    and np.linalg.norm(np.asarray(E_)[:3, 3] - E1n[:3, 3]) < 0.01 * float(np.linalg.norm(E1n[:3, 3]) + 1e-9)]
-            if same:
-                sn = same[0]
-                exist = []
-            elif exist:
-                t_cp = float(exist[0]['time'])
-                sn = str(st.lookup_name(name, [t_cp + 1e-9])[0])
-                if sn == SKIP:
-                    sn = str(st.lookup_name(name, [t_cp + 2 * ws])[0])
-                cps = [cp for cp in cps if cp is not exist[0]]
-            else:
-                k = len(st.names(name))
-                sn = '{}@s{}'.format(name, k)
-                while sn in st.names(name):
-                    k += 1
-                    sn = '{}@s{}'.format(name, k)
-            prev = str(st.lookup_name(name, [t_cp - 1e-6])[0]) if np.isfinite(t_cp) else None
-            st = st.paint(name, t_cp, t_end, sn)
-            rots.setdefault(name, {name: np.zeros(3)})
-            rots[name][sn] = _rotvec(E1n[:3, :3] @ E0[:3, :3].T.cpu().numpy())
-            poses.setdefault(name, {})[sn] = E1n
-            if prev != sn:
-                cps.append(dict(camera=name, time=float(t_cp) if np.isfinite(t_cp) else float(t0), window=int(k0),
-                                step_deg=d['step_deg'], z=None, recovered=True, center_shift=d['center_shift'],
-                                left_deg=[0.0, 0.0, 0.0], right_deg=d['rotvec_deg']))
-            d['station'] = sn
-            if np.isfinite(t_cp):
-                d['time'] = float(t_cp)
-        # re-association of the camera's detections after the move (or after the data loss)
-        if detections is not None:
-            if new_pts is None:
-                new_pts = p2d.copy()
-            dc = _frame_detections(detections, names, c)
-            Xall = torch.as_tensor(np.nan_to_num(Xr), dtype=dt, device=dev)
-            uva, _, _ = _proj_pose(P, c, Rb, tb, Xall.reshape(-1, 3))
-            uva = uva.reshape(len(rows), J, 2).cpu().numpy()
-            uva[~np.isfinite(Xr).all(-1)] = np.nan
-            new_pts[c, rows] = np.nan
-            fr = np.asarray(frame_ids)[rows]
-            n_as = 0
-            for fid in np.unique(fr):
-                ri = np.flatnonzero(fr == fid)
-                det = _get_frame(dc, fid)
-                if det is None:
+            # further steps inside the interval (a second bump): the pose refined per block of
+            # windows from the recovered one; blocks within min_step_deg of a segment's first block
+            # share its station
+            wi = win[rows[inst]]
+            uw = np.unique(wi)
+            br = []
+            for bl in np.array_split(uw, min(len(uw), max_blocks)):
+                sub = np.flatnonzero(np.isin(wi, bl))
+                if len(sub) < max(3, min_support // max(J, 1)):
                     continue
-                e2 = np.linalg.norm(uva[ri][:, None] - det[None], axis=-1)       # [r, D, J]
-                with np.errstate(all='ignore'), warnings.catch_warnings():
-                    warnings.simplefilter('ignore', RuntimeWarning)
-                    nj = np.isfinite(e2).sum(-1)
-                    cost = np.where(nj >= min(3, J), np.nanmedian(e2, -1), np.inf)
-                a_, b_ = _assign(cost, 2 * gate)
-                for i, k in zip(a_, b_):
-                    new_pts[c, rows[ri[i]]] = det[k]
-                    n_as += 1
-            work[c, rows] = new_pts[c, rows]
-            d['n_reassociated'] = int(n_as)
+                if len(sub) > max_instances:
+                    sub = np.sort(gen.choice(sub, max_instances, replace=False))
+                Rk, tk, _, _, _ = _refine_pose(P, c, Xa[sub], Da[sub], Rb, tb, 2 * gate, full=False)
+                Rk, tk, _, _, _ = _refine_pose(P, c, Xa[sub], Da[sub], Rk, tk, gate, full=False)
+                br.append((int(bl[0]), int(bl[-1]), Rk))
+            groups = []
+            for x in br:
+                if groups and np.degrees(np.linalg.norm(_rotvec((x[2] @ groups[-1][0][2].T).cpu().numpy()))) \
+                        < min_step_deg:
+                    groups[-1].append(x)
+                else:
+                    groups.append([x])
+            if len(groups) > 1:
+                segs = []
+                tin = t[rows[inst]]
+                for gi, g in enumerate(groups):
+                    ta = t_cp if gi == 0 else t0 + g[0][0] * ws
+                    tb_ = t_end if gi == len(groups) - 1 else t0 + groups[gi + 1][0][0] * ws
+                    sub = np.flatnonzero((tin >= ta) & (tin < tb_))
+                    if len(sub) > max_instances:
+                        sub = np.sort(gen.choice(sub, max_instances, replace=False))
+                    Rk, tk, _, _, _ = _refine_pose(P, c, Xa[sub], Da[sub], g[0][2], tb, gate, full=False)
+                    if bool(d.get('translation')):
+                        Rk, tk, _, _, _ = _refine_pose(P, c, Xa[sub], Da[sub], Rk, tk, gate, full=True)
+                    segs.append((ta, tb_, Rk, tk))
+                d['segments'] = [dict(time=float(a_), t_end=float(b_),
+                                      rotvec_deg=np.degrees(_rotvec(R_.cpu().numpy())).tolist()) for a_, b_, R_, _ in segs]
+            d['status'] = 'recovered'
+        E0 = E_all[c]
+        for si, (sa, sb, Rs, ts) in enumerate(segs):
+            srows = np.flatnonzero((t[rows] >= sa) & (t[rows] < sb))
+            if moved_:
+                E1 = torch.eye(4, dtype=dt, device=dev)
+                E1[:3, :3] = Rs @ E0[:3, :3]
+                E1[:3, 3] = Rs @ E0[:3, 3] + ts
+                E1n = E1.cpu().numpy()
+                overrides.append((c, sa, sb, E1))
+                exist = [cp for cp in cps if cp['camera'] == name and abs(cp['time'] - sa) <= 2 * ws]
+                same = [k_ for k_, E_ in poses.get(name, {}).items()
+                        if np.degrees(np.linalg.norm(_rotvec(np.asarray(E_)[:3, :3] @ E1n[:3, :3].T))) < min_step_deg
+                        and np.linalg.norm(np.asarray(E_)[:3, 3] - E1n[:3, 3])
+                        < 0.01 * float(np.linalg.norm(E1n[:3, 3]) + 1e-9)]
+                if same:
+                    sn = same[0]
+                    exist = []
+                elif exist:
+                    sa = float(exist[0]['time'])
+                    sn = str(st.lookup_name(name, [sa + 1e-9])[0])
+                    if sn == SKIP:
+                        sn = str(st.lookup_name(name, [sa + 2 * ws])[0])
+                    cps = [cp for cp in cps if cp is not exist[0]]
+                else:
+                    k = len(st.names(name))
+                    sn = '{}@s{}'.format(name, k)
+                    while sn in st.names(name):
+                        k += 1
+                        sn = '{}@s{}'.format(name, k)
+                prev = str(st.lookup_name(name, [sa - 1e-6])[0]) if np.isfinite(sa) else None
+                st = st.paint(name, sa, sb, sn)
+                rots.setdefault(name, {name: np.zeros(3)})
+                rv_s = _rotvec(E1n[:3, :3] @ E0[:3, :3].T.cpu().numpy())
+                rots[name][sn] = rv_s
+                poses.setdefault(name, {})[sn] = E1n
+                if prev != sn:
+                    cps.append(dict(camera=name, time=float(sa) if np.isfinite(sa) else float(t0), window=int(k0),
+                                    step_deg=float(np.degrees(np.linalg.norm(rv_s))), z=None, recovered=True,
+                                    center_shift=float(np.linalg.norm(
+                                        -(E1n[:3, :3].T @ E1n[:3, 3]) + (E0[:3, :3].T @ E0[:3, 3]).cpu().numpy())),
+                                    left_deg=[0.0, 0.0, 0.0], right_deg=np.degrees(rv_s).tolist()))
+                if si == 0:
+                    d['station'] = sn
+                    if np.isfinite(sa):
+                        d['time'] = float(sa)
+            # re-association of the camera's detections after the move (or after the data loss)
+            if detections is not None and len(srows):
+                if new_pts is None:
+                    new_pts = p2d.copy()
+                dc = _frame_detections(detections, names, c)
+                Xs_ = Xr[srows]
+                Xall = torch.as_tensor(np.nan_to_num(Xs_), dtype=dt, device=dev)
+                uva, _, _ = _proj_pose(P, c, Rs, ts, Xall.reshape(-1, 3))
+                uva = uva.reshape(len(srows), J, 2).cpu().numpy()
+                uva[~np.isfinite(Xs_).all(-1)] = np.nan
+                rr = rows[srows]
+                new_pts[c, rr] = np.nan
+                fr = np.asarray(frame_ids)[rr]
+                n_as = 0
+                for fid in np.unique(fr):
+                    ri = np.flatnonzero(fr == fid)
+                    det = _get_frame(dc, fid)
+                    if det is None:
+                        continue
+                    e2 = np.linalg.norm(uva[ri][:, None] - det[None], axis=-1)       # [r, D, J]
+                    with np.errstate(all='ignore'), warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)
+                        nj = np.isfinite(e2).sum(-1)
+                        cost = np.where(nj >= min(3, J), np.nanmedian(e2, -1), np.inf)
+                    a_, b_ = _assign(cost, 2 * gate)
+                    for i, k in zip(a_, b_):
+                        new_pts[c, rr[ri[i]]] = det[k]
+                        n_as += 1
+                work[c, rr] = new_pts[c, rr]
+                d['n_reassociated'] = d.get('n_reassociated', 0) + int(n_as)
     if moves is not None or info or transient:
         base = moves if moves is not None else MoveReport(
             cameras=names, window_t0=t0 + np.arange(W) * ws, window_s=ws, delta_deg=np.full((C, W, 3), np.nan),
