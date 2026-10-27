@@ -46,8 +46,8 @@ Conventions
   in camera order. ``rng=0`` by default.
 * No unit-dependent knobs. Pixel thresholds derive from the robust noise floor
   (:func:`~aniposelib.workflows._common.noise_floor`, >= 0.5 px) through the *noise unit*
-  ``u = noise_floor / 0.5 px``: the backend defaults (tuned for 0.5 px noise) are multiplied by
-  ``u``. First-pass thresholds are fractions of the image diagonal. Lengths are relative to
+  ``u = clip(noise_floor / 0.5 px, 1, 2)``: the backend defaults (tuned for 0.5 px noise) are
+  multiplied by ``u`` (``options={'noise_unit': 1}`` = the plain pixel defaults). First-pass thresholds are fractions of the image diagonal. Lengths are relative to
   the rig or object size. Every derived value is in ``result.settings``.
 * Verdicts follow the rules listed in each docstring; override them with
   ``options={'verdict': {rule: (warn_at, fail_at) | None}}``. Workflows raise only on unusable
@@ -1301,8 +1301,8 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     Parameters
     ----------
     points : ``C x N x 2`` | ``C x N x J x 2`` pixels (NaN missing; same index = same 3D point),
-        an :class:`aniposelib.bundle.Observations`, or ``C x F x P x J x 2`` with
-        ``init='people'`` (unassociated people).
+        an :class:`aniposelib.bundle.Observations`, or ``C x F x P x J x 2`` unassociated people
+        with ``init='people'``, ``init='vggt'`` or a ``CameraGroup`` init.
     intrinsics : ``CameraGroup`` (lab calibration, VGGT K, nominal; its extrinsics are the
         ``'reference'`` candidate), a 3x3 / ``[C,3,3]`` K, ``{name: dict(matrix=, dist=)}``, or
         None (nominal; needs ``options={'cam_names':, 'sizes':}``).
@@ -1330,12 +1330,30 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     - ``loo_worst_px``: worst per-camera LOO median; warn above 3 nf, fail above 10 nf;
     - ``unplaced_cameras``: cameras the init could not place (fail);
     - ``runaway_cameras``: centres farther than ``runaway_ratio`` x the median distance from the
-      rig centre (fail);
+      rig centre that also moved more than ``runaway_move`` x the rig scale from their init (fail);
+    - ``loo_unsupported``: cameras none of whose held-out points the others triangulate (warn);
+    - ``init_support``: share of the multi-view observations the chosen init explains at the last
+      coarse threshold; warn below 0.3, fail below 0.05 (a wrong VGGT / reference init);
+    - ``two_view_only`` / ``two_view_px`` (fewer than 3 cameras placed): no LOO (warn); worst
+      per-camera 2-view reprojection median, warn above 0.5 %, fail above 2 % of the diagonal;
     - ``min_inlier_frames``: fewest frames with inlier observations of a camera; warn below
       ``min_inlier_frames``, fail below a quarter of it;
     - ``min_inlier_frac``: smallest fraction of a camera's observations kept by the fit; warn
       below 0.5, fail below 0.1;
     - ``scale_rejected``: a requested scale was refused (fail).
+
+    Options (``W2_DEFAULTS``; besides the verdict overrides): ``noise_unit`` ('auto' or a float: 1 =
+    the backend's absolute pixel defaults); ``intrinsics_share`` (None, 'all' or groups of camera
+    names / indices sharing the lens when intrinsics are refined); ``intrinsics_sigma_logf`` /
+    ``intrinsics_sigma_k`` (float or ``{camera: sigma, 'default': sigma}``); ``auto_skip_sfm``
+    (``init='auto'``: no SfM candidate when the given extrinsics are complete and explain >= 70 % of
+    the multi-view observations, >= 50 % per camera); ``track_ids`` (``C x F x P`` ids of 5D points);
+    ``reject`` ('auto' or None: structured frame / keypoint rejection); ``runaway_move``;
+    ``init_check``. 5D points with ``init='vggt'`` (and ``frames=``) or a ``CameraGroup`` init are
+    associated on that rig with :func:`~aniposelib.workflows.associate_views` first. With
+    ``stations=``, ``result.cgroup.stations`` and ``metadata['station_poses']`` hold the per-station
+    poses; ``result.rig_at(t)`` is the calibration at time ``t``. The refined-lens gate reverts
+    lenses that are not invertible over the image. Never raises on bad data (``'fail'`` + reason).
     """
     from ..init import RecipeReport, make_intrinsics_group, select, _has_extrinsics
     from ..init import _refine as _legacy_refine

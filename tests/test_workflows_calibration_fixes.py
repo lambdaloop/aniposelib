@@ -391,3 +391,14 @@ def test_sfm_seed_skips_a_pair_that_triangulates_nothing(mo):
     cg, rep = sfm.from_correspondences(base, p2, pairs=pairs, rng=0)
     assert len(rep.placed) == 7, rep
     assert len(rep.stats['seed_tried']) >= 2 and rep.stats['seed_tried'][0][2] < 30
+
+
+def test_intrinsics_prior_per_camera_sigma_and_partial_group():
+    from aniposelib.params import IntrinsicsPrior
+    true = synth.load_rig('motobs_7cam')
+    names = true.get_names()
+    pr = IntrinsicsPrior(true.subset_cameras([0, 2]), sigma_logf={names[0]: 0.3, 'default': 0.05}, sigma_k=0.1)
+    out = pr.priors_for(true.cameras)
+    assert set(out) == {0, 2}                                 # unmatched cameras: no prior (not by position)
+    assert out[0]['fx'][1] == 0.3 and out[2]['fx'][1] == 0.05
+    assert IntrinsicsPrior(true).priors_for(true.cameras)[3]['fx'][1] == 0.05

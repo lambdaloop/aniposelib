@@ -50,6 +50,12 @@ result = al.evaluate_calibration(cgroup, points2d,
                                  options={'verdict': {'loo_worst_px': (5, 15)}})   # warn above 5 px, fail above 15
 ```
 
+**Pixel thresholds and noisy keypoints.** Internally, the pixel limits start from values that suit clean detections
+(about half a pixel of noise) and grow with the measured noise, but at most twofold, because pose keypoints often have
+a few very wrong detections that make the noise look larger than it is. If you want the limits in plain pixels,
+exactly as the lower-level functions use them, pass `options={'noise_unit': 1}` to `calibrate_from_points`,
+`estimate_scale` or `evaluate_calibration` (`'auto'` is the default).
+
 **Speed.** Functions with a `device=` argument (`calibrate_from_points`, `evaluate_calibration`,
 `estimate_offsets`, `reconstruct_3d`) run their heavy steps on the GPU when there is one (`device='auto'`; pass
 `device='cpu'` to stay on the CPU), and the results always come back as numpy. On the CPU each function uses at most 8 threads, because more
@@ -86,7 +92,9 @@ What it does:
 4. Refines everything together.
 
 Use `fisheye=True` for fisheye lenses. If you already know the lenses, pass an earlier calibration as `intrinsics=` to
-start from it.
+start from it; it may hold only some of the cameras, and the others are worked out from the board. If a camera's lens
+comes out wrong (phones sometimes do), give a rough focal length in pixels as
+`options={'focal_guess': {'phone1': 1700}}`.
 
 **If some cameras never saw the board at the same time as the others.** Imagine cameras on the left of the arena and
 cameras on the right, and the board was only ever shown to one side at a time. Each side can be calibrated, but
@@ -99,8 +107,10 @@ calibration for each group in `result.component_groups`. To join them you have t
   from the board.
 
 The checks: how far the board corners land from where the calibration predicts (compared with the noise in the
-detections), whether every camera saw the board, whether all cameras are connected, and whether the board comes out
-the right shape in 3D.
+detections), whether one camera is much worse than the others, whether a camera ended up far away from the rest,
+whether every camera saw the board, whether all cameras are connected, and whether the board comes out the right shape
+in 3D. With `bridge_points=`, the board check uses the board alone, and the bridge must agree with the final
+calibration (a group of cameras placed back to front fails).
 
 ## Calibrating with an object of known shape: `PointObject`
 
@@ -157,7 +167,29 @@ The result has no real-world scale unless you give it one: the points alone can'
 
 The main check is a **leave-one-camera-out** error: each camera is hidden in turn, the points are rebuilt in 3D from
 the other cameras, and then projected into the hidden camera to see how far off they land. This catches a camera in
-the wrong place, which a plain reprojection error can miss.
+the wrong place, which a plain reprojection error can miss. With only two cameras that check is impossible; you get a
+`'warn'` saying so, and the plain two-camera error instead.
+
+Some situations it handles for you:
+
+- **A good starting calibration.** If the calibration you pass in already explains most of the points, the slower
+  reconstruction from the points alone is skipped.
+- **Lens refinement.** A refined lens is only kept if it predicts held-out data better on every count (the typical
+  error, how many points agree, how many can be checked) and if the lens model still behaves well over the whole
+  image. A camera whose refined lens doesn't is put back to the lens you gave.
+- **Identical cameras.** `options={'intrinsics_share': 'all'}` makes all cameras share one focal length and
+  distortion when lenses are refined (or give groups of camera names, e.g. `[['gopro1', 'gopro2'], ['phone1']]`).
+- **People not yet matched across cameras.** Pass the detections as `(cameras, frames, people, keypoints, 2)` with
+  `init='vggt'` and `frames=` (or a calibration as `init=`), plus your tracker's IDs as
+  `options={'track_ids': ...}`. The people are matched across cameras with that first calibration
+  (`associate_views`), then the calibration is refined from them. If nobody can be matched, you get `'fail'` with
+  the reason: the first calibration was probably wrong.
+- **Cameras that were bumped.** Give `stations=` (for example from `evaluate_calibration(...).moves.stations`) and the
+  frame times in `groups={'time': ...}`. Each position of a bumped camera gets its own pose. `result.rig_at(t)` gives
+  you the calibration at time `t`.
+
+Other options: `intrinsics_sigma_logf` can be given per camera (`{'phone1': 0.3, 'default': 0.05}`) for cameras whose
+focal length is less certain, and `reject=None` turns off the removal of whole frames and keypoints that don't fit.
 
 ## Getting real-world units: `estimate_scale`
 
@@ -181,6 +213,19 @@ It measures the scale in many frames separately and takes the middle value. If t
 it refuses (`result.accepted` is False and the verdict is `'fail'`) rather than give you a scale it doesn't trust.
 `align='ground'` also turns the calibration so that the floor is flat at height zero.
 
+With known lengths, the lengths are measured again on the rescaled calibration with a stricter cut-off. If they don't
+come out right this time, you get a `'warn'` (`result.report['lengths_check']`).
+
+To get the scale from bone lengths but the position and orientation of an older calibration, give both:
+
+```python
+result = al.estimate_scale(cgroup, lengths=dict(points=points2d, pairs=bones, ref=bone_mm),
+                           reference=lab_calibration, align='reference')
+```
+
+The board can also be found directly in the videos: `board_points={'cam1': 'cam1.mp4', 'cam2': 'cam2.mp4', ...}`, with
+`options={'n_frames': 60}` to look at only 60 evenly spaced frames. The frames are the same in every camera.
+
 ## Checking a calibration: `evaluate_calibration`
 
 Use this to check a new calibration, to decide whether last week's calibration can still be used today, or to find
@@ -195,9 +240,23 @@ It reports, for each camera, the leave-one-camera-out error, how many of its poi
 lens model behaves well across the whole image. It also flags pairs of cameras that look at the scene from almost
 the same direction, which triangulate poorly. Some inputs switch on extra checks:
 
-- `times=`, the time of each frame: it looks for cameras that moved during the recording, and when.
-- `reference=`, another calibration: it compares the two.
+- `times=`, the time of each frame: it looks for cameras that moved during the recording, and when. It also splits
+  the recording into about 20 time windows and repeats the leave-one-camera-out check in each one
+  (`result.per_window`). A window where a camera suddenly agrees much less than usual is flagged; this is usually
+  a sync problem or broken data, not the calibration. Set the window length with `options={'loo_window_s': 3600}`.
+- `reference=`, another calibration: it compares the two. A big difference only gives a `'warn'`, because the
+  reference is often the rougher of the two.
 - a board or `PointObject` and its detections: it checks that the board comes out the right shape.
+- `options={'compare_to': {'lab': lab_calibration}}`: compares how well each calibration predicts the same points,
+  with a confidence interval (`result.report['compare_to']`). Give `options['clusters']` (for example a recording or
+  block ID per frame) so the interval accounts for frames that aren't independent.
+
+If your points include cameras the calibration doesn't have, or are in another order, pass their camera names as
+`options={'cam_names': [...]}`. Cameras that aren't in the calibration are dropped, and calibration cameras without
+points are left out of the check; both are listed in `result.report`. To use your own pixel cut-offs for the
+leave-one-camera-out check, pass `options={'tau_tri_px': 5, 'thresholds_px': (5, 8, 10)}`.
+
+With only two cameras there's no leave-one-camera-out check; you get the plain two-camera error and a `'warn'`.
 
 The function only reports how good the calibration is. The decision is up to you, for example a rule that a
 calibration is reused only while every camera stays under some error.

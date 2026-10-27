@@ -50,6 +50,67 @@ Same results (bitwise, or within float rounding where noted), less time and memo
 - `sync.audio_offset(method='spectrogram')`: batched per-frequency correlations; `_lm` Schur blocks via a flat
   `index_add_`.
 
+### Calibration workflows: real-data fixes (1.1)
+
+From the real-data checks of the reference projects (Emory, motor observatory, EvoVision, outdoor mouse, tailcycle,
+dancing). Behaviour changes say how to get the previous behaviour.
+
+- **`options['noise_unit']`** (`'auto'` | float) in `calibrate_from_points`, `estimate_scale`, `evaluate_calibration`
+  and `calibrate_from_board` (bridge): a float forces the unit that multiplies the backend's pixel defaults (1 =
+  absolute pixels). Default `'auto'` = the capped unit (base commit).
+- W2 fine threshold schedule: thresholds above the last coarse threshold are dropped instead of clipped to it, so the
+  rounds keep their ratios (`min(t*u, coarse)` flattened every round to one threshold).
+- W2 verdict noise floor (`settings['noise_floor_px']`, the `loo_worst_px` limits and the intrinsics gate): measured on
+  the points under the refined rig at 2 % of the diagonal (as W4), not at the last schedule threshold (that one is
+  ~threshold / 3 by construction); the old value is `settings['noise_floor_fit_px']`.
+- W2 `refine_intrinsics='auto'`: a refined lens that is not invertible over the image (`quality.lens_validity`) is put
+  back to the given one (that camera, then an extrinsics re-fit); the refinement is kept only if the held-out LOO
+  median gains `intrinsics_gain` **and** the held-out LOO agreement and coverage do not drop. The gate never raises
+  (a failing fit keeps the intrinsics). Old behaviour: none (Emory: 6/11 invalid lenses were accepted).
+- W2 `options['intrinsics_share']` (None | `'all'` | groups of camera names / indices): identical cameras share the lens
+  when intrinsics are refined. `intrinsics_sigma_logf` / `intrinsics_sigma_k` (and W1 `prior_sigma_*`) may be
+  `{camera name: sigma, 'default': sigma}`; `params.IntrinsicsPrior` takes per-camera sigma dicts and matches cameras
+  by position only when no name matches (before: by position for any unmatched camera).
+- W2 `init='auto'` skips SfM when the given extrinsics are complete and explain >= 70 % of the multi-view observations
+  (>= 50 % per camera) at the coarse threshold (`options['auto_skip_sfm']=False` for the old behaviour); new rule
+  `init_support` (share of observations the chosen init explains; warn < 0.3, fail < 0.05).
+- W2 `runaway_cameras`: a camera far from the rig centre is a runaway only if it also moved more than
+  `runaway_move` (0.5) x the rig scale from its init (telephoto rigs). Old: `options={'runaway_move': -1}`.
+- W2 5D points (`C x F x P x J x 2`) with `init='vggt'` (needs `frames=`) or a `CameraGroup` init: the people are
+  associated with `associate_views` on that rig (`options['track_ids']`), then calibrated as 4D input; no identity ->
+  `'fail'` with the VGGT template spread in the reason. `init='people'` forwards `track_ids` to the second
+  association; a failing refinement returns `'fail'` instead of raising; the report always has `per_camera`.
+- W2 `stations=`: two-pass station fit (loose selection, then 10 noise units), the result group carries
+  `cgroup.stations` and `metadata['station_poses']`; `PointCalibration.rig_at(t)` / `workflows.calibration.rig_at`.
+  W2 `options['reject']=None` turns off the structured frame / keypoint rejection.
+- 2-camera rigs: W2 and W4 run (no LOO: rules `two_view_only` (warn) and `two_view_px`), W3 lengths use
+  `min_inliers=min(3, C)`. LOO cameras without any supported point are reported as None with an `loo_unsupported` rule
+  (never 1.8e308); W4 names cameras with a low inlier rate as the likely cause of a low LOO coverage.
+- `init.sfm.from_correspondences`: when the best seed pair triangulates fewer than `min_pair_points` points, the next
+  pairs are tried (`stats['seed_tried']`); this made `test_w2_bad_inputs` flaky across machines.
+- W3 lengths: MSAC threshold 5 noise units (was 10: +16 % scale on Emory), and the bones are re-measured on the scaled
+  rig at half the threshold (`report['lengths_check']`, rule `lengths_check`, warn above `options['lengths_check']`
+  = 3 %). Old: `options={'lengths_kwargs': {'tau': 10 * u}}`. `lengths=` / `board=` together with `reference=` and
+  `align='reference'`: scale from the lengths / board, frame from the reference (`details['reference_scale']`).
+  `board_points={camera: video}` detects the board in the videos (`options['n_frames']`, same frames in every camera).
+- W4: `options['cam_names']` (points in another camera order; `report['cameras_missing' / 'cameras_dropped']`),
+  `tau_px` / `tau_tri_px` / `thresholds_px` (absolute pixels), time-blocked LOO with `times=` (`loo_window_s='auto'`
+  ~ 20 windows, `res.per_window`, rule `bad_windows_frac`; `loo_window_s=None` = off), `compare_to={name: cgroup}` +
+  `clusters` (paired LOO agreement with a cluster bootstrap, `report['compare_to']`). `center_residual_frac` is now
+  warn-only (old: `options={'verdict': {'center_residual_frac': (0.01, 0.05)}}`). `detect_moves` defaults in W4:
+  `z_thr=10` (was 6), and `stations.detect_moves` gets `min_support_frac=0.25` (windows with few points cannot form a
+  step) and `retest=True` (flagged cameras re-tested without the confirmed moved ones). Old:
+  `detect_moves_kwargs=dict(z_thr=6, min_support_frac=None, retest=False)`. An `AffineCamera` group raises a
+  `ValueError` pointing to `AffineCamera.to_pinhole`.
+- `scale.fit_similarity(robust_init=True)`: LMedS start (3-point subsets + leave-one-out), so one runaway camera no
+  longer drags `align_to` / `from_reference` / `quality.compare` (motobs: 669 mm -> 0 median residual). Results on
+  clean data are unchanged; `robust_init=False` for the old fit.
+- W1: `options['focal_guess']` (float or `{camera: f}`, extra lens-ladder starts), `intrinsics=<CameraGroup>` may
+  cover only some cameras; new rules `runaway_cameras` (> `runaway_ratio`=10 x the median distance, fail),
+  `board_reproj_ratio` (worst / median camera, warn 3, fail 8) and, with `bridge_points`, `bridge_inlier_frac`
+  (warn < 0.5, fail < 0.2); with a bridge the board rules use the board observations alone
+  (`settings['noise_floor_board_px']`).
+
 ### Removed
 
 - **`aniposelib.io`.** The file formats are gone: MATLAB (`from/to_matlab`), OpenCV YAML
