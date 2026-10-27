@@ -306,7 +306,9 @@ A few things that help:
 
 - When you pass video files, the sound is lined up with the first video frame using the start times stored in
   the file. Long recordings (more than 5 minutes) are matched in pieces, so slightly fast or slow clocks don't
-  blur the match.
+  blur the match. Each soundtrack is filtered once, and the camera pairs are compared in parallel: 7 cameras with an
+  hour of sound each take about 15 s on 8 CPUs. To run the pairs one at a time (less memory), pass
+  `options={'audio_threads': 1}`.
 - Without a calibration, 2D tracks are still compared camera pair by camera pair (`options={'epipolar_F':
   'self'}` is what it does then; `'calibrated'` or `'both'` with a calibration).
 - If one camera recorded several files, say which camera each file belongs to:
