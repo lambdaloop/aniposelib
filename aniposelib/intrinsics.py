@@ -92,16 +92,17 @@ def _kernel(model, intr, poses, obj, view, jac=False):
     from . import bundle as B
     m, fish = obj.shape[0], is_fisheye(model)
     free = [11 + j for j in (_FISHEYE_FREE[model] if fish else _BROWN_FREE[model])]
-    L = torch.zeros(m, B.N_LOCAL, dtype=torch.float64)
-    L[:, :6] = poses[view]
+    # one local camera vector per view (rotations computed once per view), gathered per point
+    L = torch.zeros(poses.shape[0], B.N_LOCAL, dtype=torch.float64)
+    L[:, :6] = poses
     L[:, 6] = L[:, 7] = intr[0]                    # square pixels: f moves fx and fy
     L[:, 8], L[:, 9] = intr[1], intr[2]
     L[:, free] = intr[3:]
     args = (torch.zeros(m, dtype=torch.float64), torch.zeros(m, 2, dtype=torch.float64),
             torch.full((m,), fish), not fish, fish)
     if not jac:
-        return B._project_local(L, obj, *args)[0]
-    uv, _, dL, _ = B._project_local_jac(L, obj, *args)
+        return B._project_local(L, obj, *args, lidx=view)[0]
+    uv, _, dL, _ = B._project_local_jac(L, obj, *args, lidx=view)
     Ji = torch.stack([dL[:, :, 6] + dL[:, :, 7], dL[:, :, 8], dL[:, :, 9]] + [dL[:, :, s] for s in free], -1)
     return uv, dL[:, :, :6], Ji
 

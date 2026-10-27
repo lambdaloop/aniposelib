@@ -309,9 +309,15 @@ def rig_scale_from_centers(centers):
 _rob = _lm.robust
 
 
-def _project_local(L, Xw, k10, off, is_kb, has_b, has_k):
-    """Per-observation projection. L [M,19] local camera vectors, Xw [M,3] world points."""
-    R = G.rodrigues(L[:, 0:3])
+def _project_local(L, Xw, k10, off, is_kb, has_b, has_k, lidx=None):
+    """Per-observation projection. L [M,19] local camera vectors, Xw [M,3] world points.
+    ``lidx [M]``: L holds unique rows (e.g. one per station) and ``L[lidx]`` are the
+    observations' (rotations are then computed once per row)."""
+    if lidx is None:
+        R = G.rodrigues(L[:, 0:3])
+    else:
+        R = G.rodrigues(L[:, 0:3])[lidx]
+        L = L[lidx]
     pc = torch.einsum('mij,mj->mi', R, Xw) + L[:, 3:6]
     z = pc[:, 2]
     eps = G.FISHEYE_EPS
@@ -392,9 +398,12 @@ def _dist_coef_jac(x, y, d, is_kb, has_b, has_k):
     return out
 
 
-def _project_local_jac(L, Xw, k10, off, is_kb, has_b, has_k):
-    """Projection and analytic Jacobians: uv [M,2], z [M], dL [M,2,19], dX [M,2,3]."""
+def _project_local_jac(L, Xw, k10, off, is_kb, has_b, has_k, lidx=None):
+    """Projection and analytic Jacobians: uv [M,2], z [M], dL [M,2,19], dX [M,2,3]. ``lidx``
+    as in :func:`_project_local`."""
     R, Jr = _rot_and_jac(L[:, 0:3])
+    if lidx is not None:
+        R, Jr, L = R[lidx], Jr[lidx], L[lidx]
     pc = torch.einsum('mij,mj->mi', R, Xw) + L[:, 3:6]
     z = pc[:, 2]
     eps = G.FISHEYE_EPS
@@ -713,9 +722,8 @@ class _Kind:
 def _kind_residual(prob, kind, Lst, Sv):
     st = prob.st_o[kind.sel]
     cam = prob.cam_o[kind.sel]
-    Lo = Lst[st]
-    uvp, z = _project_local(Lo, kind.world(Sv[kind.sidx]), prob.k10[cam], prob.off[cam],
-                            prob.is_kb[cam], prob.has_b, prob.has_k)
+    uvp, z = _project_local(Lst, kind.world(Sv[kind.sidx]), prob.k10[cam], prob.off[cam],
+                            prob.is_kb[cam], prob.has_b, prob.has_k, lidx=st)
     return uvp - prob.uv[kind.sel], z
 
 
@@ -723,10 +731,9 @@ def _kind_linearize(prob, kind, Lst, Sv):
     """Residuals [m,2], depth [m], camera Jacobian [m,2,Q] (active slots), structure Jacobian [m,2,D]."""
     st = prob.st_o[kind.sel]
     cam = prob.cam_o[kind.sel]
-    Lo = Lst[st]
     So = Sv[kind.sidx]
-    uvp, z, dL, dX = _project_local_jac(Lo, kind.world(So), prob.k10[cam], prob.off[cam], prob.is_kb[cam],
-                                        prob.has_b, prob.has_k)
+    uvp, z, dL, dX = _project_local_jac(Lst, kind.world(So), prob.k10[cam], prob.off[cam], prob.is_kb[cam],
+                                        prob.has_b, prob.has_k, lidx=st)
     r = uvp - prob.uv[kind.sel]
     if kind.name == 'rigid':
         Rb, Jb = _rot_and_jac(So[:, :3])
