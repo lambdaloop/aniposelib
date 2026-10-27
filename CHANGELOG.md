@@ -182,6 +182,43 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
     detections (`frame_ids`) when the dense axis would be > 2x larger and > 1000 frames (ids around 1e5 took
     hundreds of MB). Old: `options={'frame_axis': 'dense'}`.
 
+### Moved cameras and static artifacts (1.1, real-data follow-up)
+
+- **`evaluate_calibration` (W4) `options['recover_moves']=True`** (new, on by default with `times=`;
+  `stations.recover_moves`): a camera whose leave-one-out coverage collapses from a time on, and stays collapsed, is
+  re-placed from the points the other cameras triangulate after that time (rotation grid search +-15 deg, then a
+  robust PnP; translation kept only if it clearly helps) and gets a new station in `res.moves` (change point with
+  `recovered=True`, `moves.station_poses`, `res.report['recovered_moves']`). With
+  `options['detections']` (the `associate_views` input) and `options['frame_ids']` (or `C x F x P x J x 2` points,
+  now accepted) the camera's detections are re-associated after the move and returned in `res.points` (same shape as
+  the input); a camera that only lost its association but still fits its old pose is re-associated and reported as
+  'not moved'. Without detections only a camera's agreement where it sees the point counts. Why: the dancing G4 6.2
+  deg bump was invisible to the whole chain because W7 with the old rig could not associate G4 any more.
+  Old behaviour: `options={'recover_moves': False}`.
+- **`detect_moves(retest=True)` is now an explain-away test** (`suspect_frac=0.5`): cameras with a step of z >= 0.5 x
+  `z_thr` are suspects; each suspect's observations are rotated back by its fitted offsets and the other suspects
+  re-tested; the suspect that removes the most step evidence from the others is the mover (`info['retest'][cam]
+  ['explains']`) and the cameras it explains are cleared. A moved camera biases its neighbours' leave-one-out points,
+  so they looked rotated too, and with W4's robust thresholds the mover itself could stay below `z_thr`: on Panoptic
+  with an injected 1 deg re-aim of 00_15, W4 reported 00_03 + 00_24 (both false) and missed 00_15; now 00_15 only.
+  The old re-test (exclude the strongest camera, keep it always) is gone; `retest=False` gives one pass.
+- `stations.Stations.poses` (new): start poses of stations (relative to the camera, rescaled to the rig).
+  `detect_moves` fills them from its fitted rotations, `recover_moves` from its recovered poses, and
+  `bundle_adjust_lm(stations=...)` / `calibrate_from_points(stations=...)` start each station there (before: every
+  station started at its camera's first pose, so a large bump could not converge); W2's station fit selects its
+  observations with the stations at those poses. `MoveReport.corrected_extrinsics` uses `station_poses` when present.
+- `calibrate_from_points(stations=...)`: the per-camera LOO of the verdict judges each observation with its station's
+  pose (`settings['loo_per_station']`); before, a moved camera was judged with its first pose (dancing P2: 70 px
+  instead of ~4 px).
+- **`reconstruct_3d` (W6) static artifacts** (`res.static [N,J]`, `report['static']`, rule `static_frac` warn > 5 %):
+  points in a voxel of `static_voxel` (0.011) x rig scale that is occupied for >= `static_min_s` (40) s in >=
+  `static_min_bins` (5) distinct `static_bin_s` (3600) s bins (the outdoor-mouse sync block; port of the project's
+  `static_flags`). Flag only; `static_remove=True` drops them before filling. Needs hours of data, so short
+  recordings are never flagged; time from `times=` or the frame index at `options['fps']` (30). Off:
+  `options={'static_flag': False}`.
+- `reconstruct_3d` `options['mask_regions']={cam: [(x, y, r), ...]}`: observations inside these image circles are
+  dropped (`report['n_removed']['mask_regions']`).
+
 ### Defaults settled after the real-data check
 
 - `associate_views`: `switch_min_frames` 3 -> 10 (3 over-split a real IoU tracker: 7 identities for 4 people);

@@ -244,6 +244,13 @@ the same direction, which triangulate poorly. Some inputs switch on extra checks
   the recording into about 20 time windows and repeats the leave-one-camera-out check in each one
   (`result.per_window`). A window where a camera suddenly agrees much less than usual is flagged; this is usually
   a sync problem or broken data, not the calibration. Set the window length with `options={'loo_window_s': 3600}`.
+- With `times=` it also tries to re-place a camera that was bumped so hard that the others can't use it any more
+  (its points stop agreeing from some time on, for good). It looks for the new aim that makes the camera agree with
+  the points the other cameras see, and adds it as a new station in `result.moves`. For people tracked with
+  `associate_views`, also pass the raw detections, `options={'detections': detections, 'frame_ids': ...}` (or the
+  `(cameras, frames, individuals, keypoints, 2)` points directly): the bumped camera's detections are then matched
+  to the people again and returned in `result.points`, ready for `calibrate_from_points(..., stations=
+  result.moves.stations)`. Turn it off with `options={'recover_moves': False}`.
 - `reference=`, another calibration: it compares the two. A big difference only gives a `'warn'`, because the
   reference is often the rougher of the two.
 - a board or `PointObject` and its detections: it checks that the board comes out the right shape.
@@ -341,6 +348,10 @@ Other useful things:
 - The output of `associate_views` (with an axis for each animal) can be passed in directly; each animal is
   rebuilt on its own.
 - Telecentric (affine) cameras work too.
+- Static false detections (a sync light, a reflection) that the cameras see for hours show up as 3D points that
+  never move. With `times=` they are flagged in `result.static` (a point that stays within about 1 % of the rig size
+  for 40 s or more, in 5 different hours or more); `options={'static_remove': True}` drops them. If you know where
+  such a thing is in the image, drop it up front: `options={'mask_regions': {'cam1': [(x, y, radius)]}}`.
 
 ## Several animals at once: `associate_views`
 

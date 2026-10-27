@@ -2264,7 +2264,16 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     ``tau_tri_px=5, thresholds_px=(5, 8, 10)``), ``loo_window_s`` (time-blocked LOO window with
     ``times=``; 'auto' ~ 20 windows), ``compare_to={name: CameraGroup}`` with ``clusters=[N]``
     (paired LOO agreement difference with a cluster bootstrap: ``report['compare_to']``),
-    ``detect_moves_kwargs`` (``z_thr`` defaults to 10), ``cam_names``.
+    ``detect_moves_kwargs`` (``z_thr`` defaults to 10), ``cam_names``, ``recover_moves`` (True: with
+    ``times=``, cameras whose LOO coverage collapses for good are re-placed by
+    :func:`aniposelib.stations.recover_moves` and get a station in ``moves``; details in
+    ``report['recovered_moves']``), ``detections`` / ``frame_ids`` (the unassociated
+    ``associate_views`` detections and the frame id of each point row, or of each frame for
+    ``C x F x P x J x 2`` points: a recovered / dropped camera is re-associated, ``result.points``),
+    ``recover_kwargs`` (passed to ``recover_moves``).
+
+    ``points`` may also be ``C x F x P x J x 2`` (``associate_views`` output): rows are (frame,
+    identity), ``times`` may be given per frame.
 
     Contents: LOO per camera (fixed denominator), coverage, inlier rates, lens validity, ray
     angles, plus moves / comparison / board shape when their inputs are given. Project policy
