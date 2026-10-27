@@ -40,7 +40,7 @@ from scipy import signal as _signal
 
 __all__ = [
     'OffsetEstimate', 'OffsetGraph', 'DriftFit', 'WarpEstimate', 'TimeMap', 'AlignedStreams',
-    'align_streams', 'load_audio', 'audio_offset', 'onset_envelope', 'motion_signal', 'motion_offset',
+    'align_streams', 'load_audio', 'media_info', 'audio_offset', 'audio_offset_windowed', 'onset_envelope', 'motion_signal', 'motion_offset',
     'solve_offset_graph', 'fit_drift', 'epipolar_offset', 'frame_offset_sweep', 'soft_dtw', 'soft_dtw_align',
     'SoftDTW', 'fit_fundamental', 'CONVENTION',
 ]
@@ -681,7 +681,8 @@ def load_audio(path, sr=16000, start=0.0, duration=None, backend='auto'):
 
     Backends (``backend='auto'`` tries them in order): ``'soundfile'`` (audio files; ``[sync]`` extra),
     ``'av'`` (PyAV, any container; ``[sync]`` extra), ``'ffmpeg'`` (the ``ffmpeg`` executable). Returns a 1-D
-    numpy array. Sample 0 is the audio stream start (container start offsets are not applied).
+    numpy array. Sample 0 is the audio stream start (container start offsets are not applied; see
+    :func:`media_info` for the audio stream's start time).
     """
     path = str(path)
     errors = []
@@ -699,6 +700,61 @@ def load_audio(path, sr=16000, start=0.0, duration=None, backend='auto'):
             errors.append('{}: {}'.format(be, e))
     raise RuntimeError('could not decode audio from {} ({}). Install the [sync] extra '
                        '(pip install aniposelib-pytorch[sync]) or ffmpeg.'.format(path, '; '.join(errors)))
+
+
+
+def media_info(path):
+    """Stream timing of a media file: ``{'audio_start': s, 'video_start': s, 'avg_frame_rate': Hz,
+    'r_frame_rate': Hz, 'n_frames': int}`` (keys missing / None when unknown), from PyAV or ``ffprobe``.
+
+    ``audio_start - video_start`` is the source (video) time of audio sample 0 (``audio_t0`` of
+    :func:`aniposelib.workflows.estimate_offsets`; :func:`load_audio` starts at the audio stream's
+    first sample). ``avg_frame_rate`` is the real mean frame rate; ``r_frame_rate`` is the container's
+    nominal rate, which can differ (e.g. 20 fps video in a 30 fps container)."""
+    path = str(path)
+    out = {}
+    try:
+        import av
+        with av.open(path) as c:
+            for s in c.streams:
+                st = None if s.start_time is None else float(s.start_time * s.time_base)
+                if s.type == 'audio' and 'audio_start' not in out:
+                    out['audio_start'] = st
+                elif s.type == 'video' and 'video_start' not in out:
+                    out['video_start'] = st
+                    ar = getattr(s, 'average_rate', None)
+                    br = getattr(s, 'base_rate', None) or getattr(s, 'guessed_rate', None)
+                    out['avg_frame_rate'] = float(ar) if ar else None
+                    out['r_frame_rate'] = float(br) if br else None
+                    out['n_frames'] = int(s.frames) if s.frames else None
+        return out
+    except Exception:
+        pass
+    exe = shutil.which('ffprobe')
+    if exe is None:
+        return out
+    import json
+    r = subprocess.run([exe, '-v', 'error', '-show_streams', '-of', 'json', path], capture_output=True)
+    if r.returncode:
+        return out
+
+    def rate(v):
+        try:
+            a, b = str(v).split('/')
+            return float(a) / float(b) if float(b) else None
+        except Exception:
+            return None
+    for s in json.loads(r.stdout.decode('utf-8', 'replace')).get('streams', []):
+        st = s.get('start_time')
+        st = float(st) if st not in (None, 'N/A') else None
+        if s.get('codec_type') == 'audio' and 'audio_start' not in out:
+            out['audio_start'] = st
+        elif s.get('codec_type') == 'video' and 'video_start' not in out:
+            out['video_start'] = st
+            out['avg_frame_rate'] = rate(s.get('avg_frame_rate'))
+            out['r_frame_rate'] = rate(s.get('r_frame_rate'))
+            out['n_frames'] = int(s['nb_frames']) if str(s.get('nb_frames', '')).isdigit() else None
+    return out
 
 
 def _resample(x, sr_in, sr):
@@ -870,6 +926,63 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
         return _finish(off, sig, conf, reasons, diag, 'onset', 's', pair, ea, eb, bin_hz, windows,
                        window_search or 0.1)
     raise ValueError("method must be 'gcc', 'spectrogram' or 'onset'")
+
+
+
+def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 8000.0), windows=24,
+                          min_window=20.0, search=None, min_score=0.05, pair=None):
+    """Offset of long recordings: a coarse lag from the whole clips (``method='spectrogram'``), then
+    ``'gcc'`` in ``windows`` windows (at least ``min_window`` s each, searched +-``search`` s around the
+    coarse lag; default 0.1 s or 100 ppm of the clip length) and a robust line through the window
+    estimates (3 rounds, residuals > 4 MAD dropped). Full-length gcc loses coherence when the clocks
+    drift by tens of ppm over an hour; the windows do not.
+
+    Returns an :class:`OffsetEstimate` (``method='gcc_windowed'``): ``offset`` = the line at the mean
+    window time (the whole-clip average, like ``audio_offset``), ``sigma`` = the window scatter /
+    sqrt(n - 2) (at least the coarse-scale resolution of one sample), ``diagnostics`` with
+    ``window_times`` / ``window_offsets`` (for :func:`fit_drift`), ``window_rate`` (s/s) and the
+    coarse estimate. Unidentifiable when the coarse lag is, or fewer than 3 windows correlate."""
+    a = _np(a).ravel()
+    b = _np(b).ravel()
+    co = audio_offset(a, b, sr, max_lag=max_lag, min_overlap=min_overlap, method='spectrogram', band=band,
+                      windows=0, pair=pair)
+    diag = {'coarse_offset': float(co.offset), 'coarse_identifiable': bool(co.identifiable),
+            'coarse_reasons': list(co.reasons), 'sigma_method': 'windowed_gcc'}
+    if not co.identifiable:
+        return OffsetEstimate(offset=float(co.offset), sigma=float(co.sigma), confidence=float(co.confidence),
+                              identifiable=False, reasons=list(co.reasons), method='gcc_windowed', units='s',
+                              pair=pair, diagnostics=diag)
+    dur = min(len(a), len(b)) / sr
+    search = float(search) if search is not None else max(0.1, 1e-4 * dur)
+    pa, pb = _bandpass(a, sr, band), _bandpass(b, sr, band)
+    nw = int(max(3, min(int(windows), max(3, int(dur // min_window)))))
+    wt, wo, ws = _window_offsets(pa, pb, sr, co.offset, nw, search, min_window=min_window)
+    good = ws > min_score
+    reasons = []
+    if good.sum() < 3:
+        diag.update(window_times=wt, window_offsets=wo, window_scores=ws)
+        return OffsetEstimate(offset=float(co.offset), sigma=float(co.sigma), confidence=float(co.confidence),
+                              identifiable=False, reasons=['windows_failed'], method='gcc_windowed',
+                              units='s', pair=pair, diagnostics=diag)
+    wt, wo, ws = wt[good], wo[good], ws[good]
+    keep = np.ones(len(wt), bool)
+    for _ in range(3):
+        A = np.c_[np.ones(keep.sum()), wt[keep] - wt[keep].mean()]
+        c, *_ = np.linalg.lstsq(A, wo[keep], rcond=None)
+        r = wo - (c[0] + c[1] * (wt - wt[keep].mean()))
+        s = max(1.4826 * float(np.median(np.abs(r[keep]))), 1.0 / sr)
+        new = np.abs(r) < 4 * s
+        if new.sum() < 3 or (new == keep).all():
+            break
+        keep = new
+    t_mid = float(wt[keep].mean())
+    sig = float(max(s / np.sqrt(max(keep.sum() - 2, 1)), 1.0 / (sr * np.sqrt(12))))
+    diag.update(window_times=wt[keep], window_offsets=wo[keep], window_scores=ws[keep],
+                window_rate=float(c[1]), window_t_mid=t_mid, window_spread=s,
+                n_windows=int(len(wt)), n_windows_used=int(keep.sum()))
+    return OffsetEstimate(offset=float(c[0]), sigma=sig, confidence=float(np.median(ws[keep])),
+                          identifiable=True, reasons=reasons, method='gcc_windowed', units='s', pair=pair,
+                          diagnostics=diag)
 
 
 # ------------------------------------------------------------------------------------------------ motion

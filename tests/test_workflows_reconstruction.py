@@ -2,6 +2,7 @@
 synthetic use-case rigs. Kept small (few frames, short audio) so the suite stays fast."""
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -398,3 +399,89 @@ def test_reconstruct_bones_auto(person):
     exact = synth.project(true, p3d)
     r = W.reconstruct_3d(true, exact, bones=bones, options={'n_iters': 100, 'bone_weight': 2.0})
     assert np.nanmedian(r.errors[r.inliers]) < 0.3
+
+
+# ------------------------------------------------------------------ W5 options (1.1 real-data fixes)
+
+def test_offsets_audio_t0_from_container(tmp_path, monkeypatch):
+    """Paths: the audio stream's start time (relative to the video) is the source time of sample 0."""
+    sf = pytest.importorskip('soundfile')
+    from aniposelib import sync as S
+    from test_sync import _delayed
+    sr = 8000
+    rng = np.random.default_rng(5)
+    a = _bursts(sr * 12, sr, rng)
+    b = _delayed(a, sr, 0.75, rng=rng)
+    sf.write(str(tmp_path / 'a.wav'), (0.3 * a).astype('float32'), sr)
+    sf.write(str(tmp_path / 'b.wav'), (0.3 * b).astype('float32'), sr)
+    starts = {'a.wav': 0.010, 'b.wav': 0.066}
+    monkeypatch.setattr(S, 'media_info', lambda p: {'audio_start': starts[os.path.basename(p)],
+                                                    'video_start': 0.0, 'avg_frame_rate': 20.0})
+    res = W.estimate_offsets({'a': str(tmp_path / 'a.wav'), 'b': str(tmp_path / 'b.wav')},
+                             reference='a', options={'audio_sr': sr})
+    assert abs(res.offsets['b'] - (0.75 + 0.056)) < 1e-3, res.offsets
+    assert res.settings['frame_rate'] == 20.0 and 'avg_frame_rate' in res.settings['frame_rate_from']
+    assert 'container' in res.settings['streams']['b']['audio_t0_from']
+    p = [x for x in res.pairs if x['used']][0]
+    assert abs(p['offset'] - p['offset_raw'] - 0.056) < 1e-9
+    # an explicit audio_t0 wins
+    res = W.estimate_offsets({'a': {'audio': str(tmp_path / 'a.wav'), 'audio_t0': 0.0},
+                              'b': {'audio': str(tmp_path / 'b.wav'), 'audio_t0': 0.0}},
+                             reference='a', options={'audio_sr': sr, 'fps': 30.0})
+    assert abs(res.offsets['b'] - 0.75) < 1e-3 and res.settings['frame_rate'] == 30.0
+
+
+def test_offsets_windowed_audio_drift():
+    """Long clips: coarse lag + gcc in windows + a line; the clock rate is fitted."""
+    from test_sync import _delayed
+    sr = 2000
+    rng = np.random.default_rng(2)
+    a = _bursts(sr * 150, sr, rng, n_events=400)
+    b = _delayed(a, sr, 1.3, rate=2e-4, rng=rng)
+    res = W.estimate_offsets({'a': {'audio': (a, sr)}, 'b': {'audio': (b, sr)}}, reference='a',
+                             options={'audio_strategy': 'windowed', 'audio_window_s': 10.0})
+    assert res.verdict != 'fail', res.reasons
+    assert [p['method'] for p in res.pairs] == ['gcc_windowed']
+    assert abs(res.rates['b'] - 2e-4) < 2e-5, res.rates
+    g = 75.0
+    assert abs(res.timemaps['b'].to_source(g) - (1.3 + (1 + 2e-4) * g)) < 2e-3
+    assert res.sigmas['b'] > 1e-5
+
+
+def test_offsets_drift_unidentifiable_and_irregular_times(sync_scene):
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    # no windowed audio estimates: drift=True cannot fit a rate and says so
+    res = W.estimate_offsets({n: {'audio': streams[n]['audio']} for n in names}, reference=names[0],
+                             options={'audio_windows': 0})
+    assert any('drift_unidentifiable' in r for r in res.reasons), res.reasons
+    # container-style per-frame times (2, 1, 2, 1 ticks of 1/30 s = 20 fps on average)
+    p, t = streams[names[0]]['points']
+    ticks = np.cumsum(np.r_[0, np.tile([2, 1], len(t))[:len(t) - 1]]) / 30.0
+    st = {n: {'points': (streams[n]['points'][0], ticks)} for n in names[:2]}
+    res = W.estimate_offsets(st, drift=False)
+    assert abs(res.settings['frame_rate'] - 20.0) < 0.1
+    assert any('irregular_times' in r for r in res.reasons)
+
+
+def test_offsets_self_F_seed_and_refine_rate(sync_scene):
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    pts = {n: {'points': streams[n]['points']} for n in names}
+    # epipolar estimates without a calibration: F fitted per offset
+    res = W.estimate_offsets(pts, reference=names[0], drift=False,
+                             options={'epipolar_F': 'self', 'epipolar_boot': 0})
+    assert any(p['kind'] == 'epipolar' and p.get('note') == 'F self' for p in res.pairs)
+    # a seed skips the estimation; refine on a short window keeps the seed rate ('auto')
+    full = W.estimate_offsets(streams, cgroup=cg, reference=names[0])
+    r2 = W.estimate_offsets(streams, cgroup=cg, reference=names[0], seed=full, refine=True)
+    assert r2.pairs == [] and r2.settings['seeded'] and r2.refined['ok']
+    assert r2.refined['free_rate'] is False
+    assert np.isclose(r2.rates[names[2]], full.rates[names[2]], rtol=1e-9, atol=0)
+    for n in names:
+        assert abs(r2.offsets[n] - off[n]) < 2e-3
+    # stream_camera: a clip named differently from its camera still gets the calibrated F
+    st = {'clipA': {'points': streams[names[0]]['points']}, names[1]: {'points': streams[names[1]]['points']}}
+    r3 = W.estimate_offsets(st, cgroup=cg, drift=False, options={'stream_camera': {'clipA': names[0]},
+                                                                   'epipolar_boot': 0})
+    assert any(p.get('note') == 'F calibrated' for p in r3.pairs)

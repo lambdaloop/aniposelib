@@ -1103,15 +1103,25 @@ _W5_DEFAULTS = {
     'audio_sr': 16000,            # decoding rate for audio given as paths
     'audio_max_lag': None,        # s; None = every lag with min_overlap
     'audio_min_overlap': 8.0,     # s
+    'audio_min_overlap_frac': 0.25,   # and at least this share of the shorter clip (long clips: no edge lags)
     'audio_windows': 6,           # windowed re-estimates (sigma, drift)
     'audio_cross_check': True,    # spectrogram + onset cross-checks of the gcc estimate
+    'audio_strategy': 'auto',     # 'global' | 'windowed' | 'auto' (= 'windowed' for clips > audio_windowed_min_s)
+    'audio_windowed_min_s': 300.0,
+    'audio_window_s': 20.0,       # windowed strategy: shortest window (s)
     'cross_check_frames': 1.0,    # disagreement tolerance, in frame periods (or 1/30 s)
+    'fps': None,                  # frame rate (Hz, or {stream: Hz}) for the frame-unit verdicts; None = from the data
+    'max_time_jitter': 0.05,      # points with per-frame times: share of irregular frame steps before the rate comes from the mean step (warning)
+    'stream_camera': None,        # {stream: camera name}: clips of one camera (default: stream name = camera name)
     'motion_max_lag': 5.0,        # s
+    'epipolar_F': 'auto',         # 'calibrated' (cgroup) | 'self' (F fitted per offset) | 'both' | 'auto'
     'epipolar_search_frames': 10.0,   # half-width of the epipolar search (frames)
     'epipolar_boot': 20,
     'max_residual_frames': 2.0,   # offset graph: drop edges with residual above this (frames)
     'refine_accel_frac': 10.0,    # STBA motion prior: accel_sigma = this x rig scale / s^2
     'refine_offset_sigma_min': 1e-3,   # s, floor on the STBA offset prior sigma
+    'refine_rate': 'auto',        # STBA clock rate: 'free' | 'seed' (keep the audio/seed rate) | 'auto'
+    'refine_free_rate_min_s': 60.0,   # 'auto': free the rate only with a drift fit and points spanning this long
     'refine_rate_sigma': 1e-3,
     'refine_max_iter': 15,
     'refine_extrinsics': False,
@@ -1119,30 +1129,60 @@ _W5_DEFAULTS = {
 }
 
 
-def _load_stream(name, v, sr):
-    """-> dict(audio=(sig, sr, t0)|None, motion=(sig, rate, t0)|None, points=(p2d, rate, t0)|None)."""
+def _is_path(v):
+    return isinstance(v, (str, bytes)) or hasattr(v, '__fspath__')
+
+
+def _media(path):
     from .. import sync as S
-    out = {'audio': None, 'motion': None, 'points': None}
-    if isinstance(v, (str, bytes)) or hasattr(v, '__fspath__'):
+    try:
+        return S.media_info(str(path))
+    except Exception:  # pragma: no cover - defensive
+        return {}
+
+
+def _load_stream(name, v, sr, decode_audio=True, max_jitter=0.05):
+    """-> dict(audio=(sig, sr, t0)|None, motion=(sig, rate, t0)|None, points=(p2d, rate, t0)|None,
+    meta={...})."""
+    from .. import sync as S
+    out = {'audio': None, 'motion': None, 'points': None, 'meta': {}}
+    if _is_path(v):
         v = {'audio': str(v)}
     if not isinstance(v, dict):
         raise ValueError('stream {!r}: expected a video/audio path or a dict with audio= / '
                          'motion= / points=, got {}'.format(name, type(v).__name__))
-    unknown = set(v) - {'audio', 'motion', 'points', 'audio_t0', 'motion_t0'}
+    unknown = set(v) - {'audio', 'motion', 'points', 'audio_t0', 'motion_t0', 'fps'}
     if unknown:
         raise ValueError('stream {!r}: unknown keys {}'.format(name, sorted(unknown)))
+    meta = out['meta']
+    if v.get('fps') is not None:
+        meta['fps'] = float(v['fps'])
     a = v.get('audio')
     if a is not None:
-        if isinstance(a, (str, bytes)) or hasattr(a, '__fspath__'):
-            try:
-                sig = S.load_audio(str(a), sr=sr)
-            except ImportError as e:
-                raise ImportError('stream {!r}: decoding audio needs the [sync] extra '
-                                  '(soundfile / av) or ffmpeg: {}'.format(name, e))
-            a = (sig, sr)
-        sig, asr = a
-        out['audio'] = (np.asarray(to_numpy(sig), float).ravel(), float(asr),
-                        float(v.get('audio_t0', 0.0)))
+        t0 = v.get('audio_t0')
+        meta['audio_t0_from'] = 'given' if t0 is not None else 'default 0'
+        if _is_path(a):
+            info = _media(a)
+            meta['media'] = info
+            if info.get('avg_frame_rate') and 'fps' not in meta:
+                meta['fps_container'] = info['avg_frame_rate']
+            if t0 is None and info.get('audio_start') is not None:
+                # source time of audio sample 0 = audio stream start relative to the first video frame
+                t0 = float(info['audio_start']) - float(info.get('video_start') or 0.0)
+                meta['audio_t0_from'] = 'container (audio start - video start)'
+            if decode_audio:
+                try:
+                    sig = S.load_audio(str(a), sr=sr)
+                except ImportError as e:
+                    raise ImportError('stream {!r}: decoding audio needs the [sync] extra '
+                                      '(soundfile / av) or ffmpeg: {}'.format(name, e))
+                a = (sig, sr)
+            else:
+                a = None
+        if a is not None:
+            sig, asr = a
+            out['audio'] = (np.asarray(to_numpy(sig), float).ravel(), float(asr), float(t0 or 0.0))
+        meta['audio_t0'] = float(t0 or 0.0)
     m = v.get('motion')
     if m is not None:
         sig, rate = m
@@ -1164,9 +1204,24 @@ def _load_stream(name, v, sr):
             if len(t) != len(p2d):
                 raise ValueError('stream {!r}: {} point frames but {} times'.format(
                     name, len(p2d), len(t)))
-            rate, t0 = 1.0 / float(np.median(np.diff(t))), float(t[0])
+            d = np.diff(t)
+            med = float(np.median(d)) if len(d) else 0.0
+            irr = 0.0
+            if med > 0 and len(d) >= 2:
+                r = d / med
+                # steps that are not whole multiples of the median (or shorter than it), or so many
+                # long steps that they cannot be dropped frames: irregular sampling (e.g. container pts
+                # of 20 fps video in a 30 fps time base: 2, 1, 2, 1 ticks)
+                odd = (np.abs(r - np.round(r)) > 0.05) | (r < 0.95)
+                irr = max(float(odd.mean()), float((r > 1.5).mean()) if (r > 1.5).mean() > 0.2 else 0.0)
+            meta['time_jitter'] = irr
+            regular = irr <= max_jitter or len(t) < 3
+            rate = 1.0 / med if regular else (len(t) - 1) / float(t[-1] - t[0])
+            meta['points_rate_from'] = 'median step' if regular else 'mean step (irregular times)'
+            t0 = float(t[0])
         out['points'] = (p2d, rate, t0)
-    if all(x is None for x in out.values()):
+    if out['audio'] is None and out['motion'] is None and out['points'] is None and \
+            not (a is None and v.get('audio') is not None and not decode_audio):
         raise ValueError('stream {!r} has no usable signal'.format(name))
     return out
 
@@ -1180,114 +1235,226 @@ def _resample(x, sr, sr_to):
     return resample_poly(x, fr.numerator, fr.denominator)
 
 
-def _edge(est, pair, offset_shift=0.0):
+def _resample_points(p, rate, rate_to):
+    """[T,J,2] frames at ``rate`` -> frames at ``rate_to`` (linear, NaN-aware; same start time)."""
+    T = p.shape[0]
+    if T < 2:
+        return p
+    tn = np.arange(0, (T - 1) / rate + 1e-12, 1.0 / rate_to) * rate     # in source frames
+    i0 = np.clip(np.floor(tn).astype(int), 0, T - 1)
+    i1 = np.clip(i0 + 1, 0, T - 1)
+    w = (tn - i0)[:, None, None]
+    return (1 - w) * p[i0] + w * p[i1]
+
+
+def _edge(est, pair, offset_shift=0.0, sigma=None):
     """Copy of an OffsetEstimate in seconds for the graph (pair, shifted to source times)."""
     import dataclasses
-    return dataclasses.replace(est, offset=float(est.offset) + offset_shift, pair=pair)
+    kw = dict(offset=float(est.offset) + offset_shift, pair=pair)
+    if sigma is not None:
+        kw['sigma'] = float(sigma)
+    return dataclasses.replace(est, **kw)
+
+
+def _timemap_parts(tm):
+    """TimeMap -> (offset at global 0, rate); knots are dropped."""
+    rate = 1.0 / tm.beta - 1.0
+    return -tm.c / tm.beta, rate
+
+
+def _windows_of(est):
+    wt, wo = est.diagnostics.get('window_times'), est.diagnostics.get('window_offsets')
+    if wt is None or wo is None or len(wo) < 3:
+        return None
+    return np.asarray(wt, float), np.asarray(wo, float)
 
 
 @thread_guard
 def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=False,
-                     options=None, rng=0, device='auto'):
+                     options=None, rng=0, device='auto', seed=None):
     """W5: time offsets between unsynchronised streams. See the module docstring.
 
     Args:
         streams: ``{name: video/audio path | dict}``; the dict may hold ``audio=(signal, sr)``
             or a path (decoded with ``sync.load_audio``, ``[sync]`` extra; ``audio_t0`` = source
-            time of sample 0, default 0), ``motion=(signal, rate)`` (``motion_t0``) and
-            ``points=(p2d [T,J,2], t)`` with ``t`` the source time of every frame or a scalar
-            frame rate (Hz). With ``cgroup``, stream names must be camera names for the
-            epipolar estimates (and STBA).
-        cgroup: optional ``CameraGroup``: epipolar estimates between camera pairs with points.
+            time of sample 0: for paths it is read from the container (audio stream start minus
+            video stream start, ``sync.media_info``), else 0), ``motion=(signal, rate)``
+            (``motion_t0``), ``points=(p2d [T,J,2], t)`` with ``t`` the source time of every
+            frame or a scalar frame rate (Hz), and ``fps`` (the stream's frame rate). With
+            ``cgroup``, stream names must be camera names (or mapped by
+            ``options['stream_camera']``) for the epipolar estimates (and STBA).
+        cgroup: optional ``CameraGroup``: calibrated epipolar estimates between camera pairs with
+            points.
         reference: anchor stream (offset 0); default the best-connected one.
         drift: fit a per-stream clock rate (``sync.fit_drift``) on the windowed audio estimates.
         refine: run ``stba.SpatiotemporalBA`` on the points (needs ``cgroup`` and points in
             >= 2 cameras) with offset priors anchored to the graph estimates.
-        options: overrides of ``_W5_DEFAULTS``.
+        options: overrides of ``_W5_DEFAULTS``: ``audio_strategy`` ('auto': clips longer than
+            ``audio_windowed_min_s`` = 300 s use a coarse spectrogram lag plus gcc in windows and a
+            robust line through them, ``sync.audio_offset_windowed``; 'global'; 'windowed'),
+            ``audio_min_overlap_frac`` (0.25 of the shorter clip), ``fps`` (frame rate for the
+            frame-unit verdicts; default: from the points / motion, else the video's
+            ``avg_frame_rate``, else 30), ``epipolar_F`` ('auto' = the calibrated F with ``cgroup``,
+            else F fitted per offset; 'calibrated', 'self', 'both'), ``stream_camera``
+            ({stream: camera}: several clips of one camera), ``refine_rate`` ('auto': the STBA
+            frees the clock rate only when a drift fit exists and the points span at least
+            ``refine_free_rate_min_s`` = 60 s; 'free'; 'seed' keeps the given rate), ...
         rng: seed for the bootstrap resamples.
         device: ``'auto'`` (cuda if available), ``'cpu'`` or ``'cuda'``: where the STBA
             refinement runs.
+        seed: optional previous result (``OffsetEstimation``) or ``{stream: sync.TimeMap}``: the
+            pair estimates, graph and drift are skipped (audio is not decoded) and these time
+            maps are used as they are, or refined with ``refine=True``.
 
     Verdict rules: ``unidentifiable_streams`` (streams not connected to the reference; fail);
     ``max_sigma_frames`` (largest offset sigma in frame periods; warn > 0.25, fail > 1);
     ``cycle_rms_frames`` (graph inconsistency; warn > 0.25, fail > 1); ``method_disagreements``
     (audio methods disagreeing beyond ``cross_check_frames``; warn > 0); ``drift_unidentifiable``
-    (with ``drift``: streams whose rate could not be fitted although windows exist; warn > 0).
+    (with ``drift``: streams with audio whose rate could not be fitted, also when no windowed
+    estimate exists; warn > 0); ``irregular_times`` (streams whose per-frame times jitter more
+    than ``max_time_jitter``; warn > 0).
     """
     from .. import sync as S
     opts = merge_options(_W5_DEFAULTS, options)
     timer = Timer()
     if not isinstance(streams, dict) or len(streams) < 2:
         raise ValueError('streams must be a dict of >= 2 streams {name: path | dict}')
+    if opts['audio_strategy'] not in ('auto', 'global', 'windowed'):
+        raise ValueError("options['audio_strategy'] must be 'auto', 'global' or 'windowed'")
+    if opts['epipolar_F'] not in ('auto', 'calibrated', 'self', 'both'):
+        raise ValueError("options['epipolar_F'] must be 'auto', 'calibrated', 'self' or 'both'")
+    if opts['refine_rate'] not in ('auto', 'free', 'seed'):
+        raise ValueError("options['refine_rate'] must be 'auto', 'free' or 'seed'")
     names = [str(n) for n in streams]
+    seed_maps = None
+    if seed is not None:
+        seed_maps = dict(seed.timemaps) if hasattr(seed, 'timemaps') else dict(seed)
     with timer('load'):
-        data = {str(n): _load_stream(str(n), v, opts['audio_sr']) for n, v in streams.items()}
+        data = {str(n): _load_stream(str(n), v, opts['audio_sr'], decode_audio=seed is None,
+                                     max_jitter=float(opts['max_time_jitter']))
+                for n, v in streams.items()}
     if reference is not None and str(reference) not in data:
         raise ValueError('reference {!r} is not a stream ({})'.format(reference, names))
     cam_names = list(cgroup.get_names()) if cgroup is not None else []
-    rates = [d['points'][1] for d in data.values() if d['points'] is not None] + \
-            [d['motion'][1] for d in data.values() if d['motion'] is not None]
-    frame_rate = float(np.median(rates)) if rates else 30.0
+    sc = dict(opts['stream_camera'] or {})
+    cam_of = {n: str(sc.get(n, n)) for n in names}
+    # frame rate (verdict units): options > points / motion > per-stream fps > container avg_frame_rate
+    fo = opts['fps']
+    if isinstance(fo, dict):
+        rates = [float(v) for v in fo.values()]
+        rate_from = 'options fps'
+    elif fo is not None:
+        rates, rate_from = [float(fo)], 'options fps'
+    else:
+        rates = [d['points'][1] for d in data.values() if d['points'] is not None] + \
+                [d['motion'][1] for d in data.values() if d['motion'] is not None]
+        rate_from = 'points / motion'
+        if not rates:
+            rates = [d['meta']['fps'] for d in data.values() if 'fps' in d['meta']]
+            rate_from = 'stream fps'
+        if not rates:
+            rates = [d['meta']['fps_container'] for d in data.values() if 'fps_container' in d['meta']]
+            rate_from = 'video avg_frame_rate'
+    if not rates:
+        rates, rate_from = [30.0], 'default 30 fps'
+    frame_rate = float(np.median(rates))
     frame_s = 1.0 / frame_rate
-    settings = {'frame_rate': frame_rate, 'frame_period_s': frame_s,
+    settings = {'frame_rate': frame_rate, 'frame_rate_from': rate_from, 'frame_period_s': frame_s,
                 'cross_check_tol_s': opts['cross_check_frames'] * frame_s,
                 'max_residual_s': opts['max_residual_frames'] * frame_s,
-                'audio_windows': opts['audio_windows'], 'drift': bool(drift),
-                'refine': bool(refine)}
+                'audio_windows': opts['audio_windows'], 'audio_strategy': opts['audio_strategy'],
+                'drift': bool(drift), 'refine': bool(refine), 'seeded': seed is not None,
+                'streams': {n: d['meta'] for n, d in data.items()}}
+    if opts['stream_camera']:
+        settings['stream_camera'] = cam_of
     pairs, edges, windows, disagreements, fallbacks = [], [], {}, [], []
+    irregular = [n for n, d in data.items() if d['meta'].get('time_jitter', 0.0) > opts['max_time_jitter']]
+    for n in irregular:
+        fallbacks.append('stream {}: irregular frame times (jitter {:.2g}); frame rate from the mean '
+                         'step'.format(n, data[n]['meta']['time_jitter']))
 
-    def record(a, b, est, kind, used=True, note=None):
-        d = {'pair': [a, b], 'kind': kind, 'method': est.method, 'offset': float(est.offset),
-             'sigma': float(est.sigma), 'confidence': float(est.confidence),
+    def record(a, b, est, kind, used=True, note=None, shift=0.0, sigma=None):
+        d = {'pair': [a, b], 'kind': kind, 'method': est.method, 'offset_raw': float(est.offset),
+             'offset': float(est.offset) + shift,
+             'sigma': float(est.sigma if sigma is None else sigma), 'confidence': float(est.confidence),
              'identifiable': bool(est.identifiable), 'reasons': list(est.reasons), 'used': used}
         if note:
             d['note'] = note
         pairs.append(d)
 
+    def audio_pair(a, b):
+        (xa, sra, ta), (xb, srb, tb) = data[a]['audio'], data[b]['audio']
+        sr = min(sra, srb)
+        xa, xb = _resample(xa, sra, sr), _resample(xb, srb, sr)
+        shift = tb - ta      # source time of sample 0
+        dur = min(len(xa), len(xb)) / sr
+        mo = min(max(opts['audio_min_overlap'], opts['audio_min_overlap_frac'] * dur), 0.5 * dur)
+        kw = dict(max_lag=opts['audio_max_lag'], min_overlap=mo, pair=(a, b))
+        strategy = opts['audio_strategy']
+        if strategy == 'auto':
+            strategy = 'windowed' if dur > opts['audio_windowed_min_s'] else 'global'
+        tol = opts['cross_check_frames'] * frame_s
+        if strategy == 'windowed':
+            nw = int(np.clip(dur // 120, max(3, opts['audio_windows']), 48))
+            best = S.audio_offset_windowed(xa, xb, sr, windows=nw, min_window=opts['audio_window_s'],
+                                           **kw)
+            record(a, b, best, 'audio', used=True, shift=shift)
+            return best, shift, ta
+        g = S.audio_offset(xa, xb, sr, method='gcc', windows=opts['audio_windows'], **kw)
+        checks = []
+        if opts['audio_cross_check']:
+            for m in ('spectrogram', 'onset'):
+                try:
+                    checks.append(S.audio_offset(xa, xb, sr, method=m, windows=0, **kw))
+                except Exception as e:  # pragma: no cover - defensive
+                    fallbacks.append('audio {} {}-{}: {}'.format(m, a, b, e))
+        best = g
+        agree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) <= tol]
+        disagree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) > tol]
+        if not g.identifiable:
+            # gcc failed: an identifiable spectrogram estimate stands in (re-run with windows, so
+            # its sigma and the drift fit have windowed estimates)
+            alt = [c for c in checks if c.identifiable and c.method == 'spectrogram']
+            if alt:
+                best = S.audio_offset(xa, xb, sr, method='spectrogram', windows=opts['audio_windows'],
+                                      **kw)
+                fallbacks.append('audio {}-{}: gcc unidentifiable, spectrogram used'.format(a, b))
+        elif disagree and not agree:
+            disagreements.append({'pair': [a, b], 'gcc': float(g.offset),
+                                  **{c.method: float(c.offset) for c in disagree}})
+        # sigma floor: the window scatter (a curvature sigma ignores it) and the agreement of the
+        # identifiable methods
+        sig = float(best.sigma)
+        w = _windows_of(best)
+        if w is not None:
+            sig = max(sig, 1.4826 * float(np.median(np.abs(w[1] - np.median(w[1])))) / np.sqrt(len(w[1])))
+        others = [c for c in [g] + checks if c is not best and c.identifiable
+                  and abs(c.offset - best.offset) <= tol]
+        if others:
+            sig = max(sig, 0.5 * max(abs(c.offset - best.offset) for c in others))
+        sig = max(sig, 1.0 / (sr * np.sqrt(12)))
+        best = _edge(best, (a, b), 0.0, sigma=sig)
+        record(a, b, g, 'audio', used=best.method == 'gcc', shift=shift,
+               sigma=sig if best.method == 'gcc' else None)
+        for c in checks:
+            record(a, b, c, 'audio', used=best.method == c.method, note='cross-check', shift=shift,
+                   sigma=sig if best.method == c.method else None)
+        return best, shift, ta
+
     # ---------------------------------------------------------------- pair estimates
-    for a, b in itertools.combinations(names, 2):
+    for a, b in (itertools.combinations(names, 2) if seed is None else []):
         da, db = data[a], data[b]
         coarse = None
         if da['audio'] is not None and db['audio'] is not None:
             with timer('audio'):
-                (xa, sra, ta), (xb, srb, tb) = da['audio'], db['audio']
-                sr = min(sra, srb)
-                xa, xb = _resample(xa, sra, sr), _resample(xb, srb, sr)
-                shift = tb - ta      # source time of sample 0
-                kw = dict(max_lag=opts['audio_max_lag'], min_overlap=min(
-                    opts['audio_min_overlap'], 0.5 * min(len(xa), len(xb)) / sr), pair=(a, b))
-                g = S.audio_offset(xa, xb, sr, method='gcc', windows=opts['audio_windows'], **kw)
-                checks = []
-                if opts['audio_cross_check']:
-                    for m in ('spectrogram', 'onset'):
-                        try:
-                            checks.append(S.audio_offset(xa, xb, sr, method=m, windows=0, **kw))
-                        except Exception as e:  # pragma: no cover - defensive
-                            fallbacks.append('audio {} {}-{}: {}'.format(m, a, b, e))
-                tol = opts['cross_check_frames'] * frame_s
-                best = g
-                agree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) <= tol]
-                disagree = [c for c in checks if c.identifiable and abs(c.offset - g.offset) > tol]
-                if not g.identifiable:
-                    # gcc failed: an identifiable spectrogram estimate stands in
-                    alt = [c for c in checks if c.identifiable and c.method == 'spectrogram']
-                    if alt:
-                        best = alt[0]
-                        fallbacks.append('audio {}-{}: gcc unidentifiable, spectrogram used'.format(a, b))
-                elif disagree and not agree:
-                    disagreements.append({'pair': [a, b], 'gcc': float(g.offset),
-                                          **{c.method: float(c.offset) for c in disagree}})
-                record(a, b, g, 'audio', used=best is g)
-                for c in checks:
-                    record(a, b, c, 'audio', used=best is c, note='cross-check')
+                best, shift, ta = audio_pair(a, b)
                 e = _edge(best, (a, b), shift)
                 edges.append(e)
                 if best.identifiable:
                     coarse = e.offset
-                    wt, wo = g.diagnostics.get('window_times'), g.diagnostics.get('window_offsets')
-                    if best is g and wt is not None and len(wo) >= 3:
-                        windows[(a, b)] = (np.asarray(wt, float) + ta,
-                                           np.asarray(wo, float) + shift)
+                    w = _windows_of(best)
+                    if w is not None:
+                        windows[(a, b)] = (w[0] + ta, w[1] + shift)
         ma = da['motion'] or (None if da['points'] is None else
                               (S.motion_signal(da['points'][0]), da['points'][1], da['points'][2]))
         mb = db['motion'] or (None if db['points'] is None else
@@ -1302,96 +1469,131 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                 est = S.motion_offset(sa, sb, r, max_lag=opts['motion_max_lag'], pair=(a, b))
                 # motion is the weaker signal: an edge only where the pair has no audio estimate
                 use = est.identifiable and coarse is None
-                record(a, b, est, 'motion', used=use)
+                record(a, b, est, 'motion', used=use, shift=tb - ta)
                 if use:
                     e = _edge(est, (a, b), tb - ta)
                     edges.append(e)
                     coarse = e.offset
-        if cgroup is not None and da['points'] is not None and db['points'] is not None \
-                and a in cam_names and b in cam_names:
+        if da['points'] is not None and db['points'] is not None and cam_of[a] != cam_of[b]:
+            calib = cgroup is not None and cam_of[a] in cam_names and cam_of[b] in cam_names
+            mode = opts['epipolar_F']
+            kinds = {'auto': ['calibrated'] if calib else ['self'], 'calibrated': ['calibrated'] if calib else [],
+                     'self': ['self'], 'both': (['calibrated'] if calib else []) + ['self']}[mode]
             (pa, ra, ta), (pb, rb, tb) = da['points'], db['points']
-            if abs(ra - rb) > 1e-6 * ra:
-                fallbacks.append('epipolar {}-{}: different frame rates, skipped'.format(a, b))
-            else:
+            if kinds and abs(ra - rb) > 1e-6 * ra:
+                pb = _resample_points(pb, rb, ra)        # b on a's frame rate (same start time)
+                fallbacks.append('epipolar {}-{}: {:.4g} Hz points resampled to {:.4g} Hz'.format(
+                    a, b, rb, ra))
+            for kind in kinds:
                 with timer('epipolar'):
-                    # centre the search on the coarse (audio / motion) estimate, in frames of b
+                    # centre the search on the coarse (audio / motion) estimate, in frames of a
                     c0 = 0.0 if coarse is None else (coarse - (tb - ta)) * ra
                     w = float(opts['epipolar_search_frames'])
-                    sub = cgroup.subset_cameras([cam_names.index(a), cam_names.index(b)])
-                    est = S.epipolar_offset(pa, pb, sub, search=(c0 - w, c0 + w), rate=ra,
-                                            n_boot=int(opts['epipolar_boot']), rng=rng, pair=(a, b))
-                    record(a, b, est, 'epipolar', used=bool(est.identifiable))
+                    Fc = cgroup.subset_cameras([cam_names.index(cam_of[a]), cam_names.index(cam_of[b])]) \
+                        if kind == 'calibrated' else None
+                    try:
+                        est = S.epipolar_offset(pa, pb, Fc, search=(c0 - w, c0 + w), rate=ra,
+                                                n_boot=int(opts['epipolar_boot']), rng=rng, pair=(a, b))
+                    except Exception as ex:  # a failed estimate is reported, never raised
+                        fallbacks.append('epipolar {} {}-{}: {}'.format(kind, a, b, ex))
+                        continue
+                    record(a, b, est, 'epipolar', used=bool(est.identifiable), shift=tb - ta,
+                           note='F ' + kind)
                     edges.append(_edge(est, (a, b), tb - ta))
 
-    # ---------------------------------------------------------------- graph
-    deg = {n: 0 for n in names}
-    for e in edges:
-        if e.identifiable:
-            deg[e.pair[0]] += 1
-            deg[e.pair[1]] += 1
-    ref = str(reference) if reference is not None else max(names, key=lambda n: (deg[n], -names.index(n)))
-    with timer('graph'):
-        # estimates without a sigma (motion) count as one frame period
-        graph = S.solve_offset_graph(edges, anchor=ref, names=names,
-                                     max_residual=opts['max_residual_frames'] * frame_s,
-                                     default_sigma=frame_s)
-    offsets = dict(graph.offsets)
-    sigmas = {n: (float(graph.sigma[n]) if graph.sigma.get(n) is not None else None) for n in names}
-    identifiable = dict(graph.identifiable)
-
-    # ---------------------------------------------------------------- drift
+    # ---------------------------------------------------------------- graph (or the seed)
     drift_fits, rates_out, drift_fail = {}, {n: 0.0 for n in names}, []
-    if drift:
-        with timer('drift'):
-            meas = {}   # stream -> (t, offset relative to ref)
-            for (a, b), (wt, wo) in windows.items():
-                if a == ref:
-                    meas.setdefault(b, []).append((wt, wo))
-                elif b == ref:
-                    meas.setdefault(a, []).append((wt + wo, -wo))
-            # streams without a direct edge to the reference: compose through a fitted stream
-            for (a, b), (wt, wo) in windows.items():
-                for x, y, sgn in ((a, b, 1), (b, a, -1)):
-                    if y not in meas and x in meas and y != ref:
-                        t_x = np.concatenate([m[0] for m in meas[x]])
-                        o_x = np.concatenate([m[1] for m in meas[x]])
-                        fx = S.fit_drift(t_x, o_x)
-                        tt = wt if sgn == 1 else wt + wo
-                        meas[y] = [(tt, fx.predict(tt) + sgn * wo)]
-            for n, ms in meas.items():
-                t = np.concatenate([m[0] for m in ms])
-                o = np.concatenate([m[1] for m in ms])
-                if len(t) < 3:
-                    continue
-                fit = S.fit_drift(t, o)
-                drift_fits[n] = fit
-                if fit.identifiable:
-                    rates_out[n] = float(fit.rate)
-                else:
-                    drift_fail.append(n)
     a0s = {}      # offset at global time 0 of each stream's affine map
-    for n in names:
-        if offsets.get(n) is None:
-            continue
-        if n in drift_fits and drift_fits[n].identifiable:
-            f = drift_fits[n]
-            # keep the graph offset at the fit's reference time, the fitted rate around it
-            a0s[n] = offsets[n] - f.rate * f.t_ref
-        else:
-            a0s[n] = offsets[n]
-    settings['drift_t_ref'] = {n: float(f.t_ref) for n, f in drift_fits.items()}
+    if seed is None:
+        deg = {n: 0 for n in names}
+        for e in edges:
+            if e.identifiable:
+                deg[e.pair[0]] += 1
+                deg[e.pair[1]] += 1
+        ref = str(reference) if reference is not None else \
+            max(names, key=lambda n: (deg[n], -names.index(n)))
+        with timer('graph'):
+            # estimates without a sigma (motion) count as one frame period
+            graph = S.solve_offset_graph(edges, anchor=ref, names=names,
+                                         max_residual=opts['max_residual_frames'] * frame_s,
+                                         default_sigma=frame_s)
+        offsets = dict(graph.offsets)
+        sigmas = {n: (float(graph.sigma[n]) if graph.sigma.get(n) is not None else None) for n in names}
+
+        # ------------------------------------------------------------ drift
+        if drift:
+            with timer('drift'):
+                meas = {}   # stream -> (t, offset relative to ref)
+                for (a, b), (wt, wo) in windows.items():
+                    if a == ref:
+                        meas.setdefault(b, []).append((wt, wo))
+                    elif b == ref:
+                        meas.setdefault(a, []).append((wt + wo, -wo))
+                # streams without a direct edge to the reference: compose through a fitted stream
+                for (a, b), (wt, wo) in windows.items():
+                    for x, y, sgn in ((a, b, 1), (b, a, -1)):
+                        if y not in meas and x in meas and y != ref:
+                            t_x = np.concatenate([m[0] for m in meas[x]])
+                            o_x = np.concatenate([m[1] for m in meas[x]])
+                            fx = S.fit_drift(t_x, o_x)
+                            tt = wt if sgn == 1 else wt + wo
+                            meas[y] = [(tt, fx.predict(tt) + sgn * wo)]
+                for n, ms in meas.items():
+                    t = np.concatenate([m[0] for m in ms])
+                    o = np.concatenate([m[1] for m in ms])
+                    if len(t) < 3:
+                        continue
+                    fit = S.fit_drift(t, o)
+                    drift_fits[n] = fit
+                    if fit.identifiable:
+                        rates_out[n] = float(fit.rate)
+                    else:
+                        drift_fail.append(n)
+                # streams with audio but no windowed estimate: the rate was never fitted
+                for n in names:
+                    if n != ref and data[n]['audio'] is not None and n not in drift_fits \
+                            and offsets.get(n) is not None:
+                        drift_fail.append(n)
+        for n in names:
+            if offsets.get(n) is None:
+                continue
+            if n in drift_fits and drift_fits[n].identifiable:
+                f = drift_fits[n]
+                # keep the graph offset at the fit's reference time, the fitted rate around it
+                a0s[n] = offsets[n] - f.rate * f.t_ref
+            else:
+                a0s[n] = offsets[n]
+        settings['drift_t_ref'] = {n: float(f.t_ref) for n, f in drift_fits.items()}
+    else:
+        graph = None
+        missing = [n for n in names if seed_maps.get(n) is None]
+        for n in names:
+            if seed_maps.get(n) is not None:
+                a0s[n], rates_out[n] = _timemap_parts(seed_maps[n])
+                if getattr(seed_maps[n], 'knots', ()):
+                    fallbacks.append('seed {}: time-map knots dropped'.format(n))
+        ssig = dict(getattr(seed, 'sigmas', None) or {})
+        sigmas = {n: (ssig.get(n) if ssig.get(n) is not None else (frame_s if n in a0s else None))
+                  for n in names}
+        ref = str(reference) if reference is not None else \
+            (str(seed.reference) if getattr(seed, 'reference', None) in names else
+             min((n for n in names if n in a0s), key=lambda n: abs(a0s[n]), default=names[0]))
+        if missing:
+            fallbacks.append('seed: no time map for {}'.format(missing))
 
     # ---------------------------------------------------------------- STBA refinement
     refined = None
     if refine:
-        seed = {n: S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) for n in a0s}
-        refined = _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings,
-                               fallbacks, timer, device=device)
+        seedtm = {n: S.TimeMap.from_offset(a0s[n], rate=rates_out[n]) for n in a0s}
+        refined = _refine_stba(cgroup, data, names, ref, seedtm, sigmas, drift, opts, settings,
+                               fallbacks, timer, device=device, drift_fits=drift_fits, cam_of=cam_of,
+                               seeded=seed is not None)
         if refined.get('ok'):
             # STBA: true global = seed + delta + rc * (seed - tmid), so the refined offset is
             # seed offset - delta - rc * (g - tmid)
+            free = refined.get('free_rate', False)
             for n, dlt in refined['delta'].items():
-                rc = refined['rate_correction'][n] if drift else 0.0
+                rc = refined['rate_correction'][n] if free else 0.0
                 a0s[n] = a0s[n] - dlt + rc * refined['tmid'][n]
                 rates_out[n] = rates_out[n] - rc
                 sigmas[n] = refined['sigmas'][n]
@@ -1405,20 +1607,24 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     unident = [n for n in names if offsets.get(n) is None]
     sig = [s for n, s in sigmas.items() if n != ref and s is not None and np.isfinite(s)]
     max_sigma_f = max(sig) / frame_s if sig else 0.0
-    cyc = graph.cycle_rms / frame_s if np.isfinite(graph.cycle_rms) else 0.0
+    cyc = graph.cycle_rms / frame_s if graph is not None and np.isfinite(graph.cycle_rms) else 0.0
     rules = [Rule('unidentifiable_streams', len(unident), None, 0,
                   'streams with no identifiable path to the reference {!r}: {}'.format(ref, unident)),
              Rule('max_sigma_frames', max_sigma_f, 0.25, 1.0, 'largest offset sigma / frame period'),
              Rule('cycle_rms_frames', cyc, 0.25, 1.0,
                   'RMS residual of the offset graph / frame period (contradicting estimates)'),
              Rule('method_disagreements', len(disagreements), 0, None,
-                  'audio pairs where spectrogram / onset contradict gcc')]
-    if drift:
+                  'audio pairs where spectrogram / onset contradict gcc'),
+             Rule('irregular_times', len(irregular), 0, None,
+                  'streams with irregular per-frame times (rate from the mean step): {}'.format(irregular))]
+    if drift and seed is None:
+        drift_fail = sorted(set(drift_fail))
         rules.append(Rule('drift_unidentifiable', len(drift_fail), 0, None,
-                          'streams whose clock rate could not be fitted: {}'.format(drift_fail)))
+                          'streams with audio whose clock rate could not be fitted: {}'.format(drift_fail)))
     verdict, reasons, table = evaluate_rules(rules, opts['verdict'])
     report = {'reference': ref, 'pairs': pairs, 'n_edges': len(edges),
-              'rejected': list(graph.rejected), 'cycle_rms_s': graph.cycle_rms,
+              'rejected': list(graph.rejected) if graph is not None else [],
+              'cycle_rms_s': graph.cycle_rms if graph is not None else None,
               'disagreements': disagreements, 'unidentifiable': unident,
               'drift': {n: f.to_dict() for n, f in drift_fits.items()}, 'rules': table}
     return OffsetEstimation(
@@ -1427,44 +1633,59 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         refined=refined, reference=ref, report=report, verdict=verdict, reasons=reasons,
         settings=settings,
         provenance=provenance('estimate_offsets',
-                              inputs={n: [k for k, v in d.items() if v is not None]
+                              inputs={n: [k for k, v in d.items() if v is not None and k != 'meta']
                                       for n, d in data.items()},
                               fallbacks=fallbacks, timings=timer.times))
 
 
 def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, fallbacks,
-                 timer, device='auto'):
+                 timer, device='auto', drift_fits=None, cam_of=None, seeded=False):
     """SpatiotemporalBA on the 2D points, seed times from the graph/drift time maps; returns
     the per-stream constant corrections ``delta`` (refined offset = seed offset - delta)."""
     from .. import stba
     if cgroup is None:
         fallbacks.append('refine: needs cgroup, skipped')
         return {'ok': False, 'reason': 'no cgroup'}
+    cam_of = cam_of or {n: n for n in names}
     cam_names = list(cgroup.get_names())
-    use = [n for n in names if data[n]['points'] is not None and n in cam_names and n in seed]
+    use = [n for n in names if data[n]['points'] is not None and cam_of[n] in cam_names and n in seed]
     if len(use) < 2 or ref not in use:
         fallbacks.append('refine: needs points for the reference and >= 1 other camera')
         return {'ok': False, 'reason': 'not enough cameras with points'}
     if len({data[n]['points'][0].shape[1] for n in use}) != 1:
         return {'ok': False, 'reason': 'cameras have different numbers of keypoints'}
-    sub = cgroup.subset_cameras([cam_names.index(n) for n in use])
+    sub = cgroup.subset_cameras([cam_names.index(cam_of[n]) for n in use])
     cams, pts, uvs, ts, tmid = [], [], [], [], {}
+    span = 0.0
     for k, n in enumerate(use):
         p2d, rate, t0 = data[n]['points']
         glob = seed[n].to_global(t0 + np.arange(p2d.shape[0]) / rate)     # seed global time
         fi, ji = np.nonzero(np.isfinite(p2d).all(-1))
         cams.append(np.full(len(fi), k)); pts.append(ji); uvs.append(p2d[fi, ji]); ts.append(glob[fi])
         tmid[n] = 0.5 * (glob[fi].min() + glob[fi].max()) if len(fi) else 0.0
+        if len(fi):
+            span = max(span, float(glob[fi].max() - glob[fi].min()))
+    rr = opts['refine_rate']
+    fitted = any(drift_fits and n in drift_fits and drift_fits[n].identifiable for n in use)
+    if rr == 'free':
+        free_rate = True
+    elif rr == 'seed':
+        free_rate = False
+    else:
+        # a clock rate from a short window extrapolates badly: free it only with a drift fit (or
+        # a seeded rate) and enough time span
+        free_rate = bool(drift) and (fitted or seeded) and span >= opts['refine_free_rate_min_s']
     obs = stba.TimedObservations(cam=np.concatenate(cams), point=np.concatenate(pts),
                                  uv=np.concatenate(uvs), t=np.concatenate(ts))
     scale = _rig_scale(sub)
     prior = [max(float(sigmas[n] or 0.0), opts['refine_offset_sigma_min']) for n in use if n != ref]
     kw = dict(knot_spacing=settings['frame_period_s'], accel_sigma=opts['refine_accel_frac'] * scale,
               free_offsets='per_camera', offset_prior_sigma=float(np.median(prior)),
-              ref_camera=use.index(ref), free_rate=bool(drift),
+              ref_camera=use.index(ref), free_rate=free_rate,
               rate_prior_sigma=opts['refine_rate_sigma'], extrinsics=bool(opts['refine_extrinsics']),
               max_iter=int(opts['refine_max_iter']))
-    settings['stba'] = dict(kw, accel_sigma_rel=opts['refine_accel_frac'], cameras=use)
+    settings['stba'] = dict(kw, accel_sigma_rel=opts['refine_accel_frac'], cameras=use,
+                            refine_rate=rr, points_span_s=span, device=_device(device))
     try:
         with timer('stba'):
             res = stba.SpatiotemporalBA(sub, obs, device=_device(device), **kw).fit()
@@ -1474,7 +1695,7 @@ def _refine_stba(cgroup, data, names, ref, seed, sigmas, drift, opts, settings, 
     delta = np.asarray(res.delta, float)
     sg = np.asarray(res.delta_sigma_sandwich, float)
     sg = np.where(np.isfinite(sg), sg, np.asarray(res.delta_sigma, float))
-    return {'ok': True, 'cameras': use,
+    return {'ok': True, 'cameras': use, 'free_rate': free_rate,
             'delta': {n: float(delta[k]) for k, n in enumerate(use)},
             'sigmas': {n: (0.0 if n == ref else float(sg[k]) if np.isfinite(sg[k]) else sigmas[n])
                        for k, n in enumerate(use)},
