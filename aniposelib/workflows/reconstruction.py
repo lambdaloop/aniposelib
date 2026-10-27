@@ -6,7 +6,8 @@ association. Composition only: the maths lives in the backend modules
 API
 ---
 ``estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=False,
-                   options=None, rng=0) -> OffsetEstimation``
+                   options=None, rng=0, device='auto', seed=None, refine_windows=None)
+                   -> OffsetEstimation``
     W5. Per-stream time offsets (module convention of :mod:`aniposelib.sync`:
     ``source_time = global_time + offset``) from every available signal per pair: audio
     (``audio_offset`` gcc, cross-checked by the spectrogram and onset methods), motion
@@ -16,7 +17,9 @@ API
     ``solve_offset_graph`` (anchor = ``reference``, default the best-connected stream), then
     ``fit_drift`` per stream on the windowed audio estimates (``drift=True``). ``refine=True``
     runs ``stba.SpatiotemporalBA`` on the 2D points, with offset priors anchored to the graph
-    estimates and a motion prior relative to the rig scale. Nothing is applied: use
+    estimates and a motion prior relative to the rig scale; ``refine_windows`` runs it per
+    window and returns piecewise-linear time maps. Clips of one device share one clock rate
+    (``options['stream_device']`` / ``stream_camera``, ``clip_start``). Nothing is applied: use
     ``result.timemaps`` (``sync.TimeMap`` per stream).
 ``reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
                robust=True, options=None, device='auto') -> Reconstruction``
