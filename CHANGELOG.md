@@ -300,6 +300,25 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   `options={'static_flag': False}`.
 - `reconstruct_3d` `options['mask_regions']={cam: [(x, y, r), ...]}`: observations inside these image circles are
   dropped (`report['n_removed']['mask_regions']`).
+- **`calibrate_from_points` (W2) `times=`** (new keyword, same as `groups['time']`) **drops bad time windows**
+  (`options['drop_bad_windows']=True`, on by default whenever times are given and `stations=` is not): after the
+  robust BA the W4 time-blocked LOO judges windows of `bad_window_s` ('auto' ~ 20 windows); when it is confident
+  (>= `bad_window_min_judged` (5) judged windows, the bad windows' LOO agreement < `bad_window_ratio` (0.5) x the
+  good windows', <= `bad_window_max_frac` (0.5) of the observations in them) their observations are dropped and the
+  rig is refitted; the intrinsics gate, quality and verdict use the kept observations. `report['bad_windows']`
+  (`bad` window starts, `bad_obs_frac`; `applied`, `dropped`, `frac_obs_dropped`, else `reason`), a fallback line.
+  Outdoor mouse 05_04: 9 / 20 windows (28 % of the observations; LOO agreement 0.03 vs 0.93) dropped, project metrics
+  unchanged (LOO agree@8 0.726 / 0.457, >= 3-view points 286.4k); 5_19 part 1: 2 / 23 windows dropped, unchanged;
+  dancing (no stations): 2 candidate windows, not clearly worse (0.58 vs 0.94), nothing dropped. Who passed
+  `groups['time']` without `stations=` gets this too. Old behaviour: `options={'drop_bad_windows': False}`.
+- `reconstruct_3d` `options['surface_flag']` (new, default False; port of the outdoor-mouse `surface_residual` ground
+  QC): a height map (median height per `surface_cell` (0.045) x rig scale cell above the principal plane) is fitted to
+  the non-static points with >= `surface_min_views` (3) views; points with fewer views whose residual is not below
+  `surface_thresh` (0.034) x rig scale are flagged in `res.off_surface` (`res.surface_residual`,
+  `report['surface']`). `workflows.reconstruction.surface_residual` is the function. Flag only.
+- Workflow report JSONs no longer hold the BA's per-observation `excluded` masks (`bundle.BAReport.to_dict` writes
+  `{'shape', 'n_true'}` for masks above 10k entries): the W2 `.report.json` for 897k points was 225 MB. The masks are
+  still in `result.init_report.refine['result'].excluded`.
 
 ### Defaults settled after the real-data check
 

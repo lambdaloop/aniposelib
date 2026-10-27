@@ -146,6 +146,56 @@ def static_flags(X, t, voxel, min_s=40.0, bin_s=3600.0, min_bins=5, dilate=True)
     return (out[:, 0] if sq else out), info
 
 
+def surface_residual(X, ref, cell, min_n=20, min_ref=1000):
+    """Distance of each point to a ground surface (outdoor-mouse ``robust_triangulation.surface_residual``).
+
+    ``X [N,J,3]`` (or ``[N,3]``) points, ``ref`` (same shape, bool) the points the surface is fitted
+    to (e.g. points seen by >= 3 cameras and not static), ``cell`` the height-map cell (world units).
+    The ground plane is the principal plane of the reference points; the surface is the median
+    height above that plane in each ``cell`` x ``cell`` cell with at least ``min_n`` reference
+    points (a height map, so a sloped or uneven ground is followed). The residual is the distance
+    along the plane normal to that surface; inf where the map has no data (off the mapped ground)
+    and NaN for missing points. Returns ``(residual, info)``; ``residual`` is None when there are
+    fewer than ``min_ref`` reference points."""
+    X = np.asarray(X, float)
+    sq = X.ndim == 2
+    if sq:
+        X = X[:, None]
+    ref = np.asarray(ref, bool).reshape(X.shape[:2])
+    fin = np.isfinite(X).all(-1)
+    q = X[ref & fin]
+    info = dict(n_ref=int(len(q)), cell=float(cell), min_n=int(min_n))
+    if len(q) < min_ref or not np.isfinite(cell) or cell <= 0:
+        return None, info
+    mu = np.median(q, 0)
+    Vt = np.linalg.svd(q - mu, full_matrices=False)[2]
+    uvh = (q - mu) @ Vt.T
+    lo = np.percentile(uvh[:, :2], 0.1, 0) - cell
+    nb = np.ceil((np.percentile(uvh[:, :2], 99.9, 0) + cell - lo) / cell).astype(int)
+    ij = np.clip(((uvh[:, :2] - lo) / cell).astype(int), 0, nb - 1)
+    c = ij[:, 0] * nb[1] + ij[:, 1]
+    o = np.lexsort((uvh[:, 2], c))
+    cs, hs = c[o], uvh[o, 2]
+    uc, start, cnt = np.unique(cs, return_index=True, return_counts=True)
+    med = 0.5 * (hs[start + (cnt - 1) // 2] + hs[start + cnt // 2])      # per-cell median height
+    Hmap = np.full(int(nb.prod()), np.nan)
+    keep = cnt >= min_n
+    Hmap[uc[keep]] = med[keep]
+    r = np.full(X.shape[:2], np.nan)
+    a = (X[fin] - mu) @ Vt.T
+    cij = np.floor((a[:, :2] - lo) / cell)
+    inside = (cij >= 0).all(1) & (cij[:, 0] < nb[0]) & (cij[:, 1] < nb[1])
+    rr = np.full(len(a), np.inf)
+    ci = cij[inside].astype(np.int64)
+    h = Hmap[ci[:, 0] * nb[1] + ci[:, 1]]
+    rr[inside] = np.where(np.isfinite(h), np.abs(a[inside, 2] - h), np.inf)
+    r[fin] = rr
+    rf = r[ref & fin]
+    info.update(normal=[float(v) for v in Vt[2]], origin=[float(v) for v in mu], n_cells=int(keep.sum()),
+                ref_median=float(np.median(rf[np.isfinite(rf)])) if np.isfinite(rf).any() else None)
+    return (r[:, 0] if sq else r), info
+
+
 def _mask_regions(pts, regions, names):
     """Drop observations inside ``{cam: [(x, y, r), ...]}`` image circles; returns the count."""
     n = 0
@@ -185,7 +235,9 @@ class Reconstruction(WorkflowResult):
     triangulated, ``point_error [N,J]`` median reprojection error (px) of each triangulated
     point over its inlier views (NaN for filled / missing cells), ``out_of_image [C,N,J]``
     observations outside the image (not used with ``mask_out_of_bounds``), ``static [N,J]``
-    triangulated points in a static voxel (``static_flag``; see :func:`static_flags`). ``report``:
+    triangulated points in a static voxel (``static_flag``; see :func:`static_flags`);
+    ``surface_residual [N,J]`` / ``off_surface [N,J]`` with ``options={'surface_flag': True}`` (see
+    :func:`surface_residual`; None otherwise). ``report``:
     ``per_camera`` usage, ``gaps``, ``bones`` (length CV), ``noise_px``, ``tau_px``, ``rules``."""
     points3d: Any = None
     errors: Any = None
@@ -195,6 +247,8 @@ class Reconstruction(WorkflowResult):
     point_error: Any = None
     out_of_image: Any = None
     static: Any = None
+    surface_residual: Any = None
+    off_surface: Any = None
 
     def save(self, out):
         save_arrays(self, out, {'points3d': self.points3d, 'errors': self.errors,
@@ -228,6 +282,10 @@ _W6_DEFAULTS = {
     'static_min_bins': 5,
     'static_remove': False,    # True: static points are removed (NaN) before filling / bones
     'fps': None,               # frame rate when times= is not given (static flags; None = 30 Hz)
+    'surface_flag': False,     # ground QC: res.off_surface = points seen by < surface_min_views cameras far from the ground surface
+    'surface_cell': 0.045,     # ... height-map cell, x rig scale (outdoor mouse: 0.045 x 4.47 = 0.2)
+    'surface_thresh': 0.034,   # ... off the surface above this height residual, x rig scale (0.15 at rig scale 4.47)
+    'surface_min_views': 3,    # ... the surface is fitted to (non-static) points with >= this many views; fewer are judged
     'verdict': None,
 }
 
@@ -574,7 +632,12 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             for >= ``static_min_s`` (40) s in >= ``static_min_bins`` (5) distinct ``static_bin_s``
             (3600) s bins, i.e. a false detection that stays put for hours; flag only unless
             ``static_remove``; ``report['static']``; time from ``times=`` or the frame index at
-            ``fps`` (30)), ``n_iters``, ``chunk_frames``, ``verdict``, ...
+            ``fps`` (30)), ground QC (``surface_flag`` False; True: a height map of the ground is
+            fitted to the non-static points seen by >= ``surface_min_views`` (3) cameras, cell
+            ``surface_cell`` (0.045) x rig scale, and points seen by fewer cameras whose height
+            residual is not below ``surface_thresh`` (0.034) x rig scale are flagged in
+            ``res.off_surface``; flag only; ``res.surface_residual``, ``report['surface']``; see
+            :func:`surface_residual`), ``n_iters``, ``chunk_frames``, ``verdict``, ...
         device: ``'auto'`` (cuda if available; ``optim_points`` chunks of fewer than
             ``OPTIM_GPU_MIN_CELLS`` frames x joints stay on the CPU, where they are faster),
             ``'cpu'``, ``'cuda'``.
@@ -849,6 +912,26 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     n_views = np.where(have, inl.sum(0), 0)
     with np.errstate(all='ignore'), _quiet():
         pe = np.nanmedian(np.where(inl & have[None], err, np.nan), axis=0)
+    # ground / surface QC (outdoor mouse): points seen by few cameras far from the ground surface
+    surf_res = off_surf = surface_info = None
+    if opts['surface_flag'] and np.isfinite(scale) and scale > 0 and have.any():
+        with timer('surface'):
+            mv = int(opts['surface_min_views'])
+            ref = have & (n_views >= mv) & ~static
+            surf_res, surface_info = surface_residual(np.where(have[..., None], X, np.nan), ref,
+                                                      float(opts['surface_cell']) * scale)
+            if surf_res is None:
+                fallbacks.append('surface_flag: only {} reference points (>= {} views, not static); no '
+                                 'surface check'.format(surface_info['n_ref'], mv))
+            else:
+                thr = float(opts['surface_thresh']) * scale
+                judged = have & (n_views < mv)
+                off_surf = judged & ~(surf_res < thr)
+                surface_info.update(thresh=thr, min_views=mv, n_judged=int(judged.sum()),
+                                    n_off=int(off_surf.sum()),
+                                    off_frac=float(off_surf.sum() / max(judged.sum(), 1)))
+    settings.update(surface_flag=bool(opts['surface_flag']), surface_cell=opts['surface_cell'],
+                    surface_thresh=opts['surface_thresh'], surface_min_views=opts['surface_min_views'])
 
     # report
     per_camera = {}
@@ -879,6 +962,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                       'max_point_err_px': n_point_err, 'mask_regions': n_masked,
                       'static': int(static.sum()) if opts['static_remove'] else 0},
         'static': static_info,
+        'surface': surface_info,
         'noise_px': settings.get('noise_px'), 'tau_px': tau,
         'median_err_px': float(np.nanmedian(err[inl])) if inl.any() else None,
         'median_point_error_px': float(np.nanmedian(pe)) if np.isfinite(pe).any() else None,
@@ -925,6 +1009,8 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     return Reconstruction(
         points3d=out, errors=sq(err), n_views=sq(n_views), inliers=sq(inl), filled=sq(filled),
         point_error=sq(pe), out_of_image=sq(oob), static=sq(static),
+        surface_residual=None if surf_res is None else sq(surf_res),
+        off_surface=None if off_surf is None else sq(off_surf),
         report=report, verdict=verdict, reasons=reasons, settings=settings,
         provenance=provenance('reconstruct_3d',
                               inputs={'shape': [C, N, J], 'cameras': names,

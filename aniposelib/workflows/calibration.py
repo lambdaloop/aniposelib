@@ -1008,6 +1008,11 @@ W2_DEFAULTS = dict(
     auto_skip_sfm=True,       # init='auto': skip SfM when the given extrinsics are complete and fit well
     init_check=True,          # verdict rule init_support (share of points the chosen init explains)
     quality=True, quality_groups=None,
+    drop_bad_windows=True,    # with times= (or groups['time']): drop time windows the time-blocked LOO judges bad, then refit (False: off)
+    bad_window_s='auto',      # ... window (s); 'auto' ~ 20 windows (as W4 loo_window_s)
+    bad_window_ratio=0.5,     # ... W4 rule: a camera is bad in a window below this x its median window; windows are dropped only
+    bad_window_min_judged=5,  # ... if at least this many windows are judged, the bad ones agree < ratio x the good ones
+    bad_window_max_frac=0.5,  # ... and they hold at most this share of the observations
     verdict=None,
 )
 
@@ -1189,6 +1194,90 @@ def _robust_ba(cg, pc, gr, diag, opts, rng):
                     reject_px=None if rej is None else rej.to_dict(), resect_px=rkw, report_tau_px=fine[-1][-1], noise_floor_px=nf2)
     return r2, dict(method='bundle_adjust_robust', before_px=r1.error_before, after_px=r2.error,
                     kept=not (r1.reverted and r2.reverted), result=r2), settings
+
+
+def _judge_windows(le, el, win, agree_t, min_window_obs, ratio, min_bad):
+    """The time-blocked LOO judgement of :func:`evaluate_calibration` (``per_window`` / ``bad``) on
+    LOO errors ``le [C,M]`` / eligibility ``el [C,M]`` and window labels ``win [M]``: a camera is
+    bad in a window when its LOO coverage, or its agreement at ``agree_t`` among the supported
+    points, is below ``ratio`` x its median window; a judged window is bad when ``min_bad``
+    cameras are. Returns ``(labels, bad [W], judged [W], n_bad_cameras [W], agree [W])``."""
+    C = le.shape[0]
+    labs, inv = np.unique(win, return_inverse=True)
+    nW = len(labs)
+    den, hit, sup = np.zeros((C, nW)), np.zeros((C, nW)), np.zeros((C, nW))
+    with np.errstate(invalid='ignore'):
+        for c in range(C):
+            den[c] = np.bincount(inv, weights=el[c], minlength=nW)
+            fin = el[c] & np.isfinite(le[c])
+            sup[c] = np.bincount(inv, weights=fin, minlength=nW)
+            hit[c] = np.bincount(inv, weights=fin & (le[c] < agree_t), minlength=nW)
+        ag = np.where(sup > 0, hit / np.maximum(sup, 1), np.nan)
+        cv = np.where(den > 0, sup / np.maximum(den, 1), np.nan)
+    min_cw = max(10.0, min_window_obs / C)
+    judged = den >= min_cw
+
+    def cmed(a, m):
+        return np.array([np.median(a[c, m[c]]) if m[c].any() else np.nan for c in range(C)])
+    cov_med = cmed(cv, judged)
+    jag = judged & (sup >= min_cw)
+    cam_med = cmed(ag, jag)
+    with np.errstate(invalid='ignore'):
+        badcw = judged & ((cv < ratio * cov_med[:, None]) | (jag & (ag < ratio * cam_med[:, None])))
+        agree = hit.sum(0) / np.maximum(sup.sum(0), 1)
+    okw = judged.any(0) & (den.sum(0) >= min_window_obs)
+    nbad = badcw.sum(0)
+    return labs, okw & (nbad >= min_bad), okw, nbad, agree
+
+
+def _drop_bad_windows(cg, pc, times, u, opts, names):
+    """W2 ``drop_bad_windows``: the time-blocked LOO of :func:`evaluate_calibration` on the fitted
+    rig; observations in the windows judged bad (desynchronised / broken hours) are returned as a
+    mask to drop before the final fit, when the judgement is confident (see W2_DEFAULTS).
+    Returns ``(drop [N] bool or None, report dict)``."""
+    from .. import quality as Q
+    C = pc.shape[0]
+    J = pc.shape[2] if pc.ndim == 4 else 1
+    tt = np.asarray(times, float)
+    tt = tt.reshape(tt.shape[0], -1)[:, 0] if tt.ndim > 1 else tt
+    ws = opts['bad_window_s']
+    ws = _auto_window(tt) if ws == 'auto' else float(ws)
+    rep = dict(window_s=ws, dropped=[], n_obs_dropped=0, frac_obs_dropped=0.0, applied=False)
+    if not ws or not np.isfinite(tt).any():
+        rep['reason'] = 'no time span'
+        return None, rep
+    t0 = float(np.nanmin(tt))
+    win = np.floor((np.nan_to_num(tt, nan=t0) - t0) / ws).astype(int)
+    tau_tri, agree_t = 5.0 * u, 8.0 * u
+    min_others = min(3, max(C - 1, 1))
+    le, el = Q.loo_errors(cg, pc, tau_tri=tau_tri, min_others=min_others)
+    le, el = np.asarray(le, float), np.asarray(el, bool)
+    min_bad = max(2, int(np.ceil(0.25 * C)))
+    labs, bad, okw, nbad, agree = _judge_windows(le, el, np.repeat(win, J), agree_t, 200,
+                                                 opts['bad_window_ratio'], min_bad)
+    good = okw & ~bad
+    rep.update(n_windows=int(len(labs)), n_judged=int(okw.sum()), n_bad=int(bad.sum()), min_bad_cameras=min_bad,
+               agree_px=agree_t, agree_bad=float(np.median(agree[bad])) if bad.any() else None,
+               agree_good=float(np.median(agree[good])) if good.any() else None)
+    nobs = np.isfinite(pc).all(-1).reshape(C, len(tt), J).any(-1).sum(0)        # observations per point
+    drop = np.isin(win, labs[bad])
+    frac = float(nobs[drop].sum() / max(nobs.sum(), 1))
+    rep.update(bad=['{:.6g}'.format(t0 + int(l) * ws) for l in labs[bad]], bad_obs_frac=frac)
+    # confident: enough judged windows, the bad ones clearly worse than the good ones, and most data kept
+    if okw.sum() < opts['bad_window_min_judged']:
+        rep['reason'] = 'fewer than {} judged windows'.format(opts['bad_window_min_judged'])
+    elif not bad.any():
+        rep['reason'] = 'no bad window'
+    elif not good.any() or not rep['agree_bad'] < opts['bad_window_ratio'] * rep['agree_good']:
+        rep['reason'] = 'bad windows not clearly worse than the others (agreement {:.2f} vs {:.2f})'.format(
+            rep['agree_bad'], rep['agree_good'] or float('nan'))
+    elif frac > opts['bad_window_max_frac']:
+        rep['reason'] = 'bad windows hold {:.0%} of the observations (> {:.0%})'.format(
+            frac, opts['bad_window_max_frac'])
+    else:
+        rep.update(applied=True, dropped=list(rep['bad']), n_obs_dropped=int(nobs[drop].sum()), frac_obs_dropped=frac)
+        return drop, rep
+    return None, rep
 
 
 def _fine_schedule(fine, u, cap):
@@ -1415,7 +1504,7 @@ def _scale_spec(scale, p):
 @thread_guard
 def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=None,
                           refine_intrinsics='auto', scale=None, stations=None, options=None, rng=0,
-                          device='auto', out=None):
+                          device='auto', out=None, times=None):
     """W2: calibrate extrinsics from 2D correspondences with known (or nominal) intrinsics.
 
     Parameters
@@ -1441,6 +1530,17 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     stations : :class:`aniposelib.stations.Stations` of moved cameras (needs
         ``groups['time']``): a final extrinsics LM with one pose per station.
     device : ``'auto'`` (cuda when available) for the heavy steps; the result is on the CPU.
+    times : ``[N]`` point times (s; same as ``groups['time']``). With times the fitted rig gets the
+        time-blocked LOO of :func:`evaluate_calibration` (windows of ``bad_window_s``, 'auto' ~ 20
+        windows); when it is confident (>= ``bad_window_min_judged`` (5) judged windows, the bad
+        windows' LOO agreement below ``bad_window_ratio`` (0.5) x the good windows', and at most
+        ``bad_window_max_frac`` (0.5) of the observations in them), the bad windows (desynchronised
+        or broken hours) are dropped and the rig is refitted without them
+        (``options={'drop_bad_windows': False}``: off; not with ``stations=``, whose moved cameras
+        would look like bad windows). ``report['bad_windows']`` says what was
+        judged (``bad`` window starts, ``bad_obs_frac``) and dropped (``applied``, ``dropped``,
+        ``frac_obs_dropped``; else ``reason``);
+        the intrinsics gate, quality and verdict then use the kept observations.
 
     Returns :class:`PointCalibration` (``cgroup, res = calibrate_from_points(...)``).
 
@@ -1504,6 +1604,8 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     if p.shape[0] != len(names):
         raise ValueError('points have {} cameras, intrinsics {}'.format(p.shape[0], len(names)))
     gr = _parse_groups(groups, p.shape[1:-1] if p.ndim < 5 else p.shape[1:2])
+    if times is not None:
+        gr.update(_parse_groups(dict(time=times), p.shape[1:-1] if p.ndim < 5 else p.shape[1:2]))
     diag = _diag(base, p) or 1000.0
     settings['image_diag_px'] = diag
     tau_coarse = float(opts['coarse'][-1] * diag)
@@ -1618,6 +1720,30 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         rpt.errors['refine'] = '{}: {}'.format(type(exc).__name__, exc)
         return finish_fail('refinement of the {} init failed: {}: {}'.format(key, type(exc).__name__, exc),
                            cands, dict(init=key))
+    # ---- bad time windows (with times): drop windows of broken data, then refit
+    if opts['drop_bad_windows'] and 'time' in gr and stations is None and ba is not None and len(present) >= 3:
+        with timer('bad_windows'):
+            try:
+                drop, res.report['bad_windows'] = _drop_bad_windows(
+                    _on_device(cg, dev), pc, gr['time'], float(settings.get('noise_unit', 1.0)), opts, present)
+            except Exception as exc:  # pragma: no cover
+                drop = None
+                rpt.errors['bad_windows'] = '{}: {}'.format(type(exc).__name__, exc)
+        if drop is not None:
+            bw = res.report['bad_windows']
+            fallbacks.append('dropped {} of {} time windows ({:.0%} of the observations) judged bad by the '
+                             'time-blocked LOO before the final fit: {}'.format(
+                                 len(bw['dropped']), bw['n_judged'], bw['frac_obs_dropped'], bw['dropped'][:10]))
+            pc = pc.copy()
+            pc[:, drop] = np.nan
+            try:
+                with timer('bundle_adjust'):
+                    ba, rpt.refine, st = _robust_ba(cg, pc, gr, diag, opts, rng)
+                    settings.update(st)
+            except Exception as exc:
+                rpt.errors['refine'] = '{}: {}'.format(type(exc).__name__, exc)
+                return finish_fail('refinement after dropping bad windows failed: {}: {}'.format(
+                    type(exc).__name__, exc), cands, dict(init=key))
     # verdict noise floor: the points under the refined rig at a loose threshold (as W4), not the
     # errors at the last schedule threshold (that one is ~threshold / 3 by construction)
     # (the fit's own floor still sets the intrinsics gate and the station fit, as before)

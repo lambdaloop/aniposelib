@@ -259,7 +259,11 @@ class BAReport:
         for f in dataclasses.fields(self):
             if f.name in ('p3d', 'obs_errors'):
                 continue
-            d[f.name] = _jsonable(getattr(self, f.name))
+            v = getattr(self, f.name)
+            if f.name == 'excluded':     # large per-observation masks: shape + count (a 1M-point json was 200 MB)
+                v = {k: (dict(shape=list(np.shape(m)), n_true=int(np.sum(m))) if np.size(m) > 10000 else m)
+                     for k, m in v.items()}
+            d[f.name] = _jsonable(v)
         return d
 
     def summary(self):

@@ -194,6 +194,12 @@ Some situations it handles for you:
 - **Cameras that were bumped.** Give `stations=` (for example from `evaluate_calibration(...).moves.stations`) and the
   frame times in `groups={'time': ...}`. Each position of a bumped camera gets its own pose. `result.rig_at(t)` gives
   you the calibration at time `t`.
+- **Hours of broken data.** Give the frame times as `times=` (in seconds). The calibration is then checked hour by
+  hour, or rather in about 20 time windows (the same check as in `evaluate_calibration`). Windows where several cameras
+  suddenly stop agreeing, for example because the cameras went out of sync, are dropped, and the camera positions are
+  fitted again without them. This only happens when the bad windows clearly stand out and hold at most half of the
+  data. `result.report['bad_windows']` lists what was dropped, and why nothing was dropped otherwise.
+  `options={'drop_bad_windows': False}` turns this off. It is not done with `stations=`.
 
 Other options: `intrinsics_sigma_logf` can be given per camera (`{'phone1': 0.3, 'default': 0.05}`) for cameras whose
 focal length is less certain, and `reject=None` turns off the removal of whole frames and keypoints that don't fit.
@@ -389,6 +395,10 @@ Other useful things:
   never move. With `times=` they are flagged in `result.static` (a point that stays within about 1 % of the rig size
   for 40 s or more, in 5 different hours or more); `options={'static_remove': True}` drops them. If you know where
   such a thing is in the image, drop it up front: `options={'mask_regions': {'cam1': [(x, y, radius)]}}`.
+- Animals that walk on the ground: `options={'surface_flag': True}` fits the ground (a height map) to the points that
+  3 or more cameras agree on. Points seen by only 2 cameras that float well above or below it (about 3 % of the rig
+  size) are probably wrong matches; they are flagged in `result.off_surface`. `result.surface_residual` gives each
+  point's height above the ground.
 
 ## Several animals at once: `associate_views`
 
