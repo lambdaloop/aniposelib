@@ -321,31 +321,82 @@ def _col(v):
     return v[:, None]
 
 
-def _brown(x, y, d, jac=False):
+def _dist_terms(d, n):
+    """Which of the first ``n`` distortion coefficients are nonzero (python bools, one host
+    sync), or all True when ``d`` needs gradients. Terms with a zero coefficient contribute
+    exact zeros, so the kernels below skip them without changing any (finite) result."""
+    if d.requires_grad or d.shape[0] == 0:
+        return (True,) * n
+    return tuple(bool(v) for v in (d[:, :n] != 0).any(0).tolist())
+
+
+def _brown(x, y, d, jac=False, terms=None):
     k1, k2, p1, p2, k3, k4, k5, k6 = [_col(d[:, i]) for i in range(8)]
+    nz = _dist_terms(d, 8) if terms is None else terms
+    deg = 3 if nz[4] else (2 if nz[1] else 1)           # highest radial term (k1, k2, k3)
+    tang = nz[2] or nz[3]
+    rational = nz[5] or nz[6] or nz[7]
     r2 = x * x + y * y
-    num = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
-    den = 1 + r2 * (k4 + r2 * (k5 + r2 * k6))
-    rad = num / den
-    xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
-    yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    if deg == 3:
+        num = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
+    elif deg == 2:
+        num = 1 + r2 * (k1 + r2 * k2)
+    else:
+        num = 1 + r2 * k1
+    if rational:
+        den = 1 + r2 * (k4 + r2 * (k5 + r2 * k6))
+        rad = num / den
+    else:
+        rad = num
+    if tang:
+        xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+        yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    else:
+        xd = x * rad
+        yd = y * rad
     if not jac:
         return xd, yd
-    dnum = k1 + r2 * (2 * k2 + 3 * k3 * r2)
-    dden = k4 + r2 * (2 * k5 + 3 * k6 * r2)
-    drad = (dnum * den - num * dden) / (den * den)      # d rad / d r2
-    jxx = rad + 2 * x * x * drad + 2 * p1 * y + 6 * p2 * x
-    jxy = 2 * x * y * drad + 2 * p1 * x + 2 * p2 * y
-    jyx = 2 * x * y * drad + 2 * p1 * x + 2 * p2 * y
-    jyy = rad + 2 * y * y * drad + 6 * p1 * y + 2 * p2 * x
+    if deg == 3:
+        dnum = k1 + r2 * (2 * k2 + 3 * k3 * r2)
+    elif deg == 2:
+        dnum = k1 + r2 * (2 * k2)
+    else:
+        dnum = k1
+    if rational:
+        dden = k4 + r2 * (2 * k5 + 3 * k6 * r2)
+        drad = (dnum * den - num * dden) / (den * den)      # d rad / d r2
+    else:
+        drad = dnum
+    if tang:
+        jxx = rad + 2 * x * x * drad + 2 * p1 * y + 6 * p2 * x
+        jxy = 2 * x * y * drad + 2 * p1 * x + 2 * p2 * y
+        jyx = 2 * x * y * drad + 2 * p1 * x + 2 * p2 * y
+        jyy = rad + 2 * y * y * drad + 6 * p1 * y + 2 * p2 * x
+    else:
+        jxx = rad + 2 * x * x * drad
+        jxy = 2 * x * y * drad
+        jyx = jxy
+        jyy = rad + 2 * y * y * drad
     return xd, yd, (jxx, jxy, jyx, jyy)
 
 
-def _kb_poly(th, d):
+def _kb_poly(th, d, terms=None):
     k1, k2, k3, k4 = [_col(d[:, i]) for i in range(4)]
+    nz = _dist_terms(d, 4) if terms is None else terms
+    deg = 4 if nz[3] else (3 if nz[2] else (2 if nz[1] else 1))
     t2 = th * th
-    thd = th * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
-    dthd = 1 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3 + t2 * 9 * k4)))
+    if deg == 4:
+        thd = th * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+        dthd = 1 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3 + t2 * 9 * k4)))
+    elif deg == 3:
+        thd = th * (1 + t2 * (k1 + t2 * (k2 + t2 * k3)))
+        dthd = 1 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3)))
+    elif deg == 2:
+        thd = th * (1 + t2 * (k1 + t2 * k2))
+        dthd = 1 + t2 * (3 * k1 + t2 * (5 * k2))
+    else:
+        thd = th * (1 + t2 * k1)
+        dthd = 1 + t2 * (3 * k1)
     return thd, dthd
 
 
@@ -477,27 +528,29 @@ def _project_jac_flat(P, X, E, eps=FISHEYE_EPS):
 
 
 def _undistort_flat(P, uv, n_iter=20, tol=1e-12, check_invertible=False, n_fixed=None):
-    """uv [C,N,2] pixels -> normalised [C,N,2] (NaN in = NaN out)."""
+    """uv [C,N,2] pixels -> normalised [C,N,2] (NaN in = NaN out).
+
+    The solvers run on the finite observations only, one model at a time (each observation
+    carries its camera's coefficients), so missing points and the other model's cameras cost
+    nothing."""
     xd0, yd0 = _normalize_pixels(P, uv)
     finite = torch.isfinite(xd0) & torch.isfinite(yd0)
-    xd = torch.where(finite, xd0, torch.zeros_like(xd0))
-    yd = torch.where(finite, yd0, torch.zeros_like(yd0))
-    has_b, has_k = _models_present(P)
-    out_x = torch.zeros_like(xd)
-    out_y = torch.zeros_like(yd)
-    good = finite.clone()
-    if has_b:
-        bx, by, bok = _undistort_brown(P.dist, xd, yd, n_iter, tol, check_invertible, n_fixed)
-        is_b = _col(P.model == 0)
-        out_x = torch.where(is_b, bx, out_x); out_y = torch.where(is_b, by, out_y)
-        good = good & (bok | ~is_b)
-    if has_k:
-        kx, ky, kok = _undistort_kb(P.dist, xd, yd, n_iter, check_invertible)
-        is_k = _col(P.model == 1)
-        out_x = torch.where(is_k, kx, out_x); out_y = torch.where(is_k, ky, out_y)
-        good = good & (kok | ~is_k)
-    out = torch.stack([out_x, out_y], -1)
-    return torch.where(good[..., None], out, torch.full_like(out, float('nan')))
+    out = torch.full(xd0.shape + (2,), float('nan'), dtype=xd0.dtype, device=xd0.device)
+    for model in (0, 1):
+        sel = finite & _col(P.model == model)
+        ci, ni = torch.nonzero(sel, as_tuple=True)
+        if ci.numel() == 0:
+            continue
+        d = P.dist[ci]
+        xd, yd = xd0[ci, ni][:, None], yd0[ci, ni][:, None]
+        if model == 0:
+            x, y, ok = _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed)
+        else:
+            x, y, ok = _undistort_kb(d, xd, yd, n_iter, check_invertible)
+        v = torch.stack([x[:, 0], y[:, 0]], -1)
+        v = torch.where(ok[:, 0, None], v, torch.full_like(v, float('nan')))
+        out = out.index_put((ci, ni), v)
+    return out
 
 
 def _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed=None):
@@ -505,18 +558,31 @@ def _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed=None):
     k = [_col(d[:, i]) for i in range(8)]
     k1, k2, p1, p2, k3, k4, k5, k6 = k
     x, y = xd, yd
+    nz = _dist_terms(d, 8)          # zero terms are skipped (exactly; see _dist_terms)
+    deg = 3 if nz[4] else (2 if nz[1] else 1)
+    tang, rational = nz[2] or nz[3], nz[5] or nz[6] or nz[7]
     n_fixed = min(5, n_iter) if n_fixed is None else n_fixed
     for _ in range(n_fixed):
         r2 = x * x + y * y
-        icdist = (1 + r2 * (k4 + r2 * (k5 + r2 * k6))) / (1 + r2 * (k1 + r2 * (k2 + r2 * k3)))
-        dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
-        dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
-        x = (xd - dx) * icdist
-        y = (yd - dy) * icdist
+        if deg == 3:
+            num = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
+        elif deg == 2:
+            num = 1 + r2 * (k1 + r2 * k2)
+        else:
+            num = 1 + r2 * k1
+        icdist = (1 + r2 * (k4 + r2 * (k5 + r2 * k6))) / num if rational else 1 / num
+        if tang:
+            dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+            dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+            x = (xd - dx) * icdist
+            y = (yd - dy) * icdist
+        else:
+            x = xd * icdist
+            y = yd * icdist
     fx, fy = x, y
     # Newton
     for it in range(n_iter - n_fixed):
-        ex, ey, (jxx, jxy, jyx, jyy) = _brown(x, y, d, jac=True)
+        ex, ey, (jxx, jxy, jyx, jyy) = _brown(x, y, d, jac=True, terms=nz)
         ex = ex - xd; ey = ey - yd
         det = jxx * jyy - jxy * jyx
         det = torch.where(torch.abs(det) > 1e-30, det, torch.full_like(det, 1e-30))
@@ -528,9 +594,9 @@ def _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed=None):
             if step.numel() == 0 or float(step.max()) < tol:
                 break
     # keep the better of fixed point and Newton (Newton can run off in non-invertible regions)
-    rx, ry, (jxx, jxy, jyx, jyy) = _brown(x, y, d, jac=True)
+    rx, ry, (jxx, jxy, jyx, jyy) = _brown(x, y, d, jac=True, terms=nz)
     res_n = torch.hypot(rx - xd, ry - yd)
-    fxd, fyd = _brown(fx, fy, d)
+    fxd, fyd = _brown(fx, fy, d, terms=nz)
     res_f = torch.hypot(fxd - xd, fyd - yd)
     use_n = torch.isfinite(res_n) & ~(res_n > res_f)
     x = torch.where(use_n, x, fx); y = torch.where(use_n, y, fy)
@@ -539,7 +605,7 @@ def _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed=None):
         res = torch.where(use_n, res_n, res_f)
         det = torch.where(use_n, jxx * jyy - jxy * jyx, torch.ones_like(res))
         if not bool(use_n.all()):
-            _, _, (a, b, c, e) = _brown(x, y, d, jac=True)
+            _, _, (a, b, c, e) = _brown(x, y, d, jac=True, terms=nz)
             det = a * e - b * c
         # the solution must lie in the central, monotone part of the radial map (the outer
         # branch past a fold also has det > 0, as both radial factors are negative there)
@@ -560,12 +626,13 @@ def _undistort_kb(d, xd, yd, n_iter, check_invertible, eps=FISHEYE_EPS, tol=1e-8
     thd = torch.sqrt(torch.where(r_ok, td2, torch.ones_like(td2)))
     thd_c = torch.clamp(thd, max=_HALF_PI)
     th = thd_c.clone()
+    nz = _dist_terms(d, 4)
     for _ in range(n_iter):
-        f, fp = _kb_poly(th, d)
+        f, fp = _kb_poly(th, d, terms=nz)
         f = f - thd_c
         fp = torch.where(torch.abs(fp) > eps, fp, torch.ones_like(fp))
         th = th - f / fp
-    f, fp = _kb_poly(th, d)
+    f, fp = _kb_poly(th, d, terms=nz)
     resid = torch.abs(f - thd_c)
     ok = torch.isfinite(th) & (th >= 0) & (resid <= tol) & (thd <= _HALF_PI) & (th < _HALF_PI)
     if check_invertible:
@@ -630,6 +697,23 @@ def _reproj_err_flat(P, X, uv, E):
     e = torch.where(z > 0, e, torch.full_like(e, float('inf')))
     missing = ~torch.isfinite(uv).all(-1)
     return torch.where(missing, torch.full_like(e, float('nan')), e)
+
+
+def _reproj_err_masked(P, X, uv, E, mask, max_density=0.6):
+    """:func:`_reproj_err_flat` evaluated only where ``mask [C,N]`` (NaN elsewhere): one camera
+    at a time on its masked points, so sparse observations (points seen by few of many
+    cameras) cost what they need. Dense masks use the full kernel."""
+    C, N = mask.shape
+    if C <= 1 or N == 0 or float(mask.sum()) > max_density * C * N:
+        return _reproj_err_flat(P, X, uv, E)
+    out = torch.full((C, N), float('nan'), dtype=X.dtype, device=X.device)
+    for c in range(C):
+        idx = torch.nonzero(mask[c])[:, 0]
+        if idx.numel() == 0:
+            continue
+        Ec = E[c:c + 1] if E.ndim == 3 else E[c:c + 1, idx]
+        out[c, idx] = _reproj_err_flat(P.subset([c]), X[idx], uv[c:c + 1, idx], Ec)[0]
+    return out
 
 
 @returns_like_input()
