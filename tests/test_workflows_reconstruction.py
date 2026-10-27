@@ -62,6 +62,51 @@ def test_reconstruct_person_gaps_bones(person):
     nf = W.reconstruct_3d(true, p2d, fill='none')
     assert np.isnan(nf.points3d[40:46, 3]).all()
 
+def test_surface_residual_height_map():
+    """surface_residual (outdoor-mouse ground QC): a curved ground is followed by the height map,
+    points above it get their height, points off the mapped ground get inf."""
+    from aniposelib.workflows.reconstruction import surface_residual
+    rng = np.random.default_rng(0)
+    uv = rng.uniform(-1, 1, size=(6000, 2))
+    X = np.c_[uv, 0.05 * uv[:, 0] ** 2 + 0.002 * rng.normal(size=6000)]
+    ref = np.ones(6000, bool)
+    Y = np.array([[0.5, 0.5, 0.0125 + 0.15], [0.0, 0.0, 0.0], [5.0, 5.0, 0.0], [np.nan, 0, 0]])
+    r, info = surface_residual(np.r_[X, Y], np.r_[ref, np.zeros(4, bool)], cell=0.2)
+    assert np.abs(info['normal'][2]) > 0.99 and info['n_ref'] == 6000
+    assert np.nanpercentile(r[:6000], 95) < 0.02          # the curved ground is followed (a plane is not)
+    assert r[6000] == pytest.approx(0.15, abs=0.02) and r[6001] < 0.01
+    assert np.isinf(r[6002]) and np.isnan(r[6003])
+    assert surface_residual(X[:500], ref[:500], cell=0.2)[0] is None      # too few reference points
+
+
+def test_reconstruct_surface_flag():
+    """W6 options surface_flag: 2-view points far above the ground (false matches) are flagged in
+    res.off_surface, 2-view points on the ground are not; off by default."""
+    true = synth.load_rig('outdoor_9cam')
+    X = synth.trajectory(true, 4000, seed=1)
+    mu = X.mean(0)
+    Vt = np.linalg.svd(X - mu, full_matrices=False)[2]
+    a = (X - mu) @ Vt.T
+    a[:, 2] = 0.001 * np.random.default_rng(2).normal(size=len(a)) * synth.rig_scale(true)
+    X = mu + a @ Vt                                          # the animal walks on a (tilted) ground
+    up = Vt[2] * 0.2 * synth.rig_scale(true)
+    X[-200:] += up                                           # false points well above the ground ...
+    p2 = synth.add_noise(synth.project(true, X), 0.5, seed=3)
+    seen = np.isfinite(p2[..., 0])
+    for n in list(range(3800, 4000)) + list(range(3000, 3200)):   # ... and 200 ground points seen by 2 cameras only
+        p2[np.flatnonzero(seen[:, n])[2:], n] = np.nan
+    ok = np.isfinite(p2[..., 0]).sum(0) >= 2
+    assert W.reconstruct_3d(true, p2, fill='none').off_surface is None
+    res = W.reconstruct_3d(true, p2, fill='none', options={'surface_flag': True})
+    off, sr = np.asarray(res.off_surface), np.asarray(res.surface_residual)
+    info = res.report['surface']
+    assert info['n_judged'] >= 380 and abs(np.dot(info['normal'], Vt[2])) > 0.99
+    assert off[3800:4000][ok[3800:4000]].mean() > 0.95
+    assert off[3000:3200][ok[3000:3200]].mean() < 0.05 and not off[:3000].any()
+    assert np.nanmedian(sr[3800:4000]) == pytest.approx(0.2 * synth.rig_scale(true), rel=0.15)
+    json.dumps(res.to_dict()) if hasattr(res, 'to_dict') else None
+
+
 
 @pytest.mark.parametrize('scale', [1e-3, 1.0, 1e3])
 def test_reconstruct_unit_scale_invariant(person, scale):
