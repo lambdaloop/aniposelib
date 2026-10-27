@@ -101,17 +101,25 @@ def _shifted(cg, cam, d):
     return g
 
 
-@pytest.mark.parametrize('frac', [0.03, 0.12])
-def test_w4_static_offset_is_not_a_move(frac):
+@pytest.mark.parametrize('rig_name, frac, axis', [('fisheye_5cam', 0.04, 0), ('motobs_7cam', 0.04, 1)])
+def test_w4_static_offset_is_not_a_move(rig_name, frac, axis):
+    """A camera whose position is wrong for the whole trial, while the subject walks towards it:
+    its error grows slowly, which recover_moves / detect_moves took for a move (Panoptic 00_15)."""
     from aniposelib.workflows import evaluate_calibration
-    rig = synth.load_rig('motobs_7cam')
-    fn = synth.smooth_tracks(rig, n_points=6, amp=0.4, seed=1)
+    rig = synth.load_rig(rig_name)
+    cen, s = synth.camera_centers(rig), synth.rig_scale(rig)
+    fn = synth.smooth_tracks(rig, n_points=6, amp=0.1, seed=1)
     t = np.arange(0, 40, 1 / 10)
     X = np.stack([fn(p, t) for p in range(6)], 1)
+    d = cen[2] - X.reshape(-1, 3).mean(0)
+    X = X + (t / 40 - 0.5)[:, None, None] * 0.8 * s * (d / np.linalg.norm(d))[None, None]
     p2 = synth.add_noise(synth.project(rig, X), 0.7, seed=2)
-    bad = _shifted(rig, 2, [frac * synth.rig_scale(rig), 0, 0])     # wrong for the whole trial
+    bad = _shifted(rig, 2, np.eye(3)[axis] * frac * s)
+    old = evaluate_calibration(bad, p2, times=t, options={'moves_before_ratio': None, 'static_bad_ratio': None})
+    assert old.moves.moved == [rig.get_names()[2]]                    # the 1.1 final behaviour
     ev = evaluate_calibration(bad, p2, times=t)
     assert ev.moves.moved == [], (ev.moves.change_points, ev.report.get('moves_demoted'))
+    assert ev.report.get('moves_demoted') or ev.report.get('static_bad_cameras') == [rig.get_names()[2]]
     assert any('loo' in r for r in ev.reasons)                       # the LOO rules report it
 
 

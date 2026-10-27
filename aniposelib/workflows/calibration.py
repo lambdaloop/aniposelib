@@ -2796,7 +2796,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         L0 = float(moves.window_s)
         min_n = opts['min_window_obs'] / C
 
-        def agree_ratio(ci, oth, t_cp, after, den):
+        def agree_ratio(ci, oth, t_cp, after, den, hit=hit_):
             """camera / others' agreement just before (after) t_cp, over the shortest window (from
             one detection window, doubling up to 16) with enough observations; (ratio, length)."""
             L = L0
@@ -2804,10 +2804,30 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 m = ((tf_ >= t_cp) & (tf_ < t_cp + L)) if after else ((tf_ < t_cp) & (tf_ >= t_cp - L))
                 nc, no = den[ci, m].sum(), den[oth][:, m].sum()
                 if nc >= min_n and no >= min_n:
-                    a_o = hit_[oth][:, m].sum() / no
-                    return (float(hit_[ci, m].sum() / nc / a_o) if a_o > 0 else None), L
+                    a_o = hit[oth][:, m].sum() / no
+                    return (float(hit[ci, m].sum() / nc / a_o) if a_o > 0 else None), L
                 L *= 2
             return None, None
+        loo2 = {}
+
+        def loo_2views():
+            # the move tests' own LOO (>= 2 other views, the static-bad cameras left out): with few
+            # cameras the W4 LOO (>= 3 others) leaves too few eligible points around a step
+            if not loo2:
+                from .. import geometry as G
+                from ..stations import _loo_quality
+                P2 = G.pack(cg)
+                fl = _flat(pm)
+                e2 = np.zeros(fl.shape[:2], bool)
+                h2 = np.zeros(fl.shape[:2], bool)
+                for c in range(C):
+                    if c in static_bad:
+                        continue
+                    s_, h_ = _loo_quality(P2, fl, c, tau, 2, agree_t)
+                    e2[c] = s_ & np.isfinite(fl[c]).all(-1)
+                    h2[c] = h_ & e2[c]
+                loo2.update(el=e2, hit=h2)
+            return loo2['el'], loo2['hit']
         first = {}
         for cp in moves.change_points:
             first[cp['camera']] = min(first.get(cp['camera'], np.inf), float(cp['time']))
@@ -2831,6 +2851,10 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 continue
             rb, _ = agree_ratio(ci, oth, t_cp, False, el_)
             ra, _ = agree_ratio(ci, oth, t_cp, True, el_)
+            if ra is None or rb is None:
+                e2, h2 = loo_2views()
+                rb, _ = agree_ratio(ci, oth, t_cp, False, e2, h2)
+                ra, _ = agree_ratio(ci, oth, t_cp, True, e2, h2)
             cp['agree_after_ratio'] = ra
             if ra is not None and rb is not None and ra >= opts['moves_after_ratio'] * rb:
                 demoted.append(dict(cp, reason='agreement unchanged across a {:.3g} px step (ratio {:.2f} -> {:.2f})'.format(
