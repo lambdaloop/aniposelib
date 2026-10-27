@@ -93,7 +93,7 @@ dancing). Behaviour changes say how to get the previous behaviour.
   rig at half the threshold (`report['lengths_check']`, rule `lengths_check`, warn above `options['lengths_check']`
   = 3 %). Old: `options={'lengths_kwargs': {'tau': 10 * u}}`. `lengths=` / `board=` together with `reference=` and
   `align='reference'`: scale from the lengths / board, frame from the reference (`details['reference_scale']`).
-  `board_points={camera: video}` detects the board in the videos (`options['n_frames']`, same frames in every camera).
+  `board_points={camera: video}` detects the board in the (synchronised) videos as W1 does (see below).
 - W4: `options['cam_names']` (points in another camera order; `report['cameras_missing' / 'cameras_dropped']`),
   `tau_px` / `tau_tri_px` / `thresholds_px` (absolute pixels), time-blocked LOO with `times=` (`loo_window_s='auto'`
   ~ 20 windows, `res.per_window`, rule `bad_windows_frac`; `loo_window_s=None` = off), `compare_to={name: cgroup}` +
@@ -112,6 +112,25 @@ dancing). Behaviour changes say how to get the previous behaviour.
   `board_reproj_ratio` (worst / median camera, warn 3, fail 8) and, with `bridge_points`, `bridge_inlier_frac`
   (warn < 0.5, fail < 0.2); with a bridge the board rules use the board observations alone
   (`settings['noise_floor_board_px']`).
+- **W1 / W3 video detection (motor-observatory calibration videos, 12 x 1440x1080):** frame-major sequential sampling,
+  new `boards.detect_videos(board, videos, frame_indices=|skip=, max_boards=, max_frames=, min_cameras=2,
+  n_workers=)`: all cameras' videos are read together front to back (`grab`/`retrieve`, no OpenCV seeking), the board
+  is detected in every `skip`-th frame (or `n_frames` evenly spaced, or `frame_indices`) of every camera at once
+  (batched across cameras for DeepCharuco), and reading stops early once every camera has `max_boards` boards (W1,
+  default 200) or `max_frames` frames show the board in >= 2 cameras (W3, default 200); `None` = read everything.
+  The densify-after-detection sampling of `detect_video` is no longer used by W1. `n_workers` default `'auto'`
+  (up to 8 threads; was 1). New W1 option `n_frames`, W3 `frame_indices`. `settings['detection']` (W1) /
+  `report['detection']` (W3) say what was read and why it stopped. A missing video raises `FileNotFoundError`
+  (the per-video reader printed a warning and gave no rows); per-camera `frame_indices` still use
+  `CameraGroup.get_rows_videos`. Old behaviour: `CameraGroup.get_rows_videos` (unchanged) and pass the rows.
+  Same 60 frames: identical detections and scale, 238 -> 75 s (W3, L4 node, 35 s clips); W3 default 589 -> 78 s,
+  W1 617 -> 93 s (DeepCharuco), 2214 -> 210 s (OpenCV).
+- **DeepCharuco in the workflows: input scale `'auto'`** (`DeepCharucoDetector(scale='auto')`: longest side to
+  720 px, never up), unless `detector_kwargs['scale']` is given. At scale 1, 1440x1080 frames gave 112 boards in 840
+  frames (OpenCV 312, scale 0.5: 249), missed a camera entirely (W1 `fail`) and was 4x slower. Old:
+  `options={'detector_kwargs': {'scale': 1.0}}`. `DeepCharucoDetector` itself keeps `scale=1.0`.
+- `DeepCharucoDetector(max_batch_pixels=4e6)`: frames per network call capped by pixels, halved on CUDA OOM
+  (batch 16 of 1440x1080 frames ran out of memory on a 22 GB L4).
 
 ### Data workflows W5-W7: real-data fixes (1.1)
 
