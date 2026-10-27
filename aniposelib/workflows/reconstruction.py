@@ -1007,7 +1007,8 @@ def _split_tracks(track_ids, names, groups, min_run):
 def _stitch(cents, link_gate, max_gap):
     """cents: list over identities of (frame ids [n], centroids [n,3]) -> identity -> new id.
     Identities that do not overlap in time are joined when one starts within ``max_gap`` frames
-    of the other's end and within ``link_gate`` of its last position (greedy, closest first)."""
+    of the other's end and within ``link_gate`` per frame of the gap of its last position (greedy,
+    closest first)."""
     P = len(cents)
     span = [(int(f[0]), int(f[-1])) if len(f) else (0, -1) for f, _ in cents]
     cand = []
@@ -1018,7 +1019,7 @@ def _stitch(cents, link_gate, max_gap):
             gap = span[b][0] - span[a][1]
             if 0 < gap <= max_gap:
                 d = float(np.linalg.norm(cents[a][1][-1] - cents[b][1][0]))
-                if d <= link_gate:
+                if d <= link_gate * gap:      # the per-frame jump limit, over the gap
                     cand.append((d, a, b))
     root = list(range(P))
 
