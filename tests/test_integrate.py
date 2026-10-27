@@ -58,7 +58,7 @@ def test_import_is_light_and_modules_lazy():
 
 
 def test_top_level_names():
-    assert aniposelib.__version__ == '1.0.0'
+    assert aniposelib.__version__ == '1.1.0'
     assert aniposelib.CameraGroup is CameraGroup and aniposelib.CharucoBoard is CharucoBoard
     with pytest.raises(AttributeError):
         aniposelib.not_a_module
