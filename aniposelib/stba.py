@@ -360,6 +360,11 @@ class SpatiotemporalBA:
         offset0, offset_prior_sigma: prior mean (dict clip -> s, or array) and sigma of the offsets.
         clip_names: names of the clip ids (default ``clip<i>`` / camera names for per-camera).
         free_rate, rate_prior_sigma: per-camera clock-rate error (reference camera fixed).
+        rate_groups: optional ``[C]`` labels: cameras with the same label share one clock rate (the
+            clips / camera entries of one device); the reference camera's group is fixed.
+        clip_ties: optional ``[(clip_a, clip_b, sigma), ...]`` (names or ids): two clips of one
+            device whose seed times are already consistent (known clip starts) keep one timeline,
+            ``delta_a - rate * t_mid_a = delta_b - rate * t_mid_b`` within ``sigma`` (s).
         rolling_shutter: False, True (free, start at 0), or initial readout times ``[C]`` (s);
             ``rs_prior_sigma`` anchors them.
         extrinsics: free camera poses (except ``fix_cameras``); ``gauge='baseline'`` fixes the scale.
@@ -383,7 +388,7 @@ class SpatiotemporalBA:
     def __init__(self, cgroup, obs, knot_spacing=1 / 30, segment_s=2.0, pad=None,
                  accel_sigma=40.0, vel_sigma=None, free_offsets='per_clip', offset0=None,
                  offset_prior_sigma=0.1, clip_names=None, ref_camera=0,
-                 free_rate=False, rate_prior_sigma=1e-3,
+                 free_rate=False, rate_prior_sigma=1e-3, rate_groups=None, clip_ties=None,
                  rolling_shutter=False, rs_prior_sigma=0.05,
                  extrinsics=True, fix_cameras=(0,), gauge='baseline', baseline_sigma=1e-4,
                  spec=None, intrinsics_prior_sigma=None, dist_prior_sigma=None,
@@ -416,12 +421,20 @@ class SpatiotemporalBA:
         self.is_kb = self.P0.model == 1
         self.has_b, self.has_k = bool((~self.is_kb).any()), bool(self.is_kb.any())
         self._build_obs(TimedObservations.coerce(obs), free_offsets, clip_names, ref_camera, min_obs, min_cams)
+        if rate_groups is None:
+            self.rate_rep = np.arange(nc)
+        else:
+            lab = list(rate_groups)
+            if len(lab) != nc:
+                raise ValueError('rate_groups needs one label per camera ({})'.format(nc))
+            self.rate_rep = np.array([lab.index(x) for x in lab])
         self._build_theta(free_offsets, offset0, offset_prior_sigma, free_rate, rate_prior_sigma,
                           rolling_shutter, rs_prior_sigma, extrinsics, fix_cameras, gauge, baseline_sigma,
                           spec, intrinsics_prior_sigma, dist_prior_sigma)
         self._warp_clips = None if warp_clips is None else {self._clip_key(k) for k in warp_clips}
         self._build_warp(warp_knot_s, warp_prior_sigma, warp_smooth_sigma, warp_init, warp_signals,
                          warp_dtw_sigma_scale, warp_dtw_kwargs or {})
+        self._build_ties(clip_ties)
         self._finish_theta()
         self._build_prior_C(accel_sigma, vel_sigma)
         self.C = None
@@ -541,7 +554,7 @@ class SpatiotemporalBA:
                     sig[self.i_delta + k] = offset_prior_sigma if offset_prior_sigma else np.inf
         if free_rate:
             for c in range(nc):
-                if c != self.ref_camera:
+                if self.rate_rep[c] == c and self.rate_rep[c] != self.rate_rep[self.ref_camera]:
                     free[self.i_rate + c] = True
                     sig[self.i_rate + c] = rate_prior_sigma if rate_prior_sigma else np.inf
         if rolling_shutter is not False and rolling_shutter is not None:
@@ -605,7 +618,7 @@ class SpatiotemporalBA:
         tlev = np.zeros((N, NT))
         tcols[:, 0] = self.i_delta + self.obs_clip
         tlev[:, 0] = 1.0
-        tcols[:, 1] = self.i_rate + self.obs_cam
+        tcols[:, 1] = self.i_rate + self.rate_rep[self.obs_cam]
         tlev[:, 1] = self.obs_t - self.clip_tmid[self.obs_clip]
         tcols[:, 2] = self.i_rs + self.obs_cam
         tlev[:, 2] = self.obs_vn
@@ -705,6 +718,30 @@ class SpatiotemporalBA:
             out[k] = warp_target_from_soft_dtw(est, t0_ref=ta[0], t0_clip=grid[0])
         return out
 
+    def _build_ties(self, ties):
+        """Linear rows ``(delta_a - delta_b - rate * (t_mid_a - t_mid_b)) / sigma`` (clip ties)."""
+        self._tie_rows = []
+        self.info['clip_ties'] = []
+        for a, b, sg in (ties or ()):
+            try:
+                i, j = self._clip_key(a), self._clip_key(b)
+            except ValueError:
+                continue        # a clip without observations here
+            if i == j:
+                continue
+            ca = self.obs_cam[self.obs_clip == i]
+            cb = self.obs_cam[self.obs_clip == j]
+            if not len(ca) or not len(cb):
+                continue
+            ra, rb = self.rate_rep[int(np.bincount(ca).argmax())], self.rate_rep[int(np.bincount(cb).argmax())]
+            row = np.zeros(len(self.theta))
+            row[self.i_delta + i] += 1.0
+            row[self.i_delta + j] -= 1.0
+            row[self.i_rate + ra] -= self.clip_tmid[i]
+            row[self.i_rate + rb] += self.clip_tmid[j]
+            self._tie_rows.append(row / float(sg))
+            self.info['clip_ties'].append((self.clip_names[i], self.clip_names[j], float(sg)))
+
     def _clip_key(self, k):
         return self.clip_names.index(k) if isinstance(k, str) else int(k)
 
@@ -718,6 +755,9 @@ class SpatiotemporalBA:
             if len(r) > 4:
                 Af[:, r[4]] = r[5]
             rows.append(Af); bs.append(b)
+        for r in getattr(self, '_tie_rows', []):
+            Af = np.zeros((1, n)); Af[0, :len(r)] = r
+            rows.append(Af); bs.append(np.zeros(1))
         self.lin_A = self._T(np.concatenate(rows)) if rows else None
         self.lin_b = self._T(np.concatenate(bs)) if rows else None
         self.free_idx = np.flatnonzero(self.free)
@@ -1080,7 +1120,7 @@ class SpatiotemporalBA:
         G.unpack_into(group, Pn)
         sig = lambda key, idx: np.array([self._sig(cov, key, i) for i in idx])
         di = np.arange(self.i_delta, self.i_rate)
-        ri = np.arange(self.i_rate, self.i_rs)
+        ri = self.i_rate + self.rate_rep
         si = np.arange(self.i_rs, self.i_warp)
         warp = None
         if self.warp_slice:
@@ -1101,4 +1141,5 @@ class SpatiotemporalBA:
             warp=warp, group=group, trajectories=traj, history=list(self.history), cost=float(cost),
             residuals=res, obs_index=self.obs_index.copy(), sigma_px=med / 1.1774,
             theta_names=list(self.theta_names), theta=th.copy(), free=self.free.copy(), covariance=cov,
-            info=dict(self.info, ref_clip=self.clip_names[self.ref_clip], n_iter=len(self.history)))
+            info=dict(self.info, ref_clip=self.clip_names[self.ref_clip], n_iter=len(self.history),
+                      clip_tmid={n: float(v) for n, v in zip(self.clip_names, self.clip_tmid)}))
