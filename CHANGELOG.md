@@ -92,7 +92,9 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
     `options={'audio_strategy': 'global', 'audio_min_overlap_frac': 0}`.
   - Audio sigmas are floored by the window scatter, the agreement of the audio methods and one sample (the
     spectrogram fallback reported 1.8e-5 s for ~5 ms of scatter); the fallback runs with windows, so `drift=True`
-    can fit it; streams with audio and no windowed estimate are listed by `drift_unidentifiable` (it was silent).
+    can fit it; streams with audio and no windowed estimate are listed by `drift_unidentifiable` (it was silent);
+    a fitted rate below `drift_min_z=3` sigmas is no drift (rate 0; 6 noisy windows over 2 minutes gave a spurious
+    100 ppm). Old: `options={'drift_min_z': 0}`.
   - The STBA frees the clock rate only with a drift fit (or seed) and points spanning
     `refine_free_rate_min_s=60` s (`options['refine_rate']='auto'`; a 10-30 s window gave spurious rates). Old:
     `options={'refine_rate': 'free'}` (with `drift=True`).
