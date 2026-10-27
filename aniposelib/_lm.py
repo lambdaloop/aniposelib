@@ -172,7 +172,9 @@ class _Lin:
         sc = (torch.arange(d, device=Hm.device)[None, None, :].expand(si.shape[0], q, d) if b.scols is None
               else b.scols[m][:, None, :].expand(-1, q, d))
         cc = b.cols[m][:, :, None].expand(-1, q, d)
-        W.index_put_((si, sc, cc), Hm, accumulate=True)
+        # flat index_add_ (several times faster than a 3-index accumulating index_put_)
+        flat = (si * b.D + sc) * (NC + 1) + cc
+        W.view(-1).index_add_(0, flat.reshape(-1), Hm.reshape(-1))
         return W
 
 
