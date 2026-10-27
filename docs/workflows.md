@@ -98,7 +98,9 @@ What it does:
 Use `fisheye=True` for fisheye lenses. If you already know the lenses, pass an earlier calibration as `intrinsics=` to
 start from it; it may hold only some of the cameras, and the others are worked out from the board. If a camera's lens
 comes out wrong (phones sometimes do), give a rough focal length in pixels as
-`options={'focal_guess': {'phone1': 1700}}`.
+`options={'focal_guess': {'phone1': 1700}}`: the lens is then kept within 25 % of it, and held near it while
+everything is refined. If one camera's lens is so wrong that it pulls the other cameras out of place, the check
+`camera_drag_deg` fails: it refines the rig again without that camera and sees how far the others move.
 
 **If some cameras never saw the board at the same time as the others.** Imagine cameras on the left of the arena and
 cameras on the right, and the board was only ever shown to one side at a time. Each side can be calibrated, but
@@ -164,7 +166,8 @@ What it does:
 2. Refines the camera positions while ignoring points that don't fit, such as wrong detections or a camera confusing
    one animal for another.
 3. Optionally fine-tunes the focal length and main distortion term, but keeps the change only if it really predicts
-   held-out data better (`refine_intrinsics='auto'`).
+   held-out data better (`refine_intrinsics='auto'`): at least 2 % better, on enough held-out points from enough time
+   windows, and consistently so across those windows. `result.intrinsics['reason']` says why it was kept or not.
 4. Optionally puts the result into real units (see `estimate_scale`, which you can pass through `scale=`).
 
 The result has no real-world scale unless you give it one: the points alone can't tell a small rig from a big one.
@@ -253,6 +256,9 @@ the same direction, which triangulate poorly. Some inputs switch on extra checks
   the recording into about 20 time windows (at most an hour each) and repeats the leave-one-camera-out check in each one
   (`result.per_window`). A window where a camera suddenly agrees much less than usual is flagged; this is usually
   a sync problem or broken data, not the calibration. Set the window length with `options={'loo_window_s': 3600}`.
+  A camera that is off from the very start is a calibration error (the leave-one-camera-out checks report it), not
+  a move, and a "move" no bigger than the jitter of the cameras that stayed put is ignored
+  (`result.report['moves_demoted']`).
 - With `times=` it also tries to re-place a camera that was bumped so hard that the others can't use it any more
   (its points stop agreeing from some time on, for good). It looks for the new aim that makes the camera agree with
   the points the other cameras see, and adds it as a new station in `result.moves`. For people tracked with

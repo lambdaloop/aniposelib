@@ -289,6 +289,29 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
 - **W4 `loo_window_s='auto'`:** at most 3600 s per window (was span / 20: 20000 s windows on a 46 h session, so a
   broken first hour never made a bad window and `moves_bad_window_frac` could not demote a false move in it).
   Old behaviour: `options={'loo_window_s': <span / 20>}`.
+- **W4 moves with `times=`:** a camera whose position is wrong for the whole trial is no longer reported as moved.
+  A camera whose LOO agreement is below `static_bad_ratio` (0.5) x the others' from its first windows on is a
+  calibration error (the LOO rules report it) and is left out of the move tests, so its views do not bias its
+  neighbours (`report['static_bad_cameras']`); a camera's first step is a move only if, just before it, the
+  camera's LOO agreement was >= `moves_before_ratio` (0.5) x the other cameras' (a wrong position shows as a slow
+  decline as the subject moves; else `report['moves_demoted']`, with `reason`). Panoptic 00_15 off by
+  50 mm: no move (was a recovered 1.1 deg 'move' at 12 s). Old behaviour:
+  `options={'static_bad_ratio': None, 'moves_before_ratio': None}`.
+- **W2 `refine_intrinsics='auto'`** keeps the 2 % held-out gain rule but now also needs enough held-out evidence:
+  every camera >= `intrinsics_min_heldout_obs` (100) held-out LOO observations from >= `intrinsics_min_heldout_windows`
+  (10) windows, and a paired bootstrap over the held-out windows (`intrinsics_n_boot` 200) must find a gain > 0 in
+  >= 1 - `intrinsics_alpha` (95 %) of the resamples. `result.intrinsics` reports `p_better`, `gain_ci90`,
+  `n_heldout_obs_min`, `n_heldout_windows` and the reason. Motor observatory e2e: the 3.8 % gain had P = 0.71, so
+  the lens is kept (centres 7.4 mm vs the reference, was 14.4 mm). Old behaviour:
+  `options={'intrinsics_min_heldout_obs': 0, 'intrinsics_min_heldout_windows': 0, 'intrinsics_alpha': 1.0}`.
+- **W1 `options['focal_guess']`** now constrains the lens: the ladder keeps a fit within `focal_guess_tol` (25 %) of
+  the guess (else a nominal lens at the guess), and the board BA has a log-focal prior (`focal_guess_sigma`, 0.1)
+  around it. Old behaviour: `options={'focal_guess_tol': float('inf'), 'focal_guess_sigma': float('inf')}` (an extra
+  ladder start only).
+- **W1 verdict `camera_drag_deg`** (new rule): when the worst camera's board error is > `drag_check_ratio` (3) x the
+  median camera's, the board BA is re-run without it; if the other cameras' relative rotations move > 1 / 3 deg
+  (`drag_deg`) the verdict warns / fails (dancing: a phone with a wrong focal dragged the GoPros 8-15 deg and the
+  verdict was only 'warn'). Off: `options={'drag_check_ratio': None}`.
 
 ### Defaults settled after the real-data check
 
