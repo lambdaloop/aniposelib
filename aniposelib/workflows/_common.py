@@ -34,7 +34,7 @@ import torch
 
 __all__ = ['Rule', 'evaluate_rules', 'noise_floor', 'WorkflowResult', 'merge_options',
            'provenance', 'image_diagonal', 'MIN_NOISE_PX', 'NOISE_UNIT_MAX', 'noise_unit', 'NOISE_DIAG_FRAC', 'to_numpy',
-           'Timer', 'worst', 'thread_guard', 'max_threads']
+           'Timer', 'worst', 'thread_guard', 'max_threads', 'reindex_cameras']
 
 MIN_NOISE_PX = 0.5
 # The noise unit multiplies the backend's pixel defaults (tuned for ~0.5 px noise). Keypoint errors are
@@ -237,6 +237,31 @@ def noise_unit(nf, override=None):
     if nf is None or not np.isfinite(nf):
         return 1.0
     return float(np.clip(float(nf) / MIN_NOISE_PX, 1.0, NOISE_UNIT_MAX))
+
+
+
+def reindex_cameras(points, cam_names, cgroup_names, axis=0):
+    """Reorder the camera axis of ``points`` from ``cam_names`` (the order of the points) to
+    ``cgroup_names``. -> ``(points, missing, dropped)``: group cameras absent from ``cam_names``
+    get NaN rows (``missing``), names not in the group are removed (``dropped``)."""
+    pts = np.asarray(to_numpy(points), dtype=float)
+    cam_names = [str(n) for n in cam_names]
+    cgroup_names = [str(n) for n in cgroup_names]
+    if len(set(cam_names)) != len(cam_names):
+        raise ValueError('cam_names has duplicates: {}'.format(cam_names))
+    if pts.shape[axis] != len(cam_names):
+        raise ValueError('points have {} cameras on axis {}, cam_names has {}'.format(
+            pts.shape[axis], axis, len(cam_names)))
+    pts = np.moveaxis(pts, axis, 0)
+    out = np.full((len(cgroup_names),) + pts.shape[1:], np.nan)
+    missing = []
+    for c, n in enumerate(cgroup_names):
+        if n in cam_names:
+            out[c] = pts[cam_names.index(n)]
+        else:
+            missing.append(n)
+    dropped = [n for n in cam_names if n not in cgroup_names]
+    return np.moveaxis(out, 0, axis), missing, dropped
 
 
 def merge_options(defaults, options, where='options'):
