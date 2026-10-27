@@ -71,8 +71,9 @@ __all__ = ['calibrate_from_board', 'BoardCalibration', 'calibrate_from_points', 
 # ================================================================== shared helpers
 
 def _noise_unit(nf):
-    """Noise unit ``u``: backend pixel defaults (tuned for 0.5 px noise) are multiplied by it."""
-    return max(float(nf), MIN_NOISE_PX) / MIN_NOISE_PX
+    """Noise unit ``u`` (capped; see :func:`aniposelib.workflows._common.noise_unit`)."""
+    from ._common import noise_unit
+    return noise_unit(nf)
 
 
 def _device(device):

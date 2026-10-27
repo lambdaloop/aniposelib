@@ -212,7 +212,7 @@ def loo_errors(cgroup, p2ds, tau_tri=5.0, min_others=3, robust=True, chunk=None)
             uv = torch.as_tensor(pts[c:c + 1, idxs[k]], dtype=P.dtype, device=P.device)
             e = G._reproj_err_flat(Pc, torch.nan_to_num(Xc), uv, Pc.extrinsics())[0]
             e = torch.where(torch.isfinite(Xc).all(-1), e, torch.full_like(e, float('inf')))
-            e = torch.nan_to_num(e, nan=float('inf'))
+            e = torch.nan_to_num(e, nan=float('inf'), posinf=float('inf'))
             errors[c, idxs[k]] = e.cpu().numpy()
     return errors, eligible
 

@@ -33,10 +33,15 @@ import numpy as np
 import torch
 
 __all__ = ['Rule', 'evaluate_rules', 'noise_floor', 'WorkflowResult', 'merge_options',
-           'provenance', 'image_diagonal', 'MIN_NOISE_PX', 'NOISE_DIAG_FRAC', 'to_numpy',
+           'provenance', 'image_diagonal', 'MIN_NOISE_PX', 'NOISE_UNIT_MAX', 'noise_unit', 'NOISE_DIAG_FRAC', 'to_numpy',
            'Timer', 'worst', 'thread_guard', 'max_threads']
 
 MIN_NOISE_PX = 0.5
+# The noise unit multiplies the backend's pixel defaults (tuned for ~0.5 px noise). Keypoint errors are
+# heavy-tailed, so the measured floor of real pose data is often 3-10 px; scaling every threshold by
+# nf / 0.5 (up to 20x) made all gates far too loose on real data (plan 05 real-data check). The unit is
+# therefore capped: thresholds grow at most NOISE_UNIT_MAX-fold over the 1.0 pixel defaults.
+NOISE_UNIT_MAX = 2.0
 NOISE_DIAG_FRAC = 0.01
 _ORDER = {'ok': 0, 'warn': 1, 'fail': 2}
 
@@ -222,6 +227,17 @@ def noise_floor(errors, inliers=None, diag=None, min_count=10):
 
 
 # ------------------------------------------------------------------ options / provenance
+
+def noise_unit(nf, override=None):
+    """Noise unit ``u`` from a noise floor (px): ``clip(nf / MIN_NOISE_PX, 1, NOISE_UNIT_MAX)``.
+    ``override`` (a workflow's ``options['noise_unit']``): a float forces ``u`` (1 = the 1.0 absolute
+    pixel defaults); None / 'auto' uses the capped estimate."""
+    if override not in (None, 'auto'):
+        return float(override)
+    if nf is None or not np.isfinite(nf):
+        return 1.0
+    return float(np.clip(float(nf) / MIN_NOISE_PX, 1.0, NOISE_UNIT_MAX))
+
 
 def merge_options(defaults, options, where='options'):
     """Merge ``options`` (dict, dataclass or None) over ``defaults``; unknown keys raise."""

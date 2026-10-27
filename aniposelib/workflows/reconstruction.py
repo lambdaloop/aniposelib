@@ -74,8 +74,9 @@ __all__ = ['estimate_offsets', 'OffsetEstimation', 'reconstruct_3d', 'Reconstruc
 # ================================================================== shared helpers
 
 def _noise_unit(nf):
-    """Noise unit ``u``: backend pixel defaults (tuned for 0.5 px noise) are multiplied by it."""
-    return max(float(nf), MIN_NOISE_PX) / MIN_NOISE_PX
+    """Noise unit ``u`` (capped; see :func:`aniposelib.workflows._common.noise_unit`)."""
+    from ._common import noise_unit
+    return noise_unit(nf)
 
 
 def _device(device):
@@ -130,8 +131,8 @@ class Reconstruction(WorkflowResult):
 
 
 _W6_DEFAULTS = {
-    'tau_px': None,            # fixed MSAC threshold (px); None = 20 x noise floor (10 px at 0.5 px)
-    'tau_noise_mult': 20.0,
+    'tau_px': None,            # fixed MSAC threshold (px); None = clip(5 x noise floor, 10 px, 1 % of the diagonal)
+    'tau_noise_mult': 5.0,
     'first_tau_diag_frac': 0.01,   # first robust pass: tau = max(10 px, this x image diagonal)
     'min_score': None,         # hard score cut (observations below are removed); None = soft only
     'min_views': 2,
@@ -311,8 +312,11 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             tau0 = max(10.0, opts['first_tau_diag_frac'] * diag) if diag else 20.0
             r0 = T.triangulate_robust(P, flat, tau=tau0, scores=swf, min_inliers=opts['min_views'])
             nf = noise_floor(r0.errors, r0.inliers, diag)
+            # 5 x noise floor, at least the 1.0 default (10 px) and never looser than the first-pass
+            # gate (1 % of the diagonal): on real keypoints a 20 x rule gave 60-190 px and let poor
+            # cameras pull the points
             tau = float(opts['tau_px']) if opts['tau_px'] is not None else \
-                float(opts['tau_noise_mult']) * nf
+                float(min(max(float(opts['tau_noise_mult']) * nf, 10.0), max(tau0, 10.0)))
             res = T.triangulate_robust(P, flat, tau=tau, scores=swf, min_inliers=opts['min_views'])
             X = to_numpy(res.p3d).reshape(N, J, 3)
             inl = to_numpy(res.inliers).reshape(C, N, J)
