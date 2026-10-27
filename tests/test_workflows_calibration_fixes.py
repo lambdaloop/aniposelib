@@ -76,7 +76,9 @@ def test_w3_lengths_tau_check_and_reference_frame(mo):
     S.rescale(cg, 2.0)
     res = estimate_scale(cg, lengths=dict(points=p2, pairs=bones, ref=L))
     assert res.accepted and abs(res.scale - 0.5) < 0.005
-    assert res.settings['tau_px'] == pytest.approx(5 * res.settings['noise_unit'])
+    assert res.settings['tau_px'] == pytest.approx(5.0)            # absolute 5 px by default
+    forced = estimate_scale(cg, lengths=dict(points=p2, pairs=bones, ref=L), options={'noise_unit': 2.0})
+    assert forced.settings['tau_px'] == pytest.approx(10.0)
     chk = res.report['lengths_check']
     assert abs(chk['median_ratio'] - 1) < 0.01 and res.verdict == 'ok', res.summary()
     # a too-loose threshold with gross outliers biases the scale: the re-measured bones disagree

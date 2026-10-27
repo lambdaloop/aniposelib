@@ -237,3 +237,24 @@ def test_detect_moves_finds_bumped_camera(rig):
     rep2 = ST.detect_moves(rig, obs, window_s=2.0, cameras=[2])
     assert [c['camera'] for c in rep2.change_points] == [name]
     assert abs(rep2.change_points[0]['time'] - tb) < 1 / 30 + 1e-6
+
+
+def test_stba_rate_groups_and_clip_ties(rig):
+    # cameras 1 and 2 are clips of one device: one clock rate
+    rates = np.array([0, 2e-3, 2e-3, -1e-3, 0])
+    obs, _ = synth.timed_observations(rig, n_points=8, duration=4.0, fps=60, rates=rates, noise=0.5)
+    ba = S.SpatiotemporalBA(rig, obs, segment_s=1.0, sigma_px=0.5, free_offsets='per_camera',
+                            free_rate=True, rate_prior_sigma=1e-2, extrinsics=False,
+                            rate_groups=['a', 'dev', 'dev', 'b', 'c'])
+    res = ba.fit()
+    assert res.rate[1] == res.rate[2] and abs(res.rate[1] - 2e-3) < 2e-4
+    assert int(ba.free[ba.i_rate + 2]) == 0 and 'clip_tmid' in res.info
+    # two clips of camera 1 with one timeline: tied offsets stay equal
+    obs, _ = _step_obs(rig, lambda t: np.full_like(t, 0.010), n_points=6, duration=3.0)
+    clip = obs['cam'].copy()
+    clip[(obs['cam'] == 1) & (obs['t'] >= 1.5)] = 5
+    obs['clip'] = clip
+    res = S.SpatiotemporalBA(rig, obs, segment_s=1.0, sigma_px=0.5, extrinsics=False,
+                             clip_ties=[('clip1', 'clip5', 1e-6)]).fit()
+    assert abs(res.delta[1] - res.delta[5]) < 1e-5 and abs(res.delta[1] - 0.010) < 5e-4
+    assert res.info['clip_ties'] == [('clip1', 'clip5', 1e-6)]

@@ -189,6 +189,20 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
     (else the video's `avg_frame_rate`), epipolar pairs at different frame rates (resampled; were skipped),
     irregular per-frame times use the mean rate and warn (`irregular_times`), `pairs` report the raw and the
     shifted offset (`offset_raw`, `offset`).
+  - Clips of one device share one clock (`options['stream_device']`, default the `stream_camera` mapping;
+    `options['shared_clock']=True`): one rate in the drift fit (new `sync.fit_drift_shared`) and in the STBA (new
+    `SpatiotemporalBA(rate_groups=)`). Old: `options={'shared_clock': False}`. `options['clip_start']`
+    (`{stream: s | (s, sigma)}` on the device clock, or `'container'` = the files' `creation_time`, new in
+    `sync.media_info`, sigma 1 s) keeps the clips on one timeline: `clip_start` graph edges, tied intercepts in the
+    drift fit, tied offsets in the STBA (`SpatiotemporalBA(clip_ties=)`).
+  - New `refine_windows=` (window length in s, or `(t0, t1[, cgroup])` windows): STBA per window, rates from the
+    seed / drift fit; the time maps are the seed plus a piecewise-linear correction (new `sync.TimeMap.corrected`;
+    continuous, monotone). Per-window results in `refined['windows']`, new rule `refine_windows_failed`. A
+    piecewise seed keeps its knots (they were dropped).
+  - `options['audio_delay_sigma']` (s, default 0 = old): added to every audio sigma (speaker distance, 2.9 ms/m,
+    and phone A/V latency, which audio cannot see).
+  - STBA: points with regular per-frame times (gaps of whole frames allowed) use the given times (frames after a
+    gap were placed at `t0 + i / rate`); the rate correction is applied around the STBA's own clip mid-times.
 - **`associate_views` (W7)**
   - Defaults: `gate_noise_mult` 80 -> 10 (the second, tighter pass never fired on real 3-4 px detections),
     `link_max_gap` 10 -> 30 frame ids (also `link_max_gap_s` with `fps`), `min_identity_frames=5` (1-3-frame ghost

@@ -585,3 +585,81 @@ def test_reconstruct_identity_axis(crowd):
     assert r.report['n_identities'] == P and len(r.report['per_identity']) == P
     one = W.reconstruct_3d(cg, res.points[:, :, 1], bones=[(0, 1), (1, 2)], options={'n_iters': 30})
     np.testing.assert_allclose(r.points3d[:, 1], one.points3d, equal_nan=True)
+
+
+def test_offsets_shared_clock_clip_start():
+    """Two clips of one drifting device: one clock rate; with the clip starts, one timeline."""
+    from test_sync import _delayed
+    sr = 2000
+    rng = np.random.default_rng(5)
+    a = _bursts(sr * 150, sr, rng, n_events=400)
+    b = _delayed(a, sr, 1.3, rate=2e-4, rng=rng)          # the device's whole recording
+    st = {'a': {'audio': (a, sr)}, 'b1': {'audio': (b[:sr * 70], sr)}, 'b2': {'audio': (b[sr * 80:], sr)}}
+    opts = {'audio_strategy': 'windowed', 'audio_window_s': 10.0, 'stream_device': {'b1': 'b', 'b2': 'b'}}
+    res = W.estimate_offsets(st, reference='a', options=opts)
+    assert res.rates['b1'] == res.rates['b2'] and abs(res.rates['b1'] - 2e-4) < 3e-5, res.rates
+    assert res.settings['stream_device'] == {'a': 'a', 'b1': 'b', 'b2': 'b'}
+    res = W.estimate_offsets(st, reference='a', options=dict(opts, clip_start={'b1': 0.0, 'b2': 80.0}))
+    assert any(p['kind'] == 'clip_start' for p in res.pairs)
+    assert abs((res.offsets['b2'] - res.offsets['b1']) + 80.0) < 1e-3, res.offsets
+    for n, s0 in (('b1', 0.0), ('b2', 80.0)):
+        g = 100.0 if n == 'b2' else 30.0
+        assert abs(res.timemaps[n].to_source(g) - (1.3 + (1 + 2e-4) * g - s0)) < 2e-3
+    r = W.estimate_offsets(st, reference='a', options=dict(opts, clip_start={'zz': 0.0}))
+    assert any('zz' in f for f in r.provenance['fallbacks'])
+
+
+def test_offsets_audio_delay_sigma(sync_scene):
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    au = {n: {'audio': streams[n]['audio']} for n in names}
+    r0 = W.estimate_offsets(au, reference=names[0], drift=False)
+    r1 = W.estimate_offsets(au, reference=names[0], drift=False, options={'audio_delay_sigma': 0.01})
+    for n in names[1:]:
+        assert r1.sigmas[n] > 4e-3 > r0.sigmas[n]
+        assert abs(r1.offsets[n] - r0.offsets[n]) < 1e-4
+
+
+def test_offsets_refine_windows_piecewise(sync_scene):
+    """A seed with a wrong clock rate (1 ms/s): per-window STBA gives a piecewise map that follows it."""
+    from aniposelib import sync as S
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    pts = {n: {'points': streams[n]['points']} for n in names}
+    seed = {n: S.TimeMap.from_offset(off[n], rate=rate[n]) for n in names}
+    seed[names[1]] = S.TimeMap.from_offset(off[names[1]], rate=1e-3)
+    one = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=seed, refine=True,
+                             options={'refine_rate': 'seed'})
+    res = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=seed, refine_windows=5.0)
+    assert res.refined['ok'] and res.refined['piecewise'] and len(res.refined['windows']) >= 3
+    assert res.verdict != 'fail', res.reasons
+    tm = res.timemaps[names[1]]
+    assert len(tm.knots) >= 3
+    g = np.array([w['tmid'][names[1]] for w in res.refined['windows'] if w.get('ok')])
+    err = np.abs(tm.to_source(g) - (g + off[names[1]]))
+    err1 = np.abs(one.timemaps[names[1]].to_source(g) - (g + off[names[1]]))
+    assert err.max() < 3e-3 and err.max() < 0.5 * err1.max(), (err, err1)
+    # the piecewise map is continuous and monotone, and a piecewise seed keeps its knots
+    gg = np.linspace(g.min() - 2, g.max() + 2, 200)
+    assert np.all(np.diff(tm.to_source(gg)) > 0)
+    r2 = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=res)
+    assert r2.timemaps[names[1]].knots == tm.knots
+    json.dumps(res.to_dict())
+
+
+def test_offsets_refine_tied_clip_without_points(sync_scene):
+    """A clip of the same device with known start and no points here gets its sibling's correction."""
+    from aniposelib import sync as S
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    p, t = streams[names[1]]['points']
+    pts = {n: {'points': streams[n]['points']} for n in names[:2]}
+    pts['later'] = {'points': (np.full((3,) + p.shape[1:], np.nan), np.arange(3) / 30.0)}
+    seed = {names[0]: S.TimeMap.from_offset(0.0), names[1]: S.TimeMap.from_offset(off[names[1]] + 0.005),
+            'later': S.TimeMap.from_offset(off[names[1]] + 0.005 - 100.0)}
+    res = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=seed, refine=True,
+                             options={'stream_camera': {'later': names[1]},
+                                      'clip_start': {names[1]: 0.0, 'later': 100.0}})
+    assert abs(res.offsets[names[1]] - off[names[1]]) < 2e-3
+    assert abs(res.offsets['later'] - (off[names[1]] - 100.0)) < 2e-3
+    assert 'later' in res.refined['delta_from_siblings']

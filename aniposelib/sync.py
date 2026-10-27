@@ -41,7 +41,7 @@ from scipy import signal as _signal
 __all__ = [
     'OffsetEstimate', 'OffsetGraph', 'DriftFit', 'WarpEstimate', 'TimeMap', 'AlignedStreams',
     'align_streams', 'load_audio', 'media_info', 'audio_offset', 'audio_offset_windowed', 'onset_envelope', 'motion_signal', 'motion_offset',
-    'solve_offset_graph', 'fit_drift', 'epipolar_offset', 'frame_offset_sweep', 'soft_dtw', 'soft_dtw_align',
+    'solve_offset_graph', 'fit_drift', 'fit_drift_shared', 'epipolar_offset', 'frame_offset_sweep', 'soft_dtw', 'soft_dtw_align',
     'SoftDTW', 'fit_fundamental', 'CONVENTION',
 ]
 
@@ -249,6 +249,29 @@ class TimeMap:
     def offset_at(self, g):
         """Offset (``source - global``) at global time(s) ``g``."""
         return self.to_source(g) - _np(g)
+
+    def corrected(self, g, delta):
+        """Piecewise-linear refinement: the map ``global' = global + d(global)``, with ``d`` the
+        linear interpolation of ``delta`` at the global times ``g`` (constant beyond the first /
+        last one). This is how windowed refinements are joined into one continuous, monotone map
+        (W5 ``refine_windows``); a correction ``delta`` is the STBA ``delta`` (true global time =
+        seed global time + delta). Returns a new :class:`TimeMap` (same ``c``, ``beta``, knots
+        at the old and the new positions); raises ``ValueError`` if the result is not monotone."""
+        g = _np(g).ravel()
+        delta = _np(delta).ravel()
+        if len(g) != len(delta) or not len(g):
+            raise ValueError('g and delta must have the same, non-zero length')
+        o = np.argsort(g)
+        g, delta = g[o], delta[o]
+        keep = np.r_[True, np.diff(g) > 0]
+        g, delta = g[keep], delta[keep]
+        # knot positions in g0 = c + beta * pts coordinates
+        g0_new = self.c + self.beta * self.to_source(g)
+        old = np.asarray(self.knots)[:, 0] if self.knots else np.zeros(0)
+        allg0 = np.unique(np.r_[old, g0_new])
+        w_old = self._w(allg0)
+        w = w_old + np.interp(allg0 + w_old, g, delta)
+        return TimeMap(c=self.c, beta=self.beta, knots=tuple(zip(allg0.tolist(), w.tolist())))
 
     def to_dict(self):
         return {'c': self.c, 'beta': self.beta, 'knots': [list(k) for k in self.knots],
@@ -703,9 +726,30 @@ def load_audio(path, sr=16000, start=0.0, duration=None, backend='auto'):
 
 
 
+def _parse_creation_time(v):
+    """ISO-8601 ``creation_time`` tag -> POSIX seconds (None if missing / unparsable)."""
+    if not v:
+        return None
+    from datetime import datetime, timezone
+    s = str(v).strip().replace('Z', '+00:00')
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            d = datetime.strptime(s[:19], '%Y-%m-%dT%H:%M:%S')
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return float(d.timestamp())
+
+
 def media_info(path):
     """Stream timing of a media file: ``{'audio_start': s, 'video_start': s, 'avg_frame_rate': Hz,
-    'r_frame_rate': Hz, 'n_frames': int}`` (keys missing / None when unknown), from PyAV or ``ffprobe``.
+    'r_frame_rate': Hz, 'n_frames': int, 'creation_time': POSIX s}`` (keys missing / None when
+    unknown), from PyAV or ``ffprobe``. ``creation_time`` is the container's ``creation_time`` tag
+    (usually whole seconds of the camera's wall clock: good enough to order clips of one device, not
+    to sync them).
 
     ``audio_start - video_start`` is the source (video) time of audio sample 0 (``audio_t0`` of
     :func:`aniposelib.workflows.estimate_offsets`; :func:`load_audio` starts at the audio stream's
@@ -716,6 +760,9 @@ def media_info(path):
     try:
         import av
         with av.open(path) as c:
+            ct = _parse_creation_time((c.metadata or {}).get('creation_time'))
+            if ct is not None:
+                out['creation_time'] = ct
             for s in c.streams:
                 st = None if s.start_time is None else float(s.start_time * s.time_base)
                 if s.type == 'audio' and 'audio_start' not in out:
@@ -734,9 +781,14 @@ def media_info(path):
     if exe is None:
         return out
     import json
-    r = subprocess.run([exe, '-v', 'error', '-show_streams', '-of', 'json', path], capture_output=True)
+    r = subprocess.run([exe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', path],
+                       capture_output=True)
     if r.returncode:
         return out
+    info = json.loads(r.stdout.decode('utf-8', 'replace'))
+    ct = _parse_creation_time(((info.get('format') or {}).get('tags') or {}).get('creation_time'))
+    if ct is not None:
+        out['creation_time'] = ct
 
     def rate(v):
         try:
@@ -744,7 +796,7 @@ def media_info(path):
             return float(a) / float(b) if float(b) else None
         except Exception:
             return None
-    for s in json.loads(r.stdout.decode('utf-8', 'replace')).get('streams', []):
+    for s in info.get('streams', []):
         st = s.get('start_time')
         st = float(st) if st not in (None, 'N/A') else None
         if s.get('codec_type') == 'audio' and 'audio_start' not in out:
@@ -1261,6 +1313,104 @@ def fit_drift(t, offsets, robust=True, sigma=None, t_ref=None, f_scale=None, max
     return DriftFit(offset0=float(p[0]), rate=float(p[1]), t_ref=t_ref, sigma_offset0=so, sigma_rate=sr,
                     residuals=res, inliers=inl, rms=float(np.sqrt(np.mean(res[inl] ** 2))), n=int(len(t)),
                     identifiable=not reasons, reasons=reasons)
+
+
+def fit_drift_shared(series, starts=None, start_sigma=1e-3, robust=True, max_rate=1e-2):
+    """One clock rate for several clips of one device: ``offset_k(t) = offset0_k + rate * (t - t_ref_k)``
+    fitted jointly (common ``rate``, one intercept per clip; robust soft-L1 IRLS).
+
+    Args:
+        series: ``{clip: (t, offsets)}`` windowed offset measurements per clip (global time, s).
+        starts: optional ``{clip: s}`` start of each clip on the device's own clock (e.g. chapter
+            boundaries, or ``sync.media_info`` ``creation_time``): clips with a start are tied,
+            ``offset_k = offset_device - start_k`` (sign convention of the module), with
+            ``start_sigma`` (s, scalar or ``{clip: s}``) as their uncertainty.
+        robust, max_rate: as :func:`fit_drift`.
+
+    Returns ``{clip: DriftFit}``, all with the same ``rate`` / ``sigma_rate``; a clip without inlier
+    measurements (and no tie) is unidentifiable."""
+    names = list(series)
+    starts = dict(starts or {})
+    ts, ys, ks = [], [], []
+    for k, n in enumerate(names):
+        t, y = (_np(v).ravel() for v in series[n])
+        ok = np.isfinite(t) & np.isfinite(y)
+        ts.append(t[ok]); ys.append(y[ok]); ks.append(np.full(int(ok.sum()), k))
+    t, y, kk = np.concatenate(ts), np.concatenate(ys), np.concatenate(ks)
+    K = len(names)
+    if len(t) < 2:
+        raise ValueError('need at least two measurements')
+    tref = np.array([float(np.median(x)) if len(x) else 0.0 for x in ts])
+    X = np.zeros((len(t), K + 1))
+    X[:, 0] = t - tref[kk]
+    X[np.arange(len(t)), 1 + kk] = 1.0
+    # ties between consecutive clips with a known start: A_i - A_j = -(s_i - s_j), A = offset at t = 0
+    tied = [n for n in names if starts.get(n) is not None]
+    ssig = start_sigma if isinstance(start_sigma, dict) else {n: start_sigma for n in names}
+    T, tb, tw = [], [], []
+    for a, b in zip(tied[:-1], tied[1:]):
+        i, j = names.index(a), names.index(b)
+        row = np.zeros(K + 1)
+        row[0] = -(tref[i] - tref[j])
+        row[1 + i], row[1 + j] = 1.0, -1.0
+        T.append(row); tb.append(-(float(starts[a]) - float(starts[b])))
+        tw.append(1.0 / max(np.hypot(float(ssig.get(a, 1e-3)), float(ssig.get(b, 1e-3))), 1e-12))
+    T, tb, tw = np.array(T).reshape(-1, K + 1), np.array(tb), np.array(tw)
+    seen = np.zeros(K, bool)
+    seen[np.unique(kk)] = True
+    # clips without data and without a tie: their intercept is undetermined (kept at 0, flagged)
+    reg = np.zeros(K + 1)
+    reg[1:] = np.where(seen | np.isin(names, tied), 0.0, 1.0)
+
+    def solve(w, s):
+        A = np.r_[X * np.sqrt(w)[:, None] / s, T * tw[:, None], np.diag(reg)]
+        bb = np.r_[y * np.sqrt(w) / s, tb * tw, np.zeros(K + 1)]
+        H = A.T @ A
+        return np.linalg.lstsq(A, bb, rcond=None)[0], H
+
+    w = np.ones(len(t))
+    s = 1.0
+    p, H = solve(w, s)
+    if robust:
+        for _ in range(20):
+            r = y - X @ p
+            s = max(_mad(r), 1e-9)
+            w = 1.0 / np.sqrt(1.0 + (r / s) ** 2)
+            p_new, H = solve(w, s)
+            if np.allclose(p_new, p, rtol=0, atol=1e-12):
+                p = p_new
+                break
+            p = p_new
+    res = y - X @ p
+    scale = _mad(res) if robust else float(np.sqrt(np.mean(res ** 2)))
+    if not (scale > 0):
+        scale = float(np.sqrt(np.mean(res ** 2))) or 1e-12
+    inl = np.abs(res) <= 3 * max(scale, 1e-12)
+    dof = max(int(inl.sum()) - (K + 1) + len(tb), 1)
+    s2 = float(np.sum(res[inl] ** 2) / dof)
+    Xi = X[inl]
+    try:
+        cov = np.linalg.inv(Xi.T @ Xi / max(s2, 1e-24) + (T * tw[:, None]).T @ (T * tw[:, None])
+                            + np.diag(reg))
+    except np.linalg.LinAlgError:
+        cov = np.full((K + 1, K + 1), np.nan)
+    sr = float(np.sqrt(max(cov[0, 0], 0.0)))
+    out = {}
+    for k, n in enumerate(names):
+        m = kk == k
+        reasons = []
+        if inl.sum() < 3:
+            reasons.append('too_few_inliers')
+        if not (inl[m].any() or n in tied):
+            reasons.append('no_measurements')
+        if abs(p[0]) > max_rate:
+            reasons.append('implausible_rate')
+        out[n] = DriftFit(offset0=float(p[1 + k]), rate=float(p[0]), t_ref=float(tref[k]),
+                          sigma_offset0=float(np.sqrt(max(cov[1 + k, 1 + k], 0.0))), sigma_rate=sr,
+                          residuals=res[m], inliers=inl[m],
+                          rms=float(np.sqrt(np.mean(res[m][inl[m]] ** 2))) if inl[m].any() else float('nan'),
+                          n=int(m.sum()), identifiable=not reasons, reasons=reasons)
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ epipolar
