@@ -994,7 +994,12 @@ def _apply_stations(cgroup, obs, st):
     keep = station >= 0
     obs = obs.subset(keep)
     obs.station = station[keep]
-    return obs, dict(station_cam=np.array(station_cam), names=snames)
+    out = dict(station_cam=np.array(station_cam), names=snames)
+    from .stations import station_init
+    init = station_init(cgroup, st, list(zip(station_cam, snames)))     # Stations.poses (moves / recovery)
+    if init is not None:
+        out['rvec'], out['tvec'] = init
+    return obs, out
 
 
 def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy', f_scale=5.0,

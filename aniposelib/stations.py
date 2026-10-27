@@ -42,7 +42,8 @@ import torch
 from . import geometry as G
 from . import triangulation as T
 
-__all__ = ['SKIP', 'Stations', 'MoveReport', 'detect_moves', 'detect_steps', 'fit_rotation_offsets']
+__all__ = ['SKIP', 'Stations', 'MoveReport', 'Recovery', 'detect_moves', 'recover_moves', 'detect_steps',
+           'fit_rotation_offsets']
 
 SKIP = 'skip'
 INF = float('inf')
@@ -107,8 +108,9 @@ def _paint_rows(rows, a, b, name):
 class Stations:
     """Per-camera station intervals (see module docstring)."""
 
-    def __init__(self, intervals=None, cameras=None):
+    def __init__(self, intervals=None, cameras=None, poses=None):
         self.cameras = list(cameras) if cameras is not None else None
+        self.poses = dict(poses or {})
         self._iv = {}
         for cam, rows in (intervals or {}).items():
             name = self._cam_name(cam)
@@ -167,7 +169,7 @@ class Stations:
 
     # -- edits (return a new object)
     def copy(self):
-        s = Stations(cameras=self.cameras)
+        s = Stations(cameras=self.cameras, poses=self.poses)
         s._iv = {k: [list(r) for r in v] for k, v in self._iv.items()}
         return s
 
@@ -376,6 +378,7 @@ class MoveReport:
     stations: Stations
     station_rotations: dict     # cam -> {station: rotvec (rad)}
     info: dict = field(default_factory=dict)
+    station_poses: dict = field(default_factory=dict)   # cam -> {station: 4x4} (recover_moves: full poses)
 
     @property
     def moved(self):
@@ -391,6 +394,9 @@ class MoveReport:
                 cam.get_extrinsics_mat(), torch.Tensor) else cam.get_extrinsics_mat(), float)
             out[name] = {}
             for st, rv in self.station_rotations.get(name, {name: np.zeros(3)}).items():
+                if st in self.station_poses.get(name, {}):
+                    out[name][st] = np.asarray(self.station_poses[name][st], float)
+                    continue
                 dR = G.rodrigues(torch.as_tensor(np.nan_to_num(np.asarray(rv, float)))).numpy()
                 Ei = E.copy()
                 Ei[:3, :3] = dR @ E[:3, :3]
@@ -586,14 +592,20 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
         rv_st, _, _, _ = fit_rotation_offsets(P, c, X[keep], flat[c, sel][keep], seg[keep],
                                               n_groups=len(st_names), huber_px=huber_px, min_points=min_points)
         rots[names[c]] = {nm: rv_st[i] for i, nm in enumerate(st_names)}
-    return MoveReport(cameras=names, window_t0=t0 + np.arange(W) * window_s, window_s=float(window_s),
-                      delta_deg=delta, n_points=npts, resid_px=resid,
-                      change_points=sorted(cps_all, key=lambda d: (d['time'], d['camera'])),
-                      stations=stations, station_rotations=rots,
-                      info=dict(min_step_deg=min_step_deg, z_thr=z_thr, tested=[names[c] for c in cams],
-                                min_support_frac=min_support_frac, low_support=low_support,
-                                max_resid_ratio=max_resid_ratio, bad_fit=bad_fit,
-                                retest=retest_info))
+    rep = MoveReport(cameras=names, window_t0=t0 + np.arange(W) * window_s, window_s=float(window_s),
+                     delta_deg=delta, n_points=npts, resid_px=resid,
+                     change_points=sorted(cps_all, key=lambda d: (d['time'], d['camera'])),
+                     stations=stations, station_rotations=rots,
+                     info=dict(min_step_deg=min_step_deg, z_thr=z_thr, tested=[names[c] for c in cams],
+                               min_support_frac=min_support_frac, low_support=low_support,
+                               max_resid_ratio=max_resid_ratio, bad_fit=bad_fit,
+                               retest=retest_info))
+    # each new station starts from its fitted rotation in a station BA (Stations.poses)
+    rep.stations.poses.update(_relative_poses(cgroup, rep))
+    # leave-one-out points for recover_moves on the same data (not part of the report)
+    rep._loo = dict(tau=float(tau), n=int(N * J), min_other=int(min_other),
+                    cams={c: (out[c]['sel'], out[c]['X']) for c in cams if out[c] is not None})
+    return rep
 
 
 def _refine_step(P, c, X, uv, t, w, kl, kr, rl, rr, huber_px, t_default):
@@ -625,3 +637,448 @@ def _refine_step(P, c, X, uv, t, w, kl, kr, rl, rr, huber_px, t_default):
     if s >= len(ut):
         return float(ut[-1])
     return float(0.5 * (ut[s - 1] + ut[s]))
+
+
+# ------------------------------------------------------------------ moved-camera recovery
+
+def _proj_pose(P, c, R, tv, Xw, E0=None, jac=False):
+    """World points ``Xw [n,3]`` -> pixels of camera ``c`` at the pose ``x_cam = R (E0 X) + tv``
+    (``E0``: the camera's reference extrinsics; ``R [3,3]`` / ``[G,3,3]`` with ``Xw [G,n,3]``).
+    Returns ``uv, z`` and, with ``jac``, ``J [n,2,6]`` w.r.t. a left increment (rotation, translation)."""
+    from .stba import _project_cam, _skew3
+    p = _cam_params(P, c).clone()
+    p[:6] = 0
+    E = P.extrinsics()[c] if E0 is None else E0
+    pc0 = Xw @ E[:3, :3].T + E[:3, 3]
+    pc = pc0 @ R.transpose(-1, -2) + tv[..., None, :] if R.ndim == 3 else pc0 @ R.T + tv
+    shp = pc.shape[:-1]
+    out = _project_cam(p, pc.reshape(-1, 3), int(P.model[c]), P.K[c, 1, 0], P.offset[c], jac=jac)
+    uv, z = out[0].reshape(shp + (2,)), out[1].reshape(shp)
+    if not jac:
+        return uv, z, None
+    JX = out[2]
+    Jr = -(JX @ _skew3(pc.reshape(-1, 3)))
+    return uv, z, torch.cat([Jr, JX], -1)
+
+
+def _match_score(uv, dets, gate):
+    """``uv [..., I, J, 2]`` predicted, ``dets [I, D, J, 2]`` candidates (NaN padded) ->
+    per-instance soft inlier score ``[..., I, D]`` (sum over joints of ``max(0, 1 - e^2/gate^2)``)."""
+    e2 = ((uv[..., :, None, :, :] - dets) ** 2).sum(-1)
+    s = (1 - e2 / gate ** 2).clamp(min=0)
+    return torch.nan_to_num(s, nan=0.0).sum(-1)
+
+
+def _grid_search(P, c, X, dets, gate, max_deg, step_deg, center=None, chunk_cells=4e6):
+    """Best rotation offset (camera frame) on a ``(-max_deg, max_deg]^3`` grid of ``step_deg``
+    around ``center`` (rotation vector, rad): ``(rotvec, score)``."""
+    dev, dt = P.device, P.dtype
+    a = np.radians(np.arange(-max_deg, max_deg + 1e-9, step_deg))
+    g = np.stack(np.meshgrid(a, a, a, indexing='ij'), -1).reshape(-1, 3)
+    Rc = G.rodrigues(torch.as_tensor(np.zeros(3) if center is None else center, dtype=dt, device=dev))
+    Rg = G.rodrigues(torch.as_tensor(g, dtype=dt, device=dev)) @ Rc
+    I, D, J = dets.shape[:3]
+    bs = max(1, int(chunk_cells // max(I * D * J, 1)))
+    scores = []
+    zero = torch.zeros(3, dtype=dt, device=dev)
+    for s in range(0, len(Rg), bs):
+        R = Rg[s:s + bs]
+        Xg = X.reshape(1, -1, 3).expand(len(R), -1, -1)
+        uv, z, _ = _proj_pose(P, c, R, zero.expand(len(R), 3), Xg)
+        uv = torch.where((z > 0)[..., None], uv, torch.full_like(uv, float('nan')))
+        sc = _match_score(uv.reshape(len(R), I, J, 2), dets, gate)
+        scores.append(sc.amax(-1).sum(-1))
+    scores = torch.cat(scores)
+    k = int(torch.argmax(scores))
+    return _rotvec(Rg[k].cpu().numpy()), float(scores[k])
+
+
+def _refine_pose(P, c, X, dets, R, tv, gate, full=True, n_outer=4, n_iter=8):
+    """Robust (truncated) Gauss-Newton of the pose offset ``(R, tv)`` against the best-matching
+    detection of each instance (re-selected every outer iteration): PnP on the matched joints.
+    Returns ``R, tv, cost, n_inliers, choice [I]``."""
+    dev, dt = P.device, P.dtype
+    I, D, J = dets.shape[:3]
+    nd = 6 if full else 3
+    for _ in range(n_outer):
+        uv, z, _ = _proj_pose(P, c, R, tv, X.reshape(-1, 3))
+        sc = _match_score(uv.reshape(I, J, 2), dets, gate)
+        choice = sc.argmax(-1)
+        tgt = dets[torch.arange(I, device=dev), choice].reshape(-1, 2)
+        Xf = X.reshape(-1, 3)
+        ok = torch.isfinite(tgt).all(-1) & torch.isfinite(Xf).all(-1)
+        if int(ok.sum()) < 4:
+            break
+        Xo, To = Xf[ok], tgt[ok]
+        for _ in range(n_iter):
+            uv, z, Jc = _proj_pose(P, c, R, tv, Xo, jac=True)
+            r = uv - To
+            e = r.norm(dim=-1)
+            w = ((e < gate) & (z > 0) & torch.isfinite(e)).to(dt)
+            r = torch.nan_to_num(r) * w[:, None]
+            Jc = torch.nan_to_num(Jc[..., :nd]) * w[:, None, None]
+            H = torch.einsum('nai,naj->ij', Jc, Jc) + 1e-9 * torch.eye(nd, dtype=dt, device=dev)
+            gv = torch.einsum('nai,na->i', Jc, r)
+            step = -torch.linalg.solve(H, gv)
+            dR = G.rodrigues(step[:3])
+            R = dR @ R
+            tv = dR @ tv + (step[3:] if full else 0)
+            if float(step.abs().max()) < 1e-10:
+                break
+    uv, z, _ = _proj_pose(P, c, R, tv, X.reshape(-1, 3))
+    sc = _match_score(uv.reshape(I, J, 2), dets, gate)
+    choice = sc.argmax(-1)
+    tgt = dets[torch.arange(I, device=dev), choice].reshape(-1, 2)
+    e = (uv - tgt).norm(dim=-1)
+    e = torch.where(torch.isfinite(e) & (z > 0), e, torch.full_like(e, float('inf')))
+    cost = float(torch.clamp(e, max=gate).pow(2).sum())
+    return R, tv, cost, int((e < gate).sum()), choice
+
+
+def _frame_detections(detections, names, c):
+    if isinstance(detections, dict):
+        return detections.get(names[c]) or {}
+    return detections[c]
+
+
+def _get_frame(dc, f):
+    if isinstance(dc, dict):
+        v = dc.get(f, dc.get(int(f)) if not isinstance(f, int) else None)
+    else:
+        v = dc[int(f)] if 0 <= int(f) < len(dc) else None
+    if v is None:
+        return None
+    v = np.asarray(v, float) if not isinstance(v, list) else np.stack([np.asarray(x, float) for x in v]) \
+        if len(v) else None
+    if v is None or v.size == 0:
+        return None
+    return v[..., :2].reshape(v.shape[0], -1, 2)
+
+
+def _assign(cost, gate):
+    from scipy.optimize import linear_sum_assignment
+    cc = np.where(np.isfinite(cost), cost, 1e9)
+    r, d = linear_sum_assignment(cc)
+    keep = cc[r, d] < gate
+    return r[keep], d[keep]
+
+
+@dataclass
+class Recovery:
+    """Output of :func:`recover_moves`: ``moves`` (the input :class:`MoveReport` plus the recovered
+    stations, change points with ``recovered=True`` and ``station_poses``), ``points`` (the input
+    points with the recovered cameras re-associated from ``detections``; None without
+    detections), ``cameras`` (per camera: collapse time, step, translation, coverage before /
+    lost / after, status)."""
+    moves: Any
+    points: Any
+    cameras: dict
+
+
+def _loo_quality(P, flat, c, tau, min_other, agree_px, cache=None):
+    """Per cell: supported by the other cameras (>= min_other views) and, among those, whether
+    camera c agrees (LOO error < agree_px). ``cache``: ``(sel, X)`` from :func:`detect_moves`."""
+    C = flat.shape[0]
+    others = [o for o in range(C) if o != c]
+    nv = np.isfinite(flat[others]).all(-1).sum(0)
+    sup = nv >= min_other
+    hit = np.zeros(flat.shape[1], bool)
+    if cache is not None:
+        sel, X = cache
+        X = torch.as_tensor(np.asarray(X, float), dtype=P.dtype, device=P.device)
+    else:
+        sel = np.flatnonzero(sup & np.isfinite(flat[c]).all(-1))
+        X = None
+    if len(sel):
+        if X is None:
+            r = T.triangulate_robust(P.subset(others), flat[others][:, sel], method='msac', tau=tau)
+            X = torch.as_tensor(np.asarray(r.p3d), dtype=P.dtype, device=P.device)
+        eye = torch.eye(3, dtype=P.dtype, device=P.device)
+        uv, z, _ = _proj_pose(P, c, eye, torch.zeros(3, dtype=P.dtype, device=P.device), X)
+        uv = torch.where((z > 0)[:, None], uv, torch.full_like(uv, float('nan'))).cpu().numpy()
+        e = np.linalg.norm(uv - flat[c, sel], axis=-1)
+        hit[sel] = np.isfinite(e) & (e < agree_px)
+    return sup, hit
+
+
+def _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support, max_n=5):
+    """Collapsed runs ``(start, end, level_before)`` (indices into the judged windows ``jw``)."""
+    out = []
+    i = min_windows
+    while i <= len(jw) - min_windows and len(out) < max_n:
+        before = np.nanmedian(q[jw[:i]])
+        after = q[jw[i:i + min_windows]]
+        exp = before * ns[jw[i:i + min_windows]]
+        if before > 0 and exp.sum() >= min_support and \
+                nh[jw[i:i + min_windows]].sum() < collapse_ratio * exp.sum() and np.all(after < 0.5 * before):
+            # end of the run: the first window back to >= half the earlier level
+            end = len(jw)
+            for k in range(i, len(jw)):
+                if q[jw[k]] >= 0.5 * before:
+                    end = k
+                    break
+            out.append((i, end, float(before)))
+            i = end + min_windows
+        else:
+            i += 1
+    return out
+
+
+def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=None, window_s=None,
+                  tau=10.0, agree_px=None, gate_px=None, min_other=2, collapse_ratio=0.3, min_windows=3,
+                  min_support=20, max_deg=15.0, grid_step_deg=2.5, max_instances=600, cameras=None,
+                  device=None, rng=0):
+    """Re-place cameras that were bumped so hard that their LOO coverage collapses.
+
+    A camera whose share of the points supported by the other cameras that it also sees and agrees
+    with (LOO error < ``agree_px``) drops below ``collapse_ratio`` x its earlier level, in at least
+    ``min_windows`` windows of ``window_s`` (default: ``moves.window_s`` or 4 s) from a time
+    ``t`` on, was moved at ``t`` (or lost its data: with people, an association with the old rig
+    cannot match its detections any more). Its new pose is found from the points the *other*
+    cameras triangulate after ``t``: a rotation grid search (``+-max_deg`` in ``grid_step_deg``
+    steps, then a finer grid) scores how many projected keypoints land near a detection of the
+    camera, then a robust Gauss-Newton PnP (rotation + translation, kept only if it explains the
+    data clearly better than the rotation alone) refines it. Detections come from ``detections``
+    (unassociated, the :func:`~aniposelib.workflows.associate_views` input: per camera, per frame
+    id a ``(D, J, 2|3)`` array; ``frame_ids [N]`` maps the rows of ``data`` to those ids;
+    the best-matching detection of each instance is used) or else from the camera's own rows of
+    ``data``. With ``detections`` the camera is then re-associated after ``t`` (Hungarian per
+    frame on the median keypoint distance, gate ``2 x gate_px``) and the returned ``points``
+    carry its observations.
+
+    A recovered camera gets a new station from ``t`` (an existing change point of ``moves`` within
+    two windows is reused). It is accepted when its coverage after recovery is at least half its
+    coverage before the move. Returns a :class:`Recovery`.
+    """
+    P = G.pack(cgroup, device=device)
+    names = list(P.names) if P.names else ['cam{}'.format(i) for i in range(P.n_cams)]
+    p2d = data.detach().cpu().numpy() if isinstance(data, torch.Tensor) else np.array(data, float)
+    squeeze = p2d.ndim == 3
+    if squeeze:
+        p2d = p2d[:, :, None]
+    C, N, J, _ = p2d.shape
+    t = np.asarray(times, float).reshape(-1)
+    if len(t) != N:
+        raise ValueError('times has {} entries for {} rows'.format(len(t), N))
+    if detections is not None and frame_ids is None:
+        frame_ids = np.arange(N)
+    agree_px = float(agree_px if agree_px is not None else 0.8 * tau)
+    gate = float(gate_px if gate_px is not None else tau)
+    ws = float(window_s or (moves.window_s if moves is not None else 4.0))
+    t0 = float(np.nanmin(t))
+    win = np.floor((t - t0) / ws).astype(int)
+    W = int(win.max()) + 1
+    flat = p2d.reshape(C, N * J, 2)
+    wf = np.repeat(win, J)
+    cams = list(range(C)) if cameras is None else [int(x) for x in cameras]
+    out_moves = moves
+    st = moves.stations.copy() if moves is not None else Stations(cameras=names)
+    rots = dict(moves.station_rotations) if moves is not None else {}
+    poses = {k: dict(v) for k, v in (getattr(moves, 'station_poses', None) or {}).items()}
+    cps = list(moves.change_points) if moves is not None else []
+    new_pts = None
+    info = {}
+    E_all = P.extrinsics()
+    dev, dt = P.device, P.dtype
+    gen = np.random.default_rng(rng)
+    lc = getattr(moves, '_loo', None)
+    if not (lc and lc['tau'] == float(tau) and lc['n'] == N * J and lc['min_other'] == int(min_other)):
+        lc = None
+    for c in cams:
+        sup, hit = _loo_quality(P, flat, c, tau, min_other, agree_px,
+                                cache=None if lc is None else lc['cams'].get(c))
+        ns = np.bincount(wf, weights=sup, minlength=W)
+        nh = np.bincount(wf, weights=hit, minlength=W)
+        judged = ns >= min_support
+        if judged.sum() < 2 * min_windows:
+            continue
+        q = np.where(judged, nh / np.maximum(ns, 1), np.nan)
+        # runs of windows where the camera's coverage collapsed
+        jw = np.flatnonzero(judged)
+        for cand, end, before in _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support):
+            k0 = jw[cand]
+            good_t = t[hit.reshape(N, J).any(1) & (win < k0)]
+            t_last = float(good_t.max()) if len(good_t) else t0 + k0 * ws
+            rows_after = np.flatnonzero((t > t_last) & (win >= k0) & (sup.reshape(N, J).any(1)))
+            t_cp = float(0.5 * (t_last + t[rows_after].min())) if len(rows_after) else t0 + k0 * ws
+            t_end = INF if end >= len(jw) else t0 + jw[end] * ws
+            lost = float(np.nanmedian(q[jw[cand:end]]))
+            rows = np.flatnonzero((t >= t_cp) & (t < t_end))
+            d = dict(time=t_cp, t_end=t_end, coverage_before=before, coverage_lost=lost, status='failed')
+            info.setdefault(names[c], []).append(d)
+            # points of the other cameras after the move
+            others = [o for o in range(C) if o != c]
+            r = T.triangulate_robust(P.subset(others), p2d[others][:, rows].reshape(len(others), -1, 2),
+                                     method='msac', tau=tau)
+            Xr = np.asarray(r.p3d, float).reshape(len(rows), J, 3)
+            inst = np.flatnonzero(np.isfinite(Xr).all(-1).sum(-1) >= min(3, J))
+            # candidate detections of camera c per instance
+            if detections is not None:
+                dc = _frame_detections(detections, names, c)
+                dl = [_get_frame(dc, frame_ids[rows[i]]) for i in inst]
+            else:
+                dl = [p2d[c, rows[i]][None] if np.isfinite(p2d[c, rows[i]]).any() else None for i in inst]
+            has = np.array([x is not None for x in dl], bool)
+            inst = inst[has]
+            dl = [x for x in dl if x is not None]
+            d['n_instances'] = int(len(inst))
+            if len(inst) < max(3, min_support // max(J, 1)):
+                d['status'] = 'failed: too few points from the other cameras with detections'
+                continue
+            if len(inst) > max_instances:
+                pick = np.sort(gen.choice(len(inst), max_instances, replace=False))
+            else:
+                pick = np.arange(len(inst))
+            Dm = max(x.shape[0] for x in dl)
+
+            def pad(ix):
+                a = np.full((len(ix), Dm, J, 2), np.nan)
+                for k, i in enumerate(ix):
+                    a[k, :dl[i].shape[0]] = dl[i]
+                return torch.as_tensor(a, dtype=dt, device=dev)
+            Xs = torch.as_tensor(Xr[inst[pick]], dtype=dt, device=dev)
+            Ds = pad(pick)
+            f = float(P.K[c, 0, 0])
+            coarse_gate = max(gate, 0.6 * np.radians(grid_step_deg) * f)
+            rv, s1 = _grid_search(P, c, Xs, Ds, coarse_gate, max_deg, grid_step_deg)
+            rv, s2 = _grid_search(P, c, Xs, Ds, max(gate, coarse_gate / 4), grid_step_deg, grid_step_deg / 4, center=rv)
+            R0 = G.rodrigues(torch.as_tensor(rv, dtype=dt, device=dev))
+            z3 = torch.zeros(3, dtype=dt, device=dev)
+            Rr, tr, cost_r, nin_r, _ = _refine_pose(P, c, Xs, Ds, R0, z3, 2 * gate, full=False)
+            Rr, tr, cost_r, nin_r, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=False)
+            Rf, tf_, cost_f, nin_f, _ = _refine_pose(P, c, Xs, Ds, Rr, tr, gate, full=True)
+            full = cost_f < 0.8 * cost_r and nin_f >= nin_r
+            Rb, tb = (Rf, tf_) if full else (Rr, tr)
+            # coverage after recovery on all instances of the interval
+            Xa = torch.as_tensor(Xr[inst], dtype=dt, device=dev)
+            Da = pad(np.arange(len(inst)))
+            uv, z, _ = _proj_pose(P, c, Rb, tb, Xa.reshape(-1, 3))
+            sc = _match_score(uv.reshape(len(inst), J, 2), Da, gate)
+            ch = sc.argmax(-1)
+            tgt = Da[torch.arange(len(inst), device=dev), ch].reshape(-1, 2)
+            e = (uv - tgt).norm(dim=-1).reshape(len(inst), J).cpu().numpy()
+            cells = np.isfinite(Xr[inst]).all(-1)
+            n_sup = int(sup.reshape(N, J)[rows].sum())
+            after = float(((e < agree_px) & cells).sum() / max(n_sup, 1))
+            E0 = E_all[c]
+            E1 = torch.eye(4, dtype=dt, device=dev)
+            E1[:3, :3] = Rb @ E0[:3, :3]
+            E1[:3, 3] = Rb @ E0[:3, 3] + tb
+            E1n = E1.cpu().numpy()
+            cen0 = -(E0[:3, :3].T @ E0[:3, 3]).cpu().numpy()
+            cen1 = -(E1n[:3, :3].T @ E1n[:3, 3])
+            step = float(np.degrees(np.linalg.norm(_rotvec(Rb.cpu().numpy()))))
+            d.update(coverage_after=after, step_deg=step, rotvec_deg=np.degrees(_rotvec(Rb.cpu().numpy())).tolist(),
+                     center_shift=float(np.linalg.norm(cen1 - cen0)), translation=bool(full),
+                     n_inliers=int(nin_f if full else nin_r), median_px=float(np.median(e[(e < gate) & cells]))
+                     if ((e < gate) & cells).any() else None)
+            if not after >= 0.5 * before:
+                d['status'] = 'failed: coverage after recovery {:.3g} < half of {:.3g}'.format(after, before)
+                continue
+            d['status'] = 'recovered'
+            # station: reuse an existing change point of this camera near t_cp
+            name = names[c]
+            exist = [cp for cp in cps if cp['camera'] == name and abs(cp['time'] - t_cp) <= 2 * ws]
+            if exist:
+                t_cp = float(exist[0]['time'])
+                sn = str(st.lookup_name(name, [t_cp + 1e-9])[0])
+                if sn == SKIP:
+                    sn = str(st.lookup_name(name, [t_cp + 2 * ws])[0])
+                cps = [cp for cp in cps if cp is not exist[0]]
+            else:
+                k = len(st.names(name))
+                sn = '{}@s{}'.format(name, k)
+                while sn in st.names(name):
+                    k += 1
+                    sn = '{}@s{}'.format(name, k)
+            st = st.paint(name, t_cp, t_end, sn)
+            rots.setdefault(name, {name: np.zeros(3)})
+            rots[name][sn] = _rotvec(E1n[:3, :3] @ E0[:3, :3].T.cpu().numpy())
+            poses.setdefault(name, {})[sn] = E1n
+            cps.append(dict(camera=name, time=float(t_cp), window=int(k0), step_deg=step, z=None, recovered=True,
+                            center_shift=d['center_shift'], left_deg=[0.0, 0.0, 0.0], right_deg=d['rotvec_deg']))
+            d['station'] = sn
+            d['time'] = float(t_cp)
+            # re-association of the camera's detections after the move
+            if detections is not None:
+                if new_pts is None:
+                    new_pts = p2d.copy()
+                dc = _frame_detections(detections, names, c)
+                Xall = torch.as_tensor(np.nan_to_num(Xr), dtype=dt, device=dev)
+                uva, za, _ = _proj_pose(P, c, Rb, tb, Xall.reshape(-1, 3))
+                uva = uva.reshape(len(rows), J, 2).cpu().numpy()
+                uva[~np.isfinite(Xr).all(-1)] = np.nan
+                new_pts[c, rows] = np.nan
+                fr = np.asarray(frame_ids)[rows]
+                n_as = 0
+                for fid in np.unique(fr):
+                    ri = np.flatnonzero(fr == fid)
+                    det = _get_frame(dc, fid)
+                    if det is None:
+                        continue
+                    e2 = np.linalg.norm(uva[ri][:, None] - det[None], axis=-1)       # [r, D, J]
+                    with np.errstate(all='ignore'):
+                        nj = np.isfinite(e2).sum(-1)
+                        cost = np.where(nj >= min(3, J), np.nanmedian(e2, -1), np.inf)
+                    a, b = _assign(cost, 2 * gate)
+                    for i, k in zip(a, b):
+                        new_pts[c, rows[ri[i]]] = det[k]
+                        n_as += 1
+                d['n_reassociated'] = int(n_as)
+    if moves is not None or info:
+        base = moves if moves is not None else MoveReport(
+            cameras=names, window_t0=t0 + np.arange(W) * ws, window_s=ws, delta_deg=np.full((C, W, 3), np.nan),
+            n_points=np.zeros((C, W), int), resid_px=np.full((C, W), np.nan), change_points=[], stations=st,
+            station_rotations={}, info={})
+        out_moves = dataclasses.replace(base, stations=st, station_rotations=rots,
+                                        change_points=sorted(cps, key=lambda d: (d['time'], d['camera'])),
+                                        station_poses=poses, info=dict(base.info, recovered=_jsonable(info)))
+        out_moves.stations.poses.update(_relative_poses(cgroup, out_moves))
+    return Recovery(moves=out_moves, points=None if new_pts is None else (new_pts[:, :, 0] if squeeze else new_pts),
+                    cameras=_jsonable(info))
+
+
+def _relative_poses(cgroup, moves):
+    """``{station: dict(camera, D, scale)}``: each station's pose relative to its camera's pose in
+    ``cgroup`` (``E_station = D E_camera``, translation in units of the rig scale ``scale``)."""
+    from .scale import _rig_scale, camera_centers
+    s = float(_rig_scale(camera_centers(cgroup)))
+    out = {}
+    names = cgroup.get_names()
+    for cam, d in (getattr(moves, 'station_poses', None) or {}).items():
+        E0 = cgroup.cameras[names.index(cam)].get_extrinsics_mat()
+        E0 = np.asarray(E0.detach().cpu().numpy() if isinstance(E0, torch.Tensor) else E0, float)
+        for sn, E in d.items():
+            out[sn] = dict(camera=cam, D=np.asarray(E, float) @ np.linalg.inv(E0), scale=s)
+    for cam, d in (moves.station_rotations or {}).items():
+        for sn, rv in d.items():
+            if sn == cam or sn in out or not np.isfinite(np.asarray(rv, float)).all():
+                continue
+            D = np.eye(4)
+            D[:3, :3] = G.rodrigues(torch.as_tensor(np.asarray(rv, float))).numpy()
+            out[sn] = dict(camera=cam, D=D, scale=s)
+    return out
+
+
+def station_init(cgroup, stations, names_order):
+    """Initial ``(rvec [S,3], tvec [S,3])`` for the stations ``names_order`` (list of (camera index,
+    station name)) of ``cgroup``: ``stations.poses`` (relative, rescaled to this group's rig scale)
+    where known, else the camera's own pose. None when no station has a pose."""
+    poses = getattr(stations, 'poses', None) or {}
+    if not any(sn in poses for _, sn in names_order):
+        return None
+    from .scale import _rig_scale, camera_centers
+    s = float(_rig_scale(camera_centers(cgroup)))
+    rv, tv = [], []
+    for c, sn in names_order:
+        E0 = cgroup.cameras[c].get_extrinsics_mat()
+        E0 = np.asarray(E0.detach().cpu().numpy() if isinstance(E0, torch.Tensor) else E0, float)
+        p = poses.get(sn)
+        if p is not None:
+            D = np.array(p['D'], float)
+            if p.get('scale'):
+                D[:3, 3] *= s / float(p['scale'])
+            E0 = D @ E0
+        rv.append(_rotvec(E0[:3, :3]))
+        tv.append(E0[:3, 3])
+    return np.array(rv), np.array(tv)

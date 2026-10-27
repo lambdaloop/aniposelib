@@ -1761,12 +1761,33 @@ def _stations_ba(cg, pc, gr, stations, nf, rng, noise_unit=None):
     # a moved camera's later observations are outliers of the static rig: select loosely (5 % of
     # the diagonal) for a first station fit, then keep the observations within 10 noise units of it
     diag = _diag(cg, pc) or 1000.0
-    _, _, inl = _robust_points(cg, pc, max(10 * u, 0.05 * diag))
     flat = _flat(pc)
     t = np.asarray(gr['time'], float)
     if pc.ndim == 4 and t.ndim == 1:
         t = np.broadcast_to(t[:, None], pc.shape[1:3])
     t = t.reshape(-1)
+    tau_sel = max(10 * u, 0.05 * diag)
+    poses = getattr(stations, 'poses', None) or {}
+    moved = [n for n in cg.get_names() if n in stations and any(s in poses for s in stations.names(n))]
+    if moved:
+        # stations with a known start pose (W4 moves / recovery): select per station combination
+        from ..stations import station_init
+        names_ = cg.get_names()
+        keys = np.stack([stations.lookup_name(n, t) for n in moved], 1).astype(str)
+        combos, ci_ = np.unique(keys, axis=0, return_inverse=True)
+        inl = np.zeros(flat.shape[:2], bool)
+        for k, combo in enumerate(combos):
+            m = np.asarray(ci_).reshape(-1) == k
+            cgk = cg.copy()
+            order = [(names_.index(n), s) for n, s in zip(moved, combo)]
+            init = station_init(cg, stations, order)
+            if init is not None:
+                for (c_, _), rv, tv in zip(order, *init):
+                    cgk.cameras[c_].set_rotation(rv)
+                    cgk.cameras[c_].set_translation(tv)
+            inl[:, m] = _robust_points(cgk, flat[:, m], tau_sel)[2]
+    else:
+        _, _, inl = _robust_points(cg, pc, tau_sel)
     keep = inl & (inl.sum(0) >= 2)[None]
     ci, pj = np.nonzero(keep)
     kw = dict(stations=stations, only_extrinsics=True, loss='cauchy', f_scale=3 * max(nf, MIN_NOISE_PX),
@@ -2087,6 +2108,10 @@ W4_DEFAULTS = dict(
     compare_to=None,          # {name: CameraGroup}: paired LOO agreement vs other calibrations
     clusters=None,            # [N] bootstrap cluster per point (default: the LOO windows / 100 frame blocks)
     n_boot=1000,              # bootstrap resamples of the paired comparison
+    recover_moves=True,       # with times=: re-place cameras whose LOO coverage collapses (stations.recover_moves)
+    detections=None,          # ... unassociated detections (associate_views input) to re-associate a recovered camera
+    frame_ids=None,           # ... frame id of each point row (or of each frame for C x F x P x J x 2 points)
+    recover_kwargs=None,      # ... passed to stations.recover_moves
     verdict=None,
 )
 
@@ -2098,14 +2123,17 @@ class CalibrationEvaluation(WorkflowResult):
     (:class:`aniposelib.stations.MoveReport` or None), ``comparison``
     (:class:`aniposelib.quality.CompareResult` or None), ``quality`` (the full
     :class:`aniposelib.quality.CalibrationReport`), ``per_window`` (time-blocked LOO with
-    ``times=``: per window start time, LOO agreement / median / coverage)."""
+    ``times=``: per window start time, LOO agreement / median / coverage), ``points`` (with
+    ``recover_moves`` and ``detections``: the input points with each recovered camera
+    re-associated after its move, same shape as the input; None otherwise)."""
     per_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     per_window: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     moves: Any = None
     comparison: Any = None
     quality: Any = None
+    points: Any = None
 
-    _skip = ('quality', 'moves')
+    _skip = ('quality', 'moves', 'points')
 
     def to_dict(self):
         d = super().to_dict()
@@ -2229,6 +2257,18 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     if object is not None:
         board, board_points = object, object_points if object_points is not None else board_points
     p = np.asarray(to_numpy(points), dtype='float64')
+    shape5 = None
+    frame_ids = opts['frame_ids']
+    if p.ndim == 5:
+        # identity axis (associate_views output C x F x P x J x 2): rows = (frame, identity)
+        shape5 = p.shape
+        Fn, Pn = p.shape[1], p.shape[2]
+        p = p.reshape(p.shape[0], Fn * Pn, p.shape[3], 2)
+        if times is not None and np.size(times) == Fn:
+            times = np.repeat(np.asarray(times, float).reshape(-1), Pn)
+        fi = np.arange(Fn) if frame_ids is None else np.asarray(frame_ids).reshape(-1)
+        if len(fi) == Fn:
+            frame_ids = np.repeat(fi, Pn)
     gnames = cgroup.get_names()
     missing, dropped = [], []
     if opts['cam_names'] is not None:
@@ -2299,7 +2339,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             ra = Q.ray_angles(cg, X[ok], _flat(p)[:, ok], min_deg=opts['min_ray_deg'])
             grazing = float(ra['frac_points_below'])
     report = dict(overall=qr.overall, coverage=cov, rules=None, cameras_missing=missing, cameras_dropped=dropped)
-    moves = comparison = None
+    moves = comparison = rec_points = None
     moved, center_frac, shape_rel = [], None, None
     if times is not None:
         with timer('moves'):
@@ -2310,6 +2350,21 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             moved = list(moves.moved)
             settings['detect_moves'] = {k: v for k, v in kw.items() if isinstance(v, (int, float))}
             report['moves_info'] = {k: v for k, v in moves.info.items() if k in ('retest', 'low_support')}
+            if opts['recover_moves'] and use_loo:
+                from ..stations import recover_moves
+                if opts['detections'] is not None and frame_ids is None:
+                    raise ValueError("options['detections'] needs options['frame_ids'] (or C x F x P x J x 2 points)")
+                rk = dict(tau=tau, window_s=kw.get('window_s'), min_other=2)
+                rk.update(opts['recover_kwargs'] or {})
+                det = opts['detections']
+                if det is not None and opts['cam_names'] is not None and not isinstance(det, dict):
+                    det = {n: d for n, d in zip(opts['cam_names'], det)}
+                rec = recover_moves(cg, p, times, moves=moves, detections=det, frame_ids=frame_ids, **rk)
+                moves = rec.moves
+                moved = list(moves.moved)
+                report['recovered_moves'] = rec.cameras
+                if rec.points is not None:
+                    rec_points = rec.points if shape5 is None else rec.points.reshape(shape5)
             for n in names:
                 per[n]['moved'] = n in moved
     # time-blocked LOO: per window and camera, LOO agreement at the middle threshold
@@ -2462,7 +2517,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                                                                    compare_to=list(opts['compare_to'] or [])),
                                                        timings=timer.times),
                                  per_camera=per, per_window=per_window, moves=moves, comparison=comparison,
-                                 quality=qr)
+                                 quality=qr, points=rec_points)
 
 
 def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device):
