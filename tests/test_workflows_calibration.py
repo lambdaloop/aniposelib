@@ -236,6 +236,48 @@ def test_w2_outdoor_trajectory_false_detections():
     json.dumps(res.to_dict())
 
 
+def _desynced(true, n=1000, bad=(4, 5, 13), lag=50, seed=1):
+    """A 25 Hz trajectory with times (40 s: 20 'auto' windows of 2 s); in the windows ``bad`` the
+    first half of the cameras see the animal ``lag`` frames later (broken sync)."""
+    p3 = synth.trajectory(true, n + lag, seed=seed)
+    p2 = synth.add_noise(synth.project(true, p3), 0.5, seed=seed + 1)
+    t = np.arange(n) / 25.0
+    m = np.isin(np.floor(t / 2.0).astype(int), bad)
+    out = p2[:, :n].copy()
+    half = len(true.cameras) // 2 + 1
+    out[:half, m] = p2[:half, np.flatnonzero(m) + lag]
+    keep = np.isfinite(out[..., 0]).sum(0) >= 2
+    return out[:, keep], t[keep], m[keep]
+
+
+def test_w2_times_drops_bad_windows():
+    """W2 with times=: desynchronised windows (several cameras at once) are judged by the W4
+    time-blocked LOO and dropped before the final fit; the option turns it off; the window
+    judgement drops nothing on uniform windows; the json report stays small."""
+    from aniposelib.workflows.calibration import _judge_windows
+    true = synth.load_rig('outdoor_9cam')
+    ref = synth.perturb_extrinsics(true, 0.5, 0.01, seed=4)
+    kw = dict(init='reference', refine_intrinsics=False)
+    p2, t, m = _desynced(true)
+    cg, res = calibrate_from_points(p2, ref, times=t, **kw)
+    bw = res.report['bad_windows']
+    assert bw['applied'] and bw['window_s'] == 2.0 and bw['dropped'] == ['8', '10', '26'], bw
+    assert bw['frac_obs_dropped'] == pytest.approx(m.mean(), abs=0.03) and bw['agree_bad'] < 0.5 * bw['agree_good']
+    assert any('dropped 3 of 20' in f for f in res.provenance['fallbacks'])
+    assert synth.center_error(cg, true).max() < 0.01
+    json.dumps(res.to_dict())
+    from aniposelib.bundle import BAReport                # large per-observation masks are summarised in json
+    big = BAReport(excluded=dict(fit=np.zeros((12, 1000), bool), n_fit_excluded=0)).to_dict()['excluded']
+    assert big['fit'] == dict(shape=[12, 1000], n_true=0) and big['n_fit_excluded'] == 0
+    _, res0 = calibrate_from_points(p2, ref, times=t, options=dict(drop_bad_windows=False), **kw)
+    assert 'bad_windows' not in res0.report
+    # uniform windows (clean data): nothing is bad
+    rng = np.random.default_rng(0)
+    le = np.abs(rng.normal(size=(9, 2000)))
+    _, bad, judged, _, _ = _judge_windows(le, np.ones_like(le, bool), np.repeat(np.arange(20), 100), 8.0, 200, 0.5, 3)
+    assert judged.all() and not bad.any()
+
+
 @pytest.fixture(scope='module')
 def motobs():
     true = synth.load_rig('motobs_7cam')
