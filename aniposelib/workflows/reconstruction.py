@@ -334,7 +334,7 @@ def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep, bone
             continue
         X = to_numpy(cg.optim_points(
             seg, X0, constraints=list(bones or []), scale_smooth=scale_smooth,
-            scale_length=opts['bone_weight'] if bone_w is None else bone_w,
+            scale_length=(BONE_WEIGHT_MAX if bone_w is None else bone_w),
             reproj_error_threshold=tau,
             scores=None if sw is None else np.sqrt(sw[:, s:e]),
             n_iters=int(opts['n_iters']), max_lr=opts['max_lr'], fill='all', normalize=True))
