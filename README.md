@@ -1,119 +1,125 @@
 # Anipose lib
 
- [![License](https://img.shields.io/badge/License-BSD%202--Clause-orange.svg)](https://opensource.org/licenses/BSD-2-Clause)
- 
-An easy-to-use library for calibrating cameras and triangulation in Python.
+[![License](https://img.shields.io/badge/License-BSD%202--Clause-orange.svg)](https://opensource.org/licenses/BSD-2-Clause)
 
-This is the backend library for the [Anipose](https://github.com/lambdaloop/anipose) package.
+aniposelib calibrates groups of cameras and turns 2D points seen by several cameras into 3D. It is the library behind
+[Anipose](https://github.com/lambdaloop/anipose), and you can also use it on its own.
 
-## aniposelib-pytorch
+This branch is the PyTorch version, published on PyPI as **`aniposelib-pytorch`**. It runs on the GPU when one is
+available, and it still imports as `aniposelib`.
 
-This branch is published on PyPI as **`aniposelib-pytorch`**: the PyTorch/GPU version of aniposelib
-(cameras are `torch.nn.Module`s, GPU-batched triangulation and bundle adjustment). It still
-**imports as `aniposelib`**.
+## Installing
 
 ```bash
 pip install aniposelib-pytorch
 ```
 
-Install torch with the CUDA build that matches your GPU first if you need a specific one
-(see https://pytorch.org/get-started/locally/).
+If you need a particular CUDA build of PyTorch, install that first (see https://pytorch.org/get-started/locally/).
 
-**It cannot be installed alongside classic `aniposelib`** (numpy, 0.8.x) because both provide the
-`aniposelib` import. `aniposelib-pytorch` depends on a file-less placeholder `aniposelib==0.0.1`, so
-pip/uv refuse environments that also require classic aniposelib. Replace any `aniposelib`
-requirement in your project with `aniposelib-pytorch`. If both somehow end up installed, `import
-aniposelib` raises an error; fix it with:
+A few features need extra packages, which you can add with pip extras:
+
+- `aniposelib-pytorch[deepcharuco]`: a learned ChArUco board detector, which finds boards that OpenCV misses.
+- `aniposelib-pytorch[vggt]`: VGGT, which can guess camera positions straight from images.
+- `aniposelib-pytorch[sync]`: reading audio from video files, for synchronising cameras.
+- `aniposelib-pytorch[all]`: all of the above.
+
+**Don't install it next to the classic `aniposelib` package** (the numpy version, 0.8.x). Both provide the
+`aniposelib` import, so one would overwrite the other. If your project lists `aniposelib` as a requirement, replace it
+with `aniposelib-pytorch`. If both end up installed anyway, `import aniposelib` stops with an error; fix it with:
 
 ```bash
 pip uninstall -y aniposelib aniposelib-pytorch && pip install aniposelib-pytorch
 ```
 
-Do not `pip install aniposelib==0.8.x` into an environment with aniposelib-pytorch: it overwrites
-the package files. Classic aniposelib is still available with `pip install aniposelib` in a
-separate environment.
+## What you can do with it
 
-## Quick start: the seven workflows
+Most projects need some of these seven steps. Each one is a single function.
 
-Each workflow is one function, re-exported at the top level. Each returns a result with `.verdict` (`'ok'` |
-`'warn'` | `'fail'`), `.reasons`, `.report`, `.settings` (every derived threshold), `.summary()` and `.to_json()`.
-Thresholds come from the measured pixel noise and the rig scale, so the defaults work at any unit scale without
-tuning. A bad result is a `'fail'` with reasons, not an exception. Full guide: [docs/workflows.md](docs/workflows.md).
+| I want to... | Function |
+|---|---|
+| calibrate my cameras with a calibration board (or another object of known shape) | `calibrate_from_board` |
+| calibrate my cameras from the animals or people in the videos, without a board | `calibrate_from_points` |
+| put a calibration into real units (mm) or line it up with the floor or an older calibration | `estimate_scale` |
+| check whether a calibration is good, or still good, or whether a camera was bumped | `evaluate_calibration` |
+| line up cameras that weren't recording in sync | `estimate_offsets` |
+| turn 2D keypoints from several cameras into 3D | `reconstruct_3d` |
+| work out which animal is which when several are in view | `associate_views` |
+
+A typical lab setup with a ChArUco board looks like this:
 
 ```python
 import aniposelib as al
 
 board = al.CharucoBoard(7, 5, square_length=25, marker_length=18.75, units='mm')
 
-cgroup, res = al.calibrate_from_board(videos, board, out='calibration.toml')         # W1 board (or al.PointObject)
-cgroup, res = al.calibrate_from_points(p2d, intrinsics=lab_cgroup)                  # W2 from keypoints / people
-res = al.estimate_scale(cgroup, board=board, board_points=rows)                     # W3 metric scale, world frame
-res = al.evaluate_calibration(cgroup, p2d, times=t, reference=old_cgroup)           # W4 QA, reuse, moved cameras
-res = al.estimate_offsets({'cam1': 'cam1.mp4', 'cam2': 'cam2.mov'}, cgroup=cgroup)  # W5 unsynchronised cameras
-res = al.reconstruct_3d(cgroup, p2d, scores=scores, bones=[(0, 1), (1, 2)])          # W6 2D -> 3D
-res = al.associate_views(cgroup, detections)                                        # W7 several animals / people
-print(res.summary())
+# 1. calibrate the cameras from videos of the board
+cgroup, result = al.calibrate_from_board([['cam1.mp4'], ['cam2.mp4'], ['cam3.mp4']], board,
+                                         cam_names=['cam1', 'cam2', 'cam3'],
+                                         out='calibration.toml')
+print(result.summary())
+
+# 2. later, turn 2D keypoints into 3D
+#    points2d has shape (cameras, frames, keypoints, 2), with NaN where a keypoint wasn't found
+recon = al.reconstruct_3d(cgroup, points2d, scores=scores)
+points3d = recon.points3d            # (frames, keypoints, 3)
 ```
 
-Optional extras: `[deepcharuco]` (learned ChArUco detector: `huggingface_hub`, `onnxruntime`, `onnx`), `[vggt]`
-(VGGT initialisation: `vggt`, `huggingface_hub`), `[sync]` (audio decoding: `soundfile`, `av`; an `ffmpeg` executable
-also works), `[all]`. `import aniposelib` imports none of them; sub-modules (`aniposelib.quality`, `.scale`, `.sync`,
-`.init`, ...) load on first access.
+Every function returns a result that tells you how it went:
 
-**Types.** Points are `C x N x 2` (or `C x N x J x 2`) in camera order, NaN = missing; 3D points are `N x 3`.
-Public methods accept numpy or torch: **numpy in gives numpy out, torch in gives detached torch out** (on the
-input's device), and `return_grad=True` keeps the autograd graph. Computation is float64 torch, on the cameras'
-device (`cgroup.to('cuda')`).
+- `result.verdict` is `'ok'`, `'warn'` or `'fail'`.
+- `result.reasons` says, in plain words, what was wrong.
+- `result.summary()` prints a short table of the checks.
 
-## Advanced: the backend
+A bad result comes back as `'fail'` with a reason; it doesn't raise an error. You shouldn't need to tune thresholds:
+they're worked out from how noisy your data is and how big your camera setup is, so the same call works whether
+your setup is measured in millimetres or metres.
 
-The workflows only compose these; use them directly when you need finer control.
+The [workflow guide](docs/workflows.md) walks through each step with examples.
 
-### Board calibration (anipose CLI API)
+## The lower-level toolbox
+
+The seven functions are built from a larger set of tools, which you can use directly when you need more control:
+camera models, board detection, triangulation, bundle adjustment, quality reports, scale and alignment, and
+synchronisation. Some common ones:
+
 ```python
-from aniposelib import CameraGroup, CharucoBoard
-cgroup = CameraGroup.from_names(['A', 'B', 'C'], fisheye=False)
-error, rows = cgroup.calibrate_videos([['A.mp4'], ['B.mp4'], ['C.mp4']], board)   # LM bundle adjustment
+from aniposelib import CameraGroup
+
+cgroup = CameraGroup.load('calibration.toml')
 cgroup.dump('calibration.toml')
-cgroup = CameraGroup.load('calibration.toml')     # numeric camera order: cam_2 < cam_10
+
+p3d = cgroup.triangulate(p2d)                      # simple triangulation, p2d has shape (cameras, points, 2)
+res = cgroup.triangulate_robust(p2d)               # ignores views that disagree with the others
+err = cgroup.reprojection_error(p3d, p2d)
+cgroup.bundle_adjust_robust(p2d)                   # refine the calibration on your points
+report = cgroup.report(p2d)                        # per-camera errors, including leave-one-camera-out
 ```
 
-### Triangulation
+Anipose itself uses the classic calibration call, which still works the same way:
+
 ```python
-p3d = cgroup.triangulate(p2d)                       # p2d [C,N,2] -> [N,3], linear block DLT
-res = cgroup.triangulate_robust(p2d, tau=10, scores=scores)   # MSAC: res.p3d, res.inliers, res.errors
-err = cgroup.reprojection_error(p3d, p2d)           # [C,N,2]
-p3d = cgroup.optim_points(p2d_joints, p3d_joints)   # smoothed / bone-constrained refinement (unit-free)
+cgroup = CameraGroup.from_names(['A', 'B', 'C'])
+error, rows = cgroup.calibrate_videos([['A.mp4'], ['B.mp4'], ['C.mp4']], board)
 ```
 
-### Bundle adjustment, quality, scale, gauge
-```python
-cgroup.bundle_adjust_robust(p2d)                    # robust LM BA -> BAReport (resection, rejection)
-rep = cgroup.report(p2d)                            # per-camera + leave-one-camera-out reprojection
-from aniposelib import scale
-s, res = scale.from_board(cgroup, rows, board)      # or scale.from_lengths / scale.from_reference
-cgroup.align_to(reference_group)                    # trimmed similarity onto another calibration
-cgroup.align_world(ground_points, up='z')           # floor -> z = 0
-```
+Where to find the rest:
 
-### Synchronisation and moving cameras
-```python
-from aniposelib import sync
-est = sync.audio_offset(audio_a, audio_b, sr)       # est.offset (s), est.sigma, est.identifiable
-graph = sync.solve_offset_graph(edges)              # per-stream offsets from pairwise estimates
-from aniposelib.stba import SpatiotemporalBA         # sub-frame offsets, clock rate, rolling shutter
-moves = aniposelib.quality.detect_moves(cgroup, p2d, times)   # bumped cameras -> Stations
-```
+- `aniposelib.init`: ways to get a first guess of the camera positions (from a board, from points, from VGGT).
+- `aniposelib.quality`: calibration checks.
+- `aniposelib.scale`: scale and alignment.
+- `aniposelib.sync` and `aniposelib.stba`: camera synchronisation.
+- `aniposelib.matching`: matching animals across cameras.
+- `aniposelib.intrinsics`: picking a lens model.
+- `aniposelib.geometry` and `aniposelib.triangulation`: the batched maths underneath.
 
-Other modules: `aniposelib.init` (board graph, keypoint SfM, VGGT, candidate selection),
-`aniposelib.matching` (cross-camera association), `aniposelib.intrinsics` (lens-model ladder),
-`aniposelib.params.ParamSpec` (which parameters BA may change, priors, sharing), `aniposelib.geometry`
-(batched camera kernels on `PackedCameras`, plus `camera_from_extrinsics_mat`, `reindex_points`, projection-matrix /
-DLT conversion), `aniposelib.triangulation`, `aniposelib.affine`.
+**A note on data shapes.** 2D points are arrays with the camera as the first axis, `(cameras, points, 2)` or
+`(cameras, frames, keypoints, 2)`, with NaN for missing points. If you pass numpy arrays you get numpy arrays back;
+if you pass torch tensors you get torch tensors back.
 
-**Upgrading:** 1.1 removes the file-format importers (`aniposelib.io`) and a few project-specific helpers (see CHANGELOG, "Removed in 1.1"). 1.0 changes several defaults (numpy-out returns, LM bundle adjustment with a fixed gauge
-instead of Adam, numeric camera order on load, linear triangulation, full-K projection). Every change and how to get
-the old behaviour is in [CHANGELOG.md](CHANGELOG.md).
+## Upgrading
 
-The [documentation](https://anipose.readthedocs.io/en/latest/aniposelib-tutorial.html) is located in Anipose repository.
+Version 1.1 removed the file-format converters (`aniposelib.io`) and a few helpers that were specific to one project.
+Version 1.0 changed several defaults compared with 0.9. [CHANGELOG.md](CHANGELOG.md) lists every change and how to
+get the old behaviour back.
 
+The [Anipose documentation](https://anipose.readthedocs.io/en/latest/aniposelib-tutorial.html) has a tutorial.
