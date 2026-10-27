@@ -52,7 +52,7 @@ all = ["huggingface_hub", "onnxruntime", "onnx", "vggt", "soundfile", "av"]
 Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
 
 [tool.setuptools]
-packages = ["aniposelib", "aniposelib.detectors", "aniposelib.init"]
+packages = ["aniposelib", "aniposelib.detectors", "aniposelib.init", "aniposelib.workflows"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

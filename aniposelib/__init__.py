@@ -30,14 +30,29 @@ from .boards import CharucoBoard, Checkerboard
 # Sub-modules imported on first attribute access (``aniposelib.quality``), so ``import
 # aniposelib`` stays fast and never imports optional dependencies (vggt, huggingface_hub,
 # onnxruntime, soundfile, av, yaml: those are imported inside the functions that need them).
-_LAZY_SUBMODULES = ('affine', 'bundle', 'detectors', 'geometry', 'init', 'intrinsics',
+_LAZY_SUBMODULES = ('affine', 'bundle', 'detectors', 'geometry', 'init', 'intrinsics', 'workflows',
                     'matching', 'quality', 'scale', 'stations', 'stba', 'sync', 'triangulation')
 
 __all__ = ['boards', 'cameras', 'params', 'utils', 'Camera', 'FisheyeCamera', 'CameraGroup',
            'CharucoBoard', 'Checkerboard', '__version__'] + list(_LAZY_SUBMODULES)
 
 
+# the seven workflow entry points (plan 05), lazily re-exported from aniposelib.workflows
+_WORKFLOW_NAMES = ('calibrate_from_board', 'calibrate_from_points', 'estimate_scale',
+                   'evaluate_calibration', 'estimate_offsets', 'reconstruct_3d', 'associate_views',
+                   'PointObject')
+__all__ += list(_WORKFLOW_NAMES)
+
+
 def __getattr__(name):
+    if name in _WORKFLOW_NAMES:
+        import importlib
+        if name == 'PointObject':
+            val = importlib.import_module('.boards', __name__).PointObject
+        else:
+            val = getattr(importlib.import_module('.workflows', __name__), name)
+        globals()[name] = val
+        return val
     if name in _LAZY_SUBMODULES:
         import importlib
         mod = importlib.import_module('.' + name, __name__)
@@ -47,4 +62,4 @@ def __getattr__(name):
 
 
 def __dir__():
-    return sorted(set(globals()) | set(_LAZY_SUBMODULES))
+    return sorted(set(globals()) | set(_LAZY_SUBMODULES) | set(_WORKFLOW_NAMES))
