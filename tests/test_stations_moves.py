@@ -91,7 +91,7 @@ def test_retest_clears_cameras_flagged_because_of_the_moved_one():
     for n in first.moved:
         if n != names[1]:
             assert rep.info['retest'][n]['result'] == 'cleared'
-            assert rep.info['retest'][n]['excluded'] == [names[1]]
+            assert rep.info['retest'][n]['explained_by'] == names[1]
             assert rep.stations.names(n) == [n]
     assert rep.change_points[0]['z'] > 6 and abs(rep.change_points[0]['time'] - 13.2) < 0.2
 
@@ -110,8 +110,8 @@ def test_retest_keeps_a_second_true_move():
     assert sorted(r['result'] for r in rep.info['retest'].values()).count('kept') == 2
 
 
-def test_retest_without_support_keeps_first_pass():
-    # 3 cameras, min_other=2: excluding a moved camera leaves one view -> cannot re-test
+def test_retest_two_moves_of_three_cameras_kept():
+    # 3 cameras, two of them moved: correcting one does not explain the other away
     rig = synth.load_rig('motobs_7cam').subset_cameras([1, 2, 3])
     names = rig.get_names()
     t, X = _tracks(rig)
@@ -119,4 +119,4 @@ def test_retest_without_support_keeps_first_pass():
     first = ST.detect_moves(rig, p2, times=t, window_s=2.0, retest=False)
     rep = ST.detect_moves(rig, p2, times=t, window_s=2.0)
     assert rep.moved == first.moved and len(rep.moved) >= 2
-    assert any(r['result'].startswith('insufficient') for r in rep.info['retest'].values())
+    assert all(r['result'] == 'kept' for r in rep.info['retest'].values())

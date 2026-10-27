@@ -426,7 +426,7 @@ def _dense_from_obs(obs, time_tol):
 def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_windows=3, z_thr=6.0,
                  sharp=1.5, tau=10.0, min_points=20, huber_px=3.0, cameras=None, refine=True,
                  skip_s=0.0, max_cp=10, fps=None, time_tol=1e-3, min_other=2, device=None,
-                 min_support_frac=0.25, retest=True, max_resid_ratio=5.0):
+                 min_support_frac=0.25, retest=True, max_resid_ratio=5.0, suspect_frac=0.5):
     """Detect camera bumps / re-aims (see module docstring).
 
     Args:
@@ -450,11 +450,18 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
             explained by a rotation (decoys, false detections, broken sync) and is dropped like a
             low-support window (``info['bad_fit']``); a real re-aim is explained by the offset, so
             its windows fit as well as the others. ``None``: off.
-        retest: after the first pass, flagged cameras are re-tested in order of decreasing z
-            with the already-confirmed moved cameras removed from the triangulating views; a
-            camera stays flagged only if it is still flagged without them (the strongest one is
-            always kept). If the re-test lacks support (``min_points`` / ``min_other``), the
-            first-pass result is kept. Details in ``info['retest']``. ``False``: one pass.
+        retest: explain-away re-test. A moved camera biases the leave-one-out points of its
+            neighbours, so they look rotated too (and with robust thresholds the mover itself may
+            stay below ``z_thr``). Suspects are the cameras with a step of z >= ``suspect_frac x
+            z_thr`` in the first pass. Repeatedly, each suspect's observations are rotated back by
+            its fitted offsets and the other suspects re-tested; the suspect whose correction
+            removes the most evidence (sum of step angles) from the others is confirmed
+            (``info['retest'][cam]['explains']``, it may be a suspect below ``z_thr``), the
+            correction is kept and the remaining flagged cameras are re-tested on the corrected
+            data: they stay flagged only if they still step. If no correction removes evidence,
+            the first-pass flags are kept; a re-test without support keeps the first pass.
+            ``False``: one pass (1.1.0 before this change: flagged cameras in order of z, the
+            strongest always kept; ``suspect_frac=None`` keeps suspects = flagged).
         cameras: indices to test (default all). refine: refine step times to the frame.
         skip_s: mark ``[t - skip_s/2, t + skip_s/2)`` around each step as ``'skip'``.
 
@@ -484,21 +491,22 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
     tf = np.repeat(t, J)
     wf = np.repeat(win, J)
 
-    def test(c, exclude=()):
+    def test(c, exclude=(), z=z_thr, fl=None):
+        flat_ = flat if fl is None else fl
         others = [o for o in range(C) if o != c and o not in exclude]
         if len(others) < max(min_other, 2):
             return None
-        nv = np.isfinite(flat[others]).all(-1).sum(0)
-        sel = np.flatnonzero((nv >= min_other) & np.isfinite(flat[c]).all(-1))
+        nv = np.isfinite(flat_[others]).all(-1).sum(0)
+        sel = np.flatnonzero((nv >= min_other) & np.isfinite(flat_[c]).all(-1))
         if len(sel) < min_points:
             return None
-        res = T.triangulate_robust(P.subset(others), flat[others][:, sel], method='msac', tau=tau)
+        res = T.triangulate_robust(P.subset(others), flat_[others][:, sel], method='msac', tau=tau)
         X = np.asarray(res.p3d)
         ok = np.isfinite(X).all(1)
         sel, X = sel[ok], X[ok]
         if len(sel) < min_points:
             return None
-        rv, med, cnt, _ = fit_rotation_offsets(P, c, X, flat[c, sel], wf[sel], n_groups=W,
+        rv, med, cnt, _ = fit_rotation_offsets(P, c, X, flat_[c, sel], wf[sel], n_groups=W,
                                                huber_px=huber_px, min_points=min_points)
         d = np.degrees(rv)
         low = np.zeros(W, bool)
@@ -518,35 +526,94 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
                 badfit = fm & (med > lim)
                 d[badfit] = np.nan
         cps = detect_steps(d, np.sqrt(np.maximum(cnt, 0)) * np.isfinite(d).all(1),
-                           min_step=min_step_deg, min_seg=min_windows, z_thr=z_thr, sharp=sharp, max_cp=max_cp)
+                           min_step=min_step_deg, min_seg=min_windows, z_thr=z, sharp=sharp, max_cp=max_cp)
         return dict(delta=d, cnt=cnt, med=med, cps=cps, X=X, sel=sel, low=low, badfit=badfit, others=others)
 
-    out = {c: test(c) for c in cams}
+    def zmax(r):
+        return max([cp['z'] for cp in r['cps']], default=0.0) if r is not None else 0.0
+
+    def stepmax(r):
+        return max([cp['step'] for cp in r['cps']], default=0.0) if r is not None else 0.0
+
+    def corrected(fl, m, r):
+        """``fl`` with camera m's observations rotated back by its per-segment offsets."""
+        cps = r['cps']
+        if not cps:
+            return fl
+        means = [np.asarray(cps[0]['left_mean'])] + [np.asarray(cp['right_mean']) for cp in cps]
+        edges = [-INF] + [t0 + cp['index'] * window_s for cp in cps] + [INF]
+        fl = fl.copy()
+        cam = cgroup.cameras[m]
+        for k, mu in enumerate(means):
+            sel = np.flatnonzero((tf >= edges[k]) & (tf < edges[k + 1]) & np.isfinite(fl[m]).all(-1))
+            if not len(sel) or not np.isfinite(mu).all():
+                continue
+            xy = np.asarray(cam.undistort_points(np.asarray(fl[m, sel], float)), float).reshape(-1, 2)
+            ray = torch.as_tensor(np.c_[xy, np.ones(len(xy))], dtype=P.dtype, device=P.device)
+            dR = G.rodrigues(torch.as_tensor(np.radians(mu), dtype=P.dtype, device=P.device))
+            uv, z, _ = _proj_pose(P, m, dR.T, torch.zeros(3, dtype=P.dtype, device=P.device), ray,
+                                  E0=torch.eye(4, dtype=P.dtype, device=P.device))
+            fl[m, sel] = np.where((z > 0).cpu().numpy()[:, None], uv.cpu().numpy(), np.nan)
+        return fl
+
+    zc = z_thr * float(suspect_frac) if (retest and suspect_frac) else z_thr
+    out = {c: test(c, z=zc) for c in cams}
+    z_first = {c: zmax(out[c]) for c in cams}
+    first = dict(out)
+    suspects = sorted([c for c in cams if z_first[c] >= zc], key=lambda c: -z_first[c])
+    for c in cams:                      # change points of the first pass: z >= z_thr only
+        if out[c] is not None:
+            out[c] = dict(out[c], cps=[cp for cp in out[c]['cps'] if cp['z'] >= z_thr])
     retest_info = {}
     if retest:
         flagged = [c for c in cams if out[c] is not None and out[c]['cps']]
-        flagged.sort(key=lambda c: -max(cp['z'] for cp in out[c]['cps']))
         confirmed = []
-        for c in flagged:
-            if not confirmed:
-                confirmed.append(c)
-                retest_info[names[c]] = dict(result='kept', excluded=[], z_first=max(cp['z'] for cp in out[c]['cps']))
-                continue
-            excl = [o for o in confirmed if o != c]
-            r = test(c, exclude=excl)
-            z1 = max(cp['z'] for cp in out[c]['cps'])
-            if r is None:
-                retest_info[names[c]] = dict(result='insufficient support (first pass kept)',
-                                             excluded=[names[o] for o in excl], z_first=z1)
-                confirmed.append(c)
-                continue
-            out[c] = r
-            if r['cps']:
-                confirmed.append(c)
-                retest_info[names[c]] = dict(result='kept', excluded=[names[o] for o in excl], z_first=z1,
-                                             z_retest=max(cp['z'] for cp in r['cps']))
-            else:
-                retest_info[names[c]] = dict(result='cleared', excluded=[names[o] for o in excl], z_first=z1)
+        work = flat
+        ev = {c: stepmax(first[c]) for c in suspects}   # current evidence (deg of the largest step, z >= zc)
+        while flagged:
+            # explain away: a moved camera biases its neighbours' leave-one-out points, so they look
+            # rotated too. The mover is the suspect whose correction (its observations rotated back
+            # by its fitted offsets) removes most of the other suspects' evidence.
+            best = None
+            for m in [c for c in suspects if c not in confirmed]:
+                rm = test(m, fl=work, z=zc)
+                if rm is None or not rm['cps']:
+                    continue
+                wm = corrected(work, m, rm)
+                after = {f: stepmax(test(f, fl=wm, z=zc)) for f in suspects if f != m and f not in confirmed}
+                gain = sum(ev[f] - after[f] for f in after)
+                if best is None or gain > best[0]:
+                    best = (gain, m, rm, wm, after)
+            if best is None or (best[0] <= 0 and best[1] not in flagged):
+                for f in flagged:       # nothing explains it: keep the first pass
+                    confirmed.append(f)
+                    retest_info[names[f]] = dict(result='kept', z_first=z_first[f], explains=[])
+                break
+            gain, m, rm, wm, after = best
+            rm = dict(rm, cps=[cp for cp in rm['cps'] if cp['z'] >= zc])
+            out[m] = rm
+            confirmed.append(m)
+            cleared = [names[f] for f in flagged if f != m and after.get(f, 0.0) == 0.0]
+            retest_info[names[m]] = dict(result='kept', z_first=z_first[m], z_retest=zmax(rm),
+                                         explains=cleared, evidence_removed=float(gain))
+            work = wm
+            rest = []
+            for f in flagged:
+                if f == m:
+                    continue
+                r = test(f, fl=work)
+                if r is None:
+                    confirmed.append(f)
+                    retest_info[names[f]] = dict(result='insufficient support (first pass kept)', z_first=z_first[f])
+                    continue
+                out[f] = r
+                if r['cps']:
+                    rest.append(f)
+                else:
+                    retest_info[names[f]] = dict(result='cleared', z_first=z_first[f], explained_by=names[m])
+            for f in after:
+                ev[f] = after[f]
+            flagged = rest
 
     delta = np.full((C, W, 3), np.nan)
     npts = np.zeros((C, W), int)
