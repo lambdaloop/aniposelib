@@ -2559,11 +2559,24 @@ class CameraGroup(nn.Module):
         best_loss = torch.tensor(float('inf'), device=device, dtype=dtype)
         best_state = {k: v.detach().clone() for k, v in params.items()}
 
+        # the cameras are fixed here: pack them once, detached (no per-iteration packing,
+        # rodrigues or camera-parameter gradients; the point gradients are unchanged)
+        proj_fn = None
+        if len(self.cameras) and self._packable():
+            P_fix = self._pack_internal(grad=False)
+            E_fix = P_fix.extrinsics().detach()
+
+            def proj_fn(X):
+                bad = ~torch.isfinite(X).all(-1)
+                X = torch.where(bad[:, None], torch.zeros_like(X), X)
+                uv, _ = _G._project_flat(P_fix, X, E_fix)
+                return torch.where(bad[None, :, None], torch.full_like(uv, float('nan')), uv)
+
         # the public wrapper runs under no_grad; the fit itself needs autograd
         with torch.enable_grad():
             for i in range(n_iters):
                 optimizer.zero_grad()
-                loss = self._error_fun_triangulation(params, points_tensor,
+                loss = self._error_fun_triangulation(params, points_tensor, proj_fn=proj_fn,
                                                      constraints=constraints,
                                                      constraints_weak=constraints_weak,
                                                      scores=scores,
@@ -2706,8 +2719,9 @@ class CameraGroup(nn.Module):
                                  reproj_error_threshold=100,
                                  reproj_loss='soft_l1',
                                  n_deriv_smooth=1,
-                                 p3ds_fixed=None, unit=None, center=None):
-        """optim_points loss. With ``unit``/``center`` (normalised mode) ``params['p3d']`` are
+                                 p3ds_fixed=None, unit=None, center=None, proj_fn=None):
+        """optim_points loss. ``proj_fn``: world points [M,3] -> pixels [C,M,2] (default
+        ``self._project``). With ``unit``/``center`` (normalised mode) ``params['p3d']`` are
         pixel-equivalent coordinates ``q`` (world = center + unit * q); smoothness and bone
         terms are then on ``q``, and the bone term is a plain squared difference."""
         n_cams, n_frames, n_joints, _ = p2ds.shape
@@ -2733,7 +2747,10 @@ class CameraGroup(nn.Module):
         if unit is not None:
             p3ds_flat = center + unit * p3ds_flat
         p2ds_flat = p2ds.reshape((n_cams, -1, 2))
-        errors = self._reprojection_error(p3ds_flat, p2ds_flat)
+        if proj_fn is None:
+            errors = self._reprojection_error(p3ds_flat, p2ds_flat)
+        else:
+            errors = p2ds_flat - proj_fn(p3ds_flat).reshape(p2ds_flat.shape)
         if scores is not None:
             scores_flat = scores.reshape((n_cams, -1))
             errors = errors * scores_flat[:, :, None]
