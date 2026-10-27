@@ -502,6 +502,50 @@ def _xcorr_ncc(a, b):
     return lags, ncc, np.round(n).astype(np.int64)
 
 
+def _xcorr_ncc_rows(A, B, block=64):
+    """:func:`_xcorr_ncc` of every row pair ``(A[i], B[i])``, batched (one FFT per block of rows).
+    Yields ``(ncc [rows, L], lags, n)`` per block, in row order. Rows with missing values go
+    through :func:`_xcorr_ncc` one at a time."""
+    A = np.asarray(A, float)
+    B = np.asarray(B, float)
+    k = 0
+    while k < len(A):
+        if not (np.isfinite(A[k]).all() and np.isfinite(B[k]).all()) or A.shape[1] < 2 or B.shape[1] < 2:
+            lags, ncc, n = _xcorr_ncc(A[k], B[k])
+            yield ncc[None], lags, n
+            k += 1
+            continue
+        e = k
+        while e < len(A) and e - k < block and np.isfinite(A[e]).all() and np.isfinite(B[e]).all():
+            e += 1
+        a0, b0 = A[k:e], B[k:e]
+        a0 = (a0 - a0.mean(1, keepdims=True)) / (a0.std(1, keepdims=True) + 1e-300)
+        b0 = (b0 - b0.mean(1, keepdims=True)) / (b0.std(1, keepdims=True) + 1e-300)
+        ma, mb = np.ones(a0.shape[1]), np.ones(b0.shape[1])
+
+        def cc(x, y):
+            x = x[..., ::-1]
+            if x.ndim == 1 and y.ndim == 1:
+                return _signal.fftconvolve(x, y, mode='full')
+            x, y = np.broadcast_to(x, (e - k, x.shape[-1])), np.broadcast_to(y, (e - k, y.shape[-1]))
+            return _signal.fftconvolve(x, y, mode='full', axes=-1)
+        n = cc(ma, mb)
+        sab = cc(a0, b0)
+        sa = cc(a0, mb)
+        sb = cc(ma, b0)
+        saa = cc(a0 * a0, mb)
+        sbb = cc(ma, b0 * b0)
+        n_safe = np.maximum(np.round(n), 1.0)
+        cov = sab - sa * sb / n_safe
+        va = saa - sa * sa / n_safe
+        vb = sbb - sb * sb / n_safe
+        den = np.sqrt(np.maximum(va * vb, 0.0))
+        with np.errstate(invalid='ignore', divide='ignore'):
+            ncc = np.where(den > 1e-9 * n_safe, cov / den, np.nan)
+        yield ncc, np.arange(-A.shape[1] + 1, B.shape[1]), np.round(n).astype(np.int64)
+        k = e
+
+
 def _parabolic(x, y, i):
     """Sub-sample vertex of a peak/valley at index i (returns x[i] at the edges)."""
     if i <= 0 or i >= len(y) - 1 or not np.all(np.isfinite(y[i - 1:i + 2])):
@@ -791,10 +835,10 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
         Sb, _, _ = _spectrogram_feature(b, sr, nperseg, flim)
         hop = nperseg - nperseg // 2
         acc = None
-        for fa, fb in zip(Sa, Sb):
-            lags, ncc, n = _xcorr_ncc(fa, fb)
-            ncc = np.nan_to_num(ncc)
-            acc = ncc if acc is None else acc + ncc
+        for ncc_rows, lags, n in _xcorr_ncc_rows(Sa, Sb):
+            for ncc in ncc_rows:
+                ncc = np.nan_to_num(ncc)
+                acc = ncc if acc is None else acc + ncc
         sc = acc / len(Sa)
         keep = n >= max(int(round(min_overlap * frate)), 2)
         if max_lag is not None:
