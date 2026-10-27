@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
+from . import _lm
 from . import geometry as G
 from . import triangulation as T
 from .params import ParamSpec, IntrinsicsPrior, DIST_NAMES, dist_index
@@ -53,7 +54,7 @@ __all__ = ['Observations', 'BAReport', 'BAError', 'RejectSchedule', 'ResectResul
            'bundle_adjust_robust', 'resect_cameras', 'place_cameras', 'add_camera', 'frame_mask',
            'keypoint_mask', 'LOSSES']
 
-LOSSES = ('linear', 'huber', 'cauchy', 'soft_l1')
+LOSSES = _lm.LOSSES
 
 # layout of the per-observation local camera vector
 _EXT = slice(0, 6)
@@ -304,23 +305,7 @@ def rig_scale_from_centers(centers):
 
 # ====================================================================== projection kernel
 
-def _rob(e2, loss, f):
-    """Robust cost rho(e^2) in px^2 units, and IRLS weight rho'(e^2)."""
-    if loss == 'linear':
-        return e2, torch.ones_like(e2)
-    if loss == 'cauchy':
-        s = f * f
-        return s * torch.log1p(e2 / s), 1.0 / (1.0 + e2 / s)
-    if loss == 'huber':
-        e = torch.sqrt(e2)
-        rho = torch.where(e <= f, e2, 2 * f * e - f * f)
-        w = torch.where(e <= f, torch.ones_like(e), f / e.clamp(min=1e-12))
-        return rho, w
-    if loss == 'soft_l1':
-        s = f * f
-        z = torch.sqrt(1 + e2 / s)
-        return 2 * s * (z - 1), 1.0 / z
-    raise ValueError('unknown loss {!r}; use one of {}'.format(loss, LOSSES))
+_rob = _lm.robust
 
 
 def _project_local(L, Xw, k10, off, is_kb, has_b, has_k):
@@ -642,13 +627,8 @@ class _Problem:
         coef_loc = np.concatenate([np.ones((S, 6)), coef_cam[self.station_cam]], 1)
         active = np.nonzero((idx_loc >= 0).any(0))[0]
         self.active = torch.as_tensor(active, device=dev, dtype=torch.long)
-        Q = len(active)
-        self.Q = Q
-        Pm = torch.zeros(S, Q, max(n, 1), dtype=dt, device=dev)
-        il, cl = idx_loc[:, active], coef_loc[:, active]
-        ss, qq = np.nonzero(il >= 0)
-        Pm[ss, qq, il[ss, qq]] = torch.as_tensor(cl[ss, qq], dtype=dt, device=dev)
-        self.Pm = Pm
+        self.Q = len(active)
+        self.idx_act, self.coef_act = idx_loc[:, active], coef_loc[:, active]          # [S,Q]
         # tables for the update
         self.t_idx_ext = torch.as_tensor(idx_ext, device=dev)
         self.t_idx_cam = torch.as_tensor(idx_cam, device=dev)
@@ -744,8 +724,7 @@ def _kind_linearize(prob, kind, Lst, Sv):
     cam = prob.cam_o[kind.sel]
     Lo = Lst[st]
     So = Sv[kind.sidx]
-    Xw = kind.world(So)
-    uvp, z, dL, dX = _project_local_jac(Lo, Xw, prob.k10[cam], prob.off[cam], prob.is_kb[cam],
+    uvp, z, dL, dX = _project_local_jac(Lo, kind.world(So), prob.k10[cam], prob.off[cam], prob.is_kb[cam],
                                         prob.has_b, prob.has_k)
     r = uvp - prob.uv[kind.sel]
     if kind.name == 'rigid':
@@ -754,87 +733,73 @@ def _kind_linearize(prob, kind, Lst, Sv):
         Js = torch.cat([dX @ dw, dX], -1)                                           # [m,2,6]
     else:
         Js = dX
-    Jc = dL[:, :, prob.active]
-    return r, z, Jc, Js
+    return r, z, dL[:, :, prob.active], Js
 
 
-def _chunks_by_struct(kind, S, Q, max_elems):
-    """Chunks of structure indices [s0, s1) and the observation masks of each."""
-    per = max(1, S * Q * kind.D)
-    step = max(1, int(max_elems // per))
-    out = []
-    for s0 in range(0, kind.n, step):
-        s1 = min(kind.n, s0 + step)
-        m = (kind.sidx >= s0) & (kind.sidx < s1)
-        out.append((s0, s1, m))
-    return out
+# ====================================================================== LM problem
 
+class _BundleLM:
+    """:func:`bundle_adjust_lm` as a problem of the shared LM engine (:mod:`aniposelib._lm`).
+    State: ``(ext [S,6], intr [C,13], [structure values per kind])``."""
 
-# ====================================================================== LM core
+    def __init__(self, prob, kinds, loss, f_scale, scale_mode=None, scale_pair=None):
+        self.prob, self.kinds, self.loss, self.f = prob, kinds, loss, f_scale
+        self.NC = prob.NC
+        e2 = torch.tensor((30.0 * f_scale) ** 2, dtype=torch.float64)
+        self.bad_pen = float(_lm.robust(e2, loss, f_scale)[0])
+        self.conf_k = [prob.conf[k.sel] for k in kinds]
+        dev = prob.device
+        cols = np.where(prob.idx_act >= 0, prob.idx_act, prob.NC)                  # [S,Q]
+        self.cols_k = [torch.as_tensor(cols, device=dev)[prob.st_o[k.sel]] for k in kinds]
+        coef = torch.as_tensor(prob.coef_act, dtype=prob.dtype, device=dev)
+        self.coef_k = [coef[prob.st_o[k.sel]] for k in kinds]
+        self.scale_mode = scale_mode
+        self.fixed_st = list(prob.gauge_stations)
+        self.ext_ref = prob.ext.clone()
+        self.scale0 = rig_scale_from_centers(prob.centers(prob.ext)) if scale_mode == 'keep' else None
+        self.pair = None
+        if scale_pair is not None:
+            a, b = scale_pair[0], scale_pair[1]
+            ia = prob.station_names.index(a) if a in prob.station_names else _cam_index(prob.cgroup, a)
+            ib = prob.station_names.index(b) if b in prob.station_names else _cam_index(prob.cgroup, b)
+            sig = float(scale_pair[3]) if len(scale_pair) > 3 and scale_pair[3] else None
+            self.pair = (ia, ib, float(scale_pair[2]), sig)
 
-def _bad_penalty(loss, f):
-    e2 = torch.tensor((30.0 * f) ** 2, dtype=torch.float64)
-    return float(_rob(e2, loss, f)[0])
-
-
-def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=1e-7,
-              scale_mode=None, scale_pair=None, solver='auto', max_elems=1 << 24, verbose=False):
-    """Schur-complement LM. Returns (ext, intr, values list, history, converged)."""
-    dev, dt = prob.device, prob.dtype
-    S, Q, NC = prob.S, prob.Q, prob.NC
-    Pm2 = prob.Pm.reshape(S * Q, -1)
-    bad_pen = _bad_penalty(loss, f_scale)
-    st_k = [prob.st_o[k.sel] for k in kinds]
-    conf_k = [prob.conf[k.sel] for k in kinds]
-    chunks = [_chunks_by_struct(k, S, Q, max_elems) for k in kinds]
-    if solver == 'auto':
-        solver = 'dense' if S * Q <= 1500 else 'pcg'
-    sp = prob.spec
-
-    # ---- gauge helpers
-    fixed_st = list(prob.gauge_stations)
-    scale0 = None
-    if scale_mode == 'keep':
-        scale0 = rig_scale_from_centers(prob.centers(prob.ext))
-    pair_idx = None
-    if scale_pair is not None:
-        a, b = scale_pair[0], scale_pair[1]
-        ia = prob.station_names.index(a) if a in prob.station_names else _cam_index(prob.cgroup, a)
-        ib = prob.station_names.index(b) if b in prob.station_names else _cam_index(prob.cgroup, b)
-        pair_idx = (ia, ib, float(scale_pair[2]), (float(scale_pair[3]) if len(scale_pair) > 3 and scale_pair[3] else None))
-
-    def renorm(ext, values):
-        if scale_mode == 'keep':
-            target = scale0
-            cur = rig_scale_from_centers(prob.centers(ext))
-        elif pair_idx is not None and pair_idx[3] is None:
+    def _renorm(self, ext, values):
+        """Restore the scale gauge (rig RMS scale, or a hard camera-pair distance)."""
+        prob = self.prob
+        if self.scale_mode == 'keep':
+            target, cur = self.scale0, rig_scale_from_centers(prob.centers(ext))
+        elif self.pair is not None and self.pair[3] is None:
             cen = prob.centers(ext)
-            target = pair_idx[2]
-            cur = float(torch.linalg.norm(cen[pair_idx[0]] - cen[pair_idx[1]]))
+            target = self.pair[2]
+            cur = float(torch.linalg.norm(cen[self.pair[0]] - cen[self.pair[1]]))
         else:
             return ext, values
         if not (cur > 0 and np.isfinite(cur)):
             return ext, values
         s = target / cur
         cen = prob.centers(ext)
-        pivot = cen[fixed_st[0]] if fixed_st else cen.mean(0)
+        fixed = self.fixed_st
+        pivot = cen[fixed[0]] if fixed else cen.mean(0)
         R = G.rodrigues(ext[:, :3])
         newc = pivot + s * (cen - pivot)
         ext = torch.cat([ext[:, :3], -(R @ newc[:, :, None])[..., 0]], 1)
-        if fixed_st:
-            ext[fixed_st] = prob.ext_fixed_ref[fixed_st]
+        if fixed:
+            ext[fixed] = self.ext_ref[fixed]
         out = []
-        for k, v in zip(kinds, values):
+        for k, v in zip(self.kinds, values):
             if k.name == 'rigid':
                 v = torch.cat([v[:, :3], pivot + s * (v[:, 3:] - pivot)], 1)
             else:
                 v = pivot + s * (v - pivot)
             out.append(v)
         return ext, out
-    prob.ext_fixed_ref = prob.ext.clone()
 
-    def prior_terms(ext, intr):
-        """(cost, H [NC,NC], g [NC]) of the priors in theta space."""
+    def _prior_terms(self, ext, intr):
+        """(cost, H [NC,NC], g [NC]) of the intrinsics priors and the soft pair-distance prior."""
+        prob = self.prob
+        NC, dt, dev = self.NC, prob.dtype, prob.device
         H = torch.zeros(NC, NC, dtype=dt, device=dev)
         g = torch.zeros(NC, dtype=dt, device=dev)
         cost = 0.0
@@ -850,8 +815,8 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             cost += float(r * r)
             H[i, i] += J * J
             g[i] += J * r
-        if pair_idx is not None and pair_idx[3] is not None:
-            ia, ib, d0, sig = pair_idx
+        if self.pair is not None and self.pair[3] is not None:
+            ia, ib, d0, sig = self.pair
 
             def res(ea, eb):
                 Ra, Rb = G.rodrigues(ea[:3]), G.rodrigues(eb[:3])
@@ -869,155 +834,40 @@ def _lm_solve(prob, kinds, loss='cauchy', f_scale=5.0, n_iter=25, lam=1e-3, tol=
             g += Jt * r
         return cost, H, g
 
-    def total_cost(ext, intr, values):
-        Lst = prob.local(ext, intr)
+    def prior(self, state):
+        return self._prior_terms(state[0], state[1])[1:]
+
+    def cost(self, state):
+        ext, intr, values = state
+        Lst = self.prob.local(ext, intr)
         cst = 0.0
-        for k, v, cf in zip(kinds, values, conf_k):
-            r, z = _kind_residual(prob, k, Lst, v)
+        for k, v, cf in zip(self.kinds, values, self.conf_k):
+            r, z = _kind_residual(self.prob, k, Lst, v)
             e2 = (r * r).sum(-1)
             ok = (z > 0) & torch.isfinite(e2)
-            rho = _rob(torch.where(ok, e2, torch.zeros_like(e2)), loss, f_scale)[0]
-            cst += float((cf * torch.where(ok, rho, torch.full_like(rho, bad_pen))).sum())
-        return cst + prior_terms(ext, intr)[0]
+            rho = _lm.robust(torch.where(ok, e2, torch.zeros_like(e2)), self.loss, self.f)[0]
+            cst += float((cf * torch.where(ok, rho, torch.full_like(rho, self.bad_pen))).sum())
+        return cst + self._prior_terms(ext, intr)[0]
 
-    ext, intr = prob.ext.clone(), prob.intr.clone()
-    values = [k.values.clone() for k in kinds]
-    cost = total_cost(ext, intr, values)
-    history = [dict(iter=0, cost=cost, lam=lam, accepted=True)]
-    converged = False
-    for it in range(n_iter):
-        Lst = prob.local(ext, intr)
-        U_loc = torch.zeros(S, Q, Q, dtype=dt, device=dev)
-        g_loc = torch.zeros(S, Q, dtype=dt, device=dev)
-        lin = []
-        for k, v, st, cf in zip(kinds, values, st_k, conf_k):
-            r, z, Jc, Js = _kind_linearize(prob, k, Lst, v)
+    def linearize(self, state):
+        ext, intr, values = state
+        Lst = self.prob.local(ext, intr)
+        out = []
+        for k, v, cf, cols, coef in zip(self.kinds, values, self.conf_k, self.cols_k, self.coef_k):
+            r, z, Jc, Js = _kind_linearize(self.prob, k, Lst, v)
             e2 = (r * r).sum(-1)
             ok = (z > 0) & torch.isfinite(e2) & torch.isfinite(Jc).all(-1).all(-1) & torch.isfinite(Js).all(-1).all(-1)
-            w = cf * _rob(torch.where(ok, e2, torch.zeros_like(e2)), loss, f_scale)[1]
+            w = cf * _lm.robust(torch.where(ok, e2, torch.zeros_like(e2)), self.loss, self.f)[1]
             w = torch.where(ok, w, torch.zeros_like(w))
-            r, Jc, Js = torch.nan_to_num(r), torch.nan_to_num(Jc), torch.nan_to_num(Js)
-            U_loc.index_add_(0, st, torch.einsum('m,mki,mkj->mij', w, Jc, Jc))
-            g_loc.index_add_(0, st, torch.einsum('m,mki,mk->mi', w, Jc, r))
-            Hcs = torch.einsum('m,mki,mkj->mij', w, Jc, Js)                     # [m,Q,D]
-            V = torch.zeros(k.n, k.D, k.D, dtype=dt, device=dev).index_add_(
-                0, k.sidx, torch.einsum('m,mki,mkj->mij', w, Js, Js))
-            gs = torch.zeros(k.n, k.D, dtype=dt, device=dev).index_add_(
-                0, k.sidx, torch.einsum('m,mki,mk->mi', w, Js, r))
-            lin.append((Hcs, V, gs, st))
-        Uth = torch.einsum('sqa,sqr,srb->ab', prob.Pm, U_loc, prob.Pm)[:NC, :NC]
-        gth = torch.einsum('sqa,sq->a', prob.Pm, g_loc)[:NC]
-        pc, pH, pg = prior_terms(ext, intr)
-        Uth = Uth + pH
-        gth = gth + pg
-        dU = Uth.diagonal().clone()
-        dU = torch.where(dU > 0, dU, torch.full_like(dU, float(dU.max()) * 1e-12 + 1e-12)) if NC else dU
-        improved = False
-        while lam <= 1e10:
-            Vinvs = []
-            bcorr = torch.zeros(S, Q, dtype=dt, device=dev)
-            for (Hcs, V, gs, st), k in zip(lin, kinds):
-                eyeD = torch.eye(k.D, dtype=dt, device=dev)
-                Vd = V + lam * V.diagonal(dim1=-2, dim2=-1)[..., None] * eyeD + 1e-9 * eyeD * \
-                    (1 + V.diagonal(dim1=-2, dim2=-1).abs().amax(-1)[:, None, None])
-                Vinv = torch.linalg.inv(Vd)
-                Vinvs.append(Vinv)
-                if Q:
-                    bcorr.index_add_(0, st, torch.einsum('mqd,md->mq', Hcs, (Vinv @ gs[..., None])[..., 0][k.sidx]))
-            b = -(gth - torch.einsum('sqa,sq->a', prob.Pm, bcorr)[:NC])
-            if NC == 0:
-                dth = torch.zeros(0, dtype=dt, device=dev)
-            elif solver == 'dense':
-                Sl = torch.zeros(S, Q, S, Q, dtype=dt, device=dev)
-                for (Hcs, V, gs, st), k, Vinv, ch in zip(lin, kinds, Vinvs, chunks):
-                    for s0, s1, m in ch:
-                        if not bool(m.any()):
-                            continue
-                        A = torch.zeros(s1 - s0, S, Q, k.D, dtype=dt, device=dev)
-                        A.index_put_((k.sidx[m] - s0, st[m]), Hcs[m], accumulate=True)
-                        AV = torch.einsum('nsqd,nde->nsqe', A, Vinv[s0:s1])
-                        Sl -= torch.einsum('nsqe,nrpe->sqrp', AV, A)
-                Hs = torch.einsum('sqa,sqrp,rpb->ab', prob.Pm, Sl, prob.Pm)[:NC, :NC]
-                Hd = Uth + Hs + torch.diag(lam * dU)
-                try:
-                    Lc = torch.linalg.cholesky(Hd)
-                    dth = torch.cholesky_solve(b[:, None], Lc)[:, 0]
-                except Exception:
-                    try:
-                        dth = torch.linalg.solve(Hd, b)
-                    except Exception:
-                        lam *= 10
-                        continue
-            else:
-                dth = _pcg(prob, lin, kinds, Vinvs, Uth + torch.diag(lam * dU), b, Pm2)
-            if not bool(torch.isfinite(dth).all()):
-                lam *= 10
-                continue
-            dl = (Pm2[:, :NC] @ dth).reshape(S, Q) if NC else torch.zeros(S, Q, dtype=dt, device=dev)
-            new_values = []
-            for (Hcs, V, gs, st), k, Vinv, v in zip(lin, kinds, Vinvs, values):
-                y = torch.zeros(k.n, k.D, dtype=dt, device=dev)
-                if Q:
-                    y.index_add_(0, k.sidx, torch.einsum('mqd,mq->md', Hcs, dl[st]))
-                ds = -(Vinv @ (gs + y)[..., None])[..., 0]
-                new_values.append(v + ds)
-            ext_n, intr_n = prob.apply_step(ext, intr, dth)
-            ext_n, new_values = renorm(ext_n, new_values)
-            new_cost = total_cost(ext_n, intr_n, new_values)
-            if np.isfinite(new_cost) and new_cost < cost:
-                rel = (cost - new_cost) / max(abs(cost), 1e-300)
-                ext, intr, values, cost = ext_n, intr_n, new_values, new_cost
-                lam = max(lam / 3, 1e-9)
-                improved = True
-                break
-            lam *= 5
-        history.append(dict(iter=it + 1, cost=cost, lam=lam, accepted=improved))
-        if verbose:
-            print('LM iter {:3d}: cost {:.6e}  lambda {:.1e}{}'.format(it + 1, cost, lam, '' if improved else ' (no step)'))
-        if not improved:
-            converged = True
-            break
-        if rel < tol:
-            converged = True
-            break
-    return ext, intr, values, history, converged
+            out.append(_lm.Blocks(r=torch.nan_to_num(r), w=w, Js=torch.nan_to_num(Js), sidx=k.sidx, n=k.n, D=k.D,
+                                  Jc=torch.nan_to_num(Jc) * coef[:, None, :], cols=cols))
+        return out
 
-
-def _pcg(prob, lin, kinds, Vinvs, Hc, b, Pm2, max_iter=500, rtol=1e-10):
-    """Matrix-free preconditioned CG on the reduced camera system (large camera counts)."""
-    S, Q, NC = prob.S, prob.Q, prob.NC
-    P2 = Pm2[:, :NC]
-
-    def matvec(v):
-        out = Hc @ v
-        vl = (P2 @ v).reshape(S, Q)
-        acc = torch.zeros(S, Q, dtype=v.dtype, device=v.device)
-        for (Hcs, V, gs, st), k, Vinv in zip(lin, kinds, Vinvs):
-            y = torch.zeros(k.n, k.D, dtype=v.dtype, device=v.device).index_add_(
-                0, k.sidx, torch.einsum('mqd,mq->md', Hcs, vl[st]))
-            z = (Vinv @ y[..., None])[..., 0]
-            acc.index_add_(0, st, torch.einsum('mqd,md->mq', Hcs, z[k.sidx]))
-        return out + 0 - P2.T @ acc.reshape(-1)
-
-    Minv = 1.0 / Hc.diagonal().clamp(min=1e-300)
-    x = torch.zeros_like(b)
-    r = b.clone()
-    z = Minv * r
-    p = z.clone()
-    rz = r @ z
-    bn = float(torch.linalg.norm(b)) + 1e-300
-    for _ in range(max_iter):
-        Ap = matvec(p)
-        alpha = rz / (p @ Ap)
-        x = x + alpha * p
-        r = r - alpha * Ap
-        if float(torch.linalg.norm(r)) < rtol * bn:
-            break
-        z = Minv * r
-        rz_new = r @ z
-        p = z + (rz_new / rz) * p
-        rz = rz_new
-    return x
+    def trial(self, state, dth, dvals):
+        ext, intr = self.prob.apply_step(state[0], state[1], dth)
+        ext, values = self._renorm(ext, [v + d for v, d in zip(state[2], dvals)])
+        new = (ext, intr, values)
+        return new, self.cost(new)
 
 
 # ====================================================================== LM driver
@@ -1343,10 +1193,14 @@ def bundle_adjust_lm(cgroup, obs_or_p2ds, p3d_init=None, spec=None, loss='cauchy
         return e.cpu().numpy()
     e_before = obs_errors(prob.ext, prob.intr, [k.values for k in kinds])
 
+    if solver == 'auto':
+        solver = 'dense' if prob.S * prob.Q <= 1500 else 'pcg'
     with torch.no_grad():
-        ext, intr, values, hist, conv = _lm_solve(
-            prob, kinds, loss=loss, f_scale=float(f_scale), n_iter=int(n_iter), lam=lam, tol=tol,
-            scale_mode=scale_mode, scale_pair=scale_pair, solver=solver, verbose=verbose)
+        lm = _BundleLM(prob, kinds, loss, float(f_scale), scale_mode, scale_pair)
+        res = _lm.levenberg_marquardt(lm, (prob.ext.clone(), prob.intr.clone(), [k.values.clone() for k in kinds]),
+                                      n_iter=int(n_iter), lam=lam, tol=tol, solver=solver, verbose=verbose)
+        ext, intr, values = res.state
+        hist, conv = res.history, res.converged
         e_after = obs_errors(ext, intr, values)
 
     report.history = hist
