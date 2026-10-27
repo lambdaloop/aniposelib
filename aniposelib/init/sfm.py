@@ -612,167 +612,45 @@ def from_correspondences(cgroup, p2ds, frame_id=None, window_id=None, min_inlier
 
 # ------------------------------------------------------------------ local refinement
 
-def _skew(v):
-    """[N,3] -> [N,3,3] cross-product matrices."""
-    z = np.zeros(len(v))
-    return np.stack([np.stack([z, -v[:, 2], v[:, 1]], -1),
-                     np.stack([v[:, 2], z, -v[:, 0]], -1),
-                     np.stack([-v[:, 1], v[:, 0], z], -1)], 1)
-
-
-def _right_jacobian(r):
-    """SO(3) right Jacobian of exp at rotation vectors ``r [N,3]``."""
-    th = np.linalg.norm(r, axis=1)[:, None, None]
-    S = _skew(r)
-    small = th < 1e-8
-    th = np.where(small, 1.0, th)
-    a = np.where(small, 0.5, (1 - np.cos(th)) / th ** 2)
-    b = np.where(small, 1.0 / 6, (th - np.sin(th)) / th ** 3)
-    return np.eye(3)[None] - a * S + b * S @ S
-
-
 def refine_extrinsics(u, f, Ms, p3d, fix=(0,), max_iter=60, max_points=1500, n_rounds=2,
                       reject_px=8.0, tol=1e-10, rng=None):
-    """Sparse extrinsics + points bundle adjustment on ideal pixels: Levenberg-Marquardt with
-    an analytic Jacobian and the Schur complement over the points (cameras' 6x6 reduced
-    system solved densely). ``u [C,M,2]`` (NaN = unused), ``Ms [C,4,4]``, ``p3d [M,3]`` (NaN =
-    unused point). Cameras in ``fix`` are held (the remaining scale gauge is handled by the
+    """Sparse extrinsics + points bundle adjustment on ideal pixels: the Schur-complement LM of
+    :func:`aniposelib.bundle.bundle_adjust_lm` (linear loss, extrinsics only) on ideal pinhole
+    cameras ``K = diag(f, f, 1)``. ``u [C,M,2]`` (NaN = unused), ``Ms [C,4,4]``, ``p3d [M,3]``
+    (NaN = unused point). Cameras in ``fix`` are held (the remaining scale gauge is handled by the
     damping). Robustness comes from trimming: after each of ``n_rounds`` fits, observations
     with residual above ``max(reject_px, 3 * median)`` are dropped. Scale-free (unlike the
     Adam BA, whose step size is in absolute parameter units). Returns refined ``Ms``."""
-    from scipy.spatial.transform import Rotation
+    from ..bundle import Observations, bundle_adjust_lm
+    from ..params import ParamSpec
     rng = as_rng(rng)
     C = len(Ms)
-    obs = np.all(np.isfinite(u), -1) & np.all(np.isfinite(p3d), -1)[None]
-    pts = np.nonzero(obs.sum(0) >= 2)[0]
-    if len(pts) < 10:
-        return Ms
-    if len(pts) > max_points:
-        pts = np.sort(rng.choice(pts, max_points, replace=False))
-    cam_i, pt_j = np.nonzero(obs[:, pts])
-    n_obs, P = len(cam_i), len(pts)
-    uu = u[cam_i, pts[pt_j]]
-    fixset = set(int(c) for c in fix)
-    free = [c for c in range(C) if c not in fixset]
-    nf = len(free)
-    pos = np.full(C, -1)
-    pos[free] = np.arange(nf)
-    R = np.stack([M[:3, :3] for M in Ms])
-    t = np.stack([M[:3, 3] for M in Ms]).copy()
-    rv = np.stack([rotvec(Ri) for Ri in R])
-    X = p3d[pts].copy()
-    fc = f[cam_i]
-    fo = np.nonzero(pos[cam_i] >= 0)[0]          # observations of free cameras
-    cf = pos[cam_i[fo]]
-    # observation pairs sharing a point (both free cameras), for the Schur complement
-    order = np.argsort(pt_j[fo], kind='stable')
-    fo_sorted = fo[order]
-    ptf = pt_j[fo_sorted]
-    starts = np.r_[0, np.nonzero(np.diff(ptf))[0] + 1]
-    ends = np.r_[starts[1:], len(ptf)]
-    pa, pb = [], []
-    for s0, s1 in zip(starts, ends):
-        idx = np.arange(s0, s1)
-        aa, bb = np.meshgrid(idx, idx, indexing='ij')
-        pa.append(aa.ravel())
-        pb.append(bb.ravel())
-    pa = np.concatenate(pa) if pa else np.zeros(0, int)
-    pb = np.concatenate(pb) if pb else np.zeros(0, int)
-    # pa/pb index into fo_sorted; map to positions within fo
-    inv = np.empty(len(fo), int)
-    inv[order] = np.arange(len(fo))
-    rank = np.argsort(inv)  # rank[k] = position in fo of fo_sorted[k]
-    pa, pb = rank[pa], rank[pb]
-
-    def residual(R, t, X):
-        Y = np.einsum('nij,nj->ni', R[cam_i], X[pt_j]) + t[cam_i]
-        z = np.where(np.abs(Y[:, 2]) > 1e-12, Y[:, 2], 1e-12)
-        return fc[:, None] * Y[:, :2] / z[:, None] - uu, Y, z
-
-    res, Y, z = residual(R, t, X)
-    cost = float(np.sum(res ** 2))
-    lam = 1e-3
-    for it in range(max_iter):
-        dY = np.zeros((n_obs, 2, 3))
-        dY[:, 0, 0] = fc / z
-        dY[:, 1, 1] = fc / z
-        dY[:, 0, 2] = -fc * Y[:, 0] / z ** 2
-        dY[:, 1, 2] = -fc * Y[:, 1] / z ** 2
-        Ri = R[cam_i]
-        Jp = dY @ Ri                                                     # [n,2,3]
-        V = np.zeros((P, 3, 3))
-        np.add.at(V, pt_j, np.einsum('nki,nkj->nij', Jp, Jp))
-        gp = np.zeros((P, 3))
-        np.add.at(gp, pt_j, np.einsum('nki,nk->ni', Jp, res))
-        if nf:
-            Jr = -Ri[fo] @ _skew(X[pt_j[fo]]) @ _right_jacobian(rv[cam_i[fo]])
-            Jc = np.concatenate([dY[fo] @ Jr, dY[fo]], -1)                # [nfo,2,6]
-            U = np.zeros((nf, 6, 6))
-            np.add.at(U, cf, np.einsum('nki,nkj->nij', Jc, Jc))
-            gc = np.zeros((nf, 6))
-            np.add.at(gc, cf, np.einsum('nki,nk->ni', Jc, res[fo]))
-            W = np.einsum('nki,nkj->nij', Jc, Jp[fo])                    # [nfo,6,3]
-        while True:
-            Vd = V + lam * (np.einsum('nii->ni', V)[:, :, None] * np.eye(3) + 1e-12 * np.eye(3))
-            Vinv = np.linalg.inv(Vd)
-            if nf:
-                Ud = U + lam * (np.einsum('nii->ni', U)[:, :, None] * np.eye(6) + 1e-12 * np.eye(6))
-                S = np.zeros((nf * 6, nf * 6))
-                for k in range(nf):
-                    S[6 * k:6 * k + 6, 6 * k:6 * k + 6] += Ud[k]
-                ptp = pt_j[fo]
-                blocks = W[pa] @ Vinv[ptp[pa]] @ np.transpose(W[pb], (0, 2, 1))  # [npair,6,6]
-                Sb = np.zeros((nf, nf, 6, 6))
-                np.add.at(Sb, (cf[pa], cf[pb]), blocks)
-                S -= Sb.transpose(0, 2, 1, 3).reshape(nf * 6, nf * 6)
-                rhs = -gc.copy()
-                np.add.at(rhs, cf, np.einsum('nij,nj->ni', W, np.einsum('nij,nj->ni', Vinv[ptp], gp[ptp])))
-                try:
-                    dc = np.linalg.solve(S, rhs.ravel()).reshape(nf, 6)
-                except np.linalg.LinAlgError:
-                    dc = np.linalg.lstsq(S, rhs.ravel(), rcond=None)[0].reshape(nf, 6)
-                wd = np.zeros((P, 3))
-                np.add.at(wd, ptp, np.einsum('nji,nj->ni', W, dc[cf]))
-            else:
-                dc = np.zeros((0, 6))
-                wd = np.zeros((P, 3))
-            dp = np.einsum('nij,nj->ni', Vinv, -gp - wd)
-            rv2, t2 = rv.copy(), t.copy()
-            if nf:
-                rv2[free] += dc[:, :3]
-                t2[free] += dc[:, 3:]
-            R2 = R.copy()
-            if nf:
-                R2[free] = Rotation.from_rotvec(rv2[free]).as_matrix()
-            X2 = X + dp
-            res2, Y2, z2 = residual(R2, t2, X2)
-            cost2 = float(np.sum(res2 ** 2))
-            if np.isfinite(cost2) and cost2 < cost:
-                break
-            lam *= 5
-            if lam > 1e10:
-                break
-        if not (np.isfinite(cost2) and cost2 < cost):
+    Ms0 = Ms
+    u, p3d = np.array(u, dtype='float64'), np.array(p3d, dtype='float64')
+    spec = ParamSpec.extrinsics_only(fixed_cameras=[int(c) for c in fix] or None, scale_constraint=None)
+    for rnd in range(n_rounds, 0, -1):
+        obs = np.all(np.isfinite(u), -1) & np.all(np.isfinite(p3d), -1)[None]
+        pts = np.nonzero(obs.sum(0) >= 2)[0]
+        if len(pts) < 10:
+            return Ms
+        if len(pts) > max_points:
+            pts = np.sort(rng.choice(pts, max_points, replace=False))
+        cam_i, pt_j = np.nonzero(obs[:, pts])
+        group = from_extrinsics(['cam{}'.format(c) for c in range(C)], Ms,
+                                K=[np.diag([float(fc), float(fc), 1.0]) for fc in f], dist=np.zeros(5))
+        o = Observations(cam_i, pt_j, u[cam_i, pts[pt_j]], n_points=len(pts), n_cams=C)
+        rep = bundle_adjust_lm(group, o, p3d_init=p3d[pts], spec=spec, loss='linear', n_iter=max_iter, tol=tol,
+                               min_points_per_camera=0, return_report=True)
+        Ms = get_extrinsics(group)
+        if rnd == 1:
             break
-        done = (cost - cost2) <= tol * cost
-        R, rv, t, X, res, Y, z, cost = R2, rv2, t2, X2, res2, Y2, z2, cost2
-        lam = max(lam / 3, 1e-9)
-        if done:
+        rn = np.asarray(rep.obs_errors)
+        bad = ~(rn <= max(reject_px, 3 * np.nanmedian(rn)))
+        if not bad.any():
             break
-    if n_rounds > 1:
-        rn = np.linalg.norm(res, axis=1)
-        bad = rn > max(reject_px, 3 * np.median(rn))
-        if bad.any():
-            u2 = np.array(u, copy=True)
-            u2[cam_i[bad], pts[pt_j[bad]]] = np.nan
-            X3 = np.array(p3d, copy=True)
-            X3[pts] = X
-            Mn = np.stack([make_M(R[c], t[c]) for c in range(C)])
-            return refine_extrinsics(u2, f, Mn, X3, fix=fix, max_iter=max_iter,
-                                     max_points=max_points, n_rounds=n_rounds - 1,
-                                     reject_px=reject_px, tol=tol, rng=rng)
-    out = np.stack([make_M(R[c], t[c]) for c in range(C)])
-    return out if np.all(np.isfinite(out)) else Ms
+        u[cam_i[bad], pts[pt_j[bad]]] = np.nan
+        p3d[pts] = rep.p3d
+    return Ms if np.all(np.isfinite(Ms)) else Ms0
 
 
 def refine_group(cgroup, p2ds, frame_id=None, n_rounds=4, fix=0, decoy_thresh=25.0,
