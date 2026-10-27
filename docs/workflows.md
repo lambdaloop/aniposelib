@@ -291,12 +291,21 @@ A few things that help:
 - Without a calibration, 2D tracks are still compared camera pair by camera pair (`options={'epipolar_F':
   'self'}` is what it does then; `'calibrated'` or `'both'` with a calibration).
 - If one camera recorded several files, say which camera each file belongs to:
-  `options={'stream_camera': {'P2-clip1': 'phone2', 'P2-clip2': 'phone2'}}`.
+  `options={'stream_camera': {'P2-clip1': 'phone2', 'P2-clip2': 'phone2'}}`. The files then share one clock speed.
+  If you also know where each file starts on the camera's own clock (GoPro chapters follow each other exactly), pass
+  `options={'clip_start': {'P2-clip1': 0.0, 'P2-clip2': 820.0}}` and the files stay on one timeline.
+  `'clip_start': 'container'` uses the times stored in the files, which are only good to a second.
+- Sound takes about 3 ms per metre to reach a camera, and phones add their own audio delay, so the sound can't sync
+  cameras better than that. Say how much you expect with `options={'audio_delay_sigma': 0.01}` (in seconds) to get
+  honest uncertainties. The 2D-track refinement measures the real delay.
 - The frame rate used for the checks comes from the 2D tracks, else from the video files. Set it with
   `options={'fps': 30}` if neither is right.
 - To refine an earlier result without redoing the sound, pass it back: `estimate_offsets(streams, cgroup,
   seed=result, refine=True)`. A short window only shifts the clocks; their speed is changed only when there's a
   long enough stretch of tracks (`options['refine_rate']`).
+- For a long session, refine in pieces: `refine_windows=30` (seconds), or a list of `(start, end)` times, also
+  `(start, end, calibration)` when a camera moved. Each piece is fitted on its own and the time maps join them
+  smoothly, so a fix found in one piece isn't stretched over the whole hour.
 
 ## Going from 2D to 3D: `reconstruct_3d`
 
