@@ -1994,8 +1994,8 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
-    - ``bad_windows_frac``: share of time windows whose LOO agreement is below
-      ``bad_window_ratio`` x the median window (desync / broken data; warn above 5 %);
+    - ``bad_windows_frac``: share of time windows in which some camera's LOO agreement is below
+      ``bad_window_ratio`` x that camera's median window (desync / broken data; warn above 5 %);
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
       warn 1 % (warn only: a reference is often rougher than the calibration under test);
     - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
@@ -2094,31 +2094,48 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             report['moves_info'] = {k: v for k, v in moves.info.items() if k in ('retest', 'low_support')}
             for n in names:
                 per[n]['moved'] = n in moved
-    # time-blocked LOO
+    # time-blocked LOO: per window and camera, LOO agreement at the middle threshold
     per_window, bad_frac, bad_windows = {}, None, []
-    if win is not None and qr.per_group:
-        key = 'loo_' + Q._thr_key(agree_t)
-        nel = {}
-        if qr.loo is not None:
-            wf = np.repeat(win, J)
-            for lab in np.unique(wf):
-                nel[str(lab)] = int(qr.loo.eligible[:, wf == lab].sum())
+    if win is not None and qr.loo is not None:
         ws = settings['loo_window_s']
         t0 = float(np.nanmin(np.asarray(times, float)))
-        for lab, gd in sorted(qr.per_group.items(), key=lambda kv: int(kv[0])):
-            per_window['{:.6g}'.format(t0 + int(lab) * ws)] = dict(
-                window=int(lab), n_eligible=nel.get(lab, 0), loo_agree=gd.get(key),
-                loo_median_px=gd.get('loo_median_px'), loo_coverage=gd.get('loo_coverage'))
-        judged = {k: v for k, v in per_window.items()
-                  if v['n_eligible'] >= opts['min_window_obs'] and v['loo_agree'] is not None}
-        if len(judged) >= 3:
-            med = float(np.median([v['loo_agree'] for v in judged.values()]))
-            bad_windows = [k for k, v in judged.items() if v['loo_agree'] < opts['bad_window_ratio'] * med]
-            bad_frac = len(bad_windows) / len(judged)
-            for k, v in per_window.items():
-                v['bad'] = k in bad_windows
-            report['windows'] = dict(window_s=ws, n_windows=len(per_window), n_judged=len(judged),
-                                     median_agree=med, bad=bad_windows, agree_px=agree_t)
+        wf = np.repeat(win, J)
+        le, el = np.asarray(qr.loo.errors, float), np.asarray(qr.loo.eligible, bool)
+        labs, inv = np.unique(wf, return_inverse=True)
+        nW = len(labs)
+        den = np.zeros((C, nW))
+        hit = np.zeros((C, nW))
+        sup = np.zeros((C, nW))
+        with np.errstate(invalid='ignore'):
+            for c in range(C):
+                den[c] = np.bincount(inv, weights=el[c], minlength=nW)
+                fin = el[c] & np.isfinite(le[c])
+                sup[c] = np.bincount(inv, weights=fin, minlength=nW)
+                hit[c] = np.bincount(inv, weights=fin & (le[c] < agree_t), minlength=nW)
+            ag = np.where(den > 0, hit / np.maximum(den, 1), np.nan)
+        min_cw = max(10.0, opts['min_window_obs'] / C)
+        judged = (den >= min_cw)
+        cam_med = np.array([np.median(ag[c, judged[c]]) if judged[c].any() else np.nan for c in range(C)])
+        badcw = judged & (ag < opts['bad_window_ratio'] * cam_med[:, None])
+        okw = judged.any(0) & (den.sum(0) >= opts['min_window_obs'])
+        for k, lab in enumerate(labs):
+            key = '{:.6g}'.format(t0 + int(lab) * ws)
+            gd = qr.per_group.get(str(lab), {})
+            tot = den[:, k].sum()
+            per_window[key] = dict(
+                window=int(lab), n_eligible=int(tot),
+                loo_agree=float(hit[:, k].sum() / tot) if tot else None,
+                loo_median_px=gd.get('loo_median_px'), loo_coverage=float(sup[:, k].sum() / tot) if tot else None,
+                per_camera={n: (None if not np.isfinite(ag[c, k]) else float(ag[c, k])) for c, n in enumerate(names)},
+                bad_cameras=[n for c, n in enumerate(names) if badcw[c, k]], judged=bool(okw[k]))
+            per_window[key]['bad'] = bool(okw[k] and badcw[:, k].any())
+        if okw.sum() >= 3:
+            bad_windows = [k for k, v in per_window.items() if v['bad']]
+            bad_frac = len(bad_windows) / int(okw.sum())
+            report['windows'] = dict(window_s=ws, n_windows=len(per_window), n_judged=int(okw.sum()),
+                                     camera_median_agree={n: (None if not np.isfinite(v) else float(v))
+                                                          for n, v in zip(names, cam_med)},
+                                     bad=bad_windows, agree_px=agree_t)
     if reference is not None:
         with timer('compare'):
             try:
@@ -2180,7 +2197,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
         Rule('center_residual_frac', center_frac, 0.01, None, 'aligned centre residual vs reference / rig scale'),
         Rule('board_shape_rel', shape_rel, 0.005, 0.02, 'board shape residual / object size'),
         Rule('bad_windows_frac', bad_frac, 0.05, None,
-             'time windows with LOO agreement < {} x the median window: {}'.format(
+             'time windows where a camera\'s LOO agreement is < {} x its median window: {}'.format(
                  opts['bad_window_ratio'], bad_windows[:10]) if bad_windows else ''),
     ]
     if missing:
