@@ -70,10 +70,22 @@ __all__ = ['calibrate_from_board', 'BoardCalibration', 'calibrate_from_points', 
 
 # ================================================================== shared helpers
 
-def _noise_unit(nf):
-    """Noise unit ``u`` (capped; see :func:`aniposelib.workflows._common.noise_unit`)."""
+def _noise_unit(nf, override=None):
+    """Noise unit ``u`` (capped; see :func:`aniposelib.workflows._common.noise_unit`).
+    ``override``: a workflow's ``options['noise_unit']`` ('auto' / None, or a float)."""
     from ._common import noise_unit
-    return noise_unit(nf)
+    return noise_unit(nf, override)
+
+
+def _check_noise_unit(v):
+    if v in (None, 'auto'):
+        return
+    try:
+        ok = float(v) > 0
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ValueError("options['noise_unit'] must be 'auto' or a positive number, got {!r}".format(v))
 
 
 def _device(device):
@@ -122,7 +134,7 @@ def _points_noise(cgroup, points, diag):
     views. Returns ``(noise_floor_px, errors [C,N])``."""
     tau = 0.02 * diag if diag else 20.0
     _, err, inl = _robust_points(cgroup, points, tau)
-    sup = inl.sum(0) >= 3
+    sup = inl.sum(0) >= min(3, inl.shape[0])
     return noise_floor(err[:, sup], inl[:, sup], diag=diag), err
 
 
@@ -151,6 +163,7 @@ W1_DEFAULTS = dict(
     prior_sigma_logf=0.05, prior_sigma_k=0.1,                          # intrinsics=<CameraGroup>
     object_sigma=None,        # static PointObject: not supported yet (points held fixed)
     min_bridge_points=6,      # bridge: minimum points per extra component
+    noise_unit='auto',        # bridge MSAC threshold = 10 noise units; a float forces the unit
     verdict=None,
 )
 
@@ -413,7 +426,7 @@ def _bridge_components(cg, comp_idx, bridge, nf, diag, opts):
             norm[c, v] = np.asarray(to_numpy(cam.undistort_points(pts[c, v].reshape(-1, 1, 2)))).reshape(-1, 2)
         K = to_numpy(cam.get_camera_matrix())
         focal[c] = 0.5 * (K[0, 0] + K[1, 1])
-    tau = 10 * _noise_unit(nf)
+    tau = 10 * _noise_unit(nf, opts.get('noise_unit'))
     placed = set(comp_idx[0])
     todo = list(range(1, len(comp_idx)))
     out = dict(components=[], tau_px=tau, unbridged=[])
@@ -811,12 +824,18 @@ W2_DEFAULTS = dict(
     fine=((40, 20, 10, 5), (20, 10, 5)),          # later rounds (px at 0.5 px noise) x noise unit
     resect=True,
     ba_kwargs=None, sfm_kwargs=None, vggt_kwargs=None, select_kwargs=None, people_kwargs=None,
+    track_ids=None,           # C x F x P track ids of 5D points (init='people' / 'vggt' / a CameraGroup)
     intrinsics_free=('f', 'k1'),                  # refine_intrinsics: parameters freed
     intrinsics_sigma_logf=0.05, intrinsics_sigma_k=0.1,   # ... under priors around the given ones
     heldout_every=5,          # refine_intrinsics='auto': every k-th window is held out
     intrinsics_gain=0.02,     # ... accepted if the held-out LOO median improves by this fraction
+    intrinsics_share=None,    # refine_intrinsics: None | 'all' | groups of camera names/indices sharing f + k1
     min_inlier_frames=20,     # verdict: frames with inliers per camera
-    runaway_ratio=5.0,        # verdict: camera centre farther than this x the median from the rig centre
+    runaway_ratio=5.0,        # verdict: camera centre farther than this x the median from the rig centre ...
+    runaway_move=0.5,         # ... and moved more than this x the rig scale away from its init
+    noise_unit='auto',        # 'auto' (capped noise floor / 0.5 px) or a float (1 = absolute pixel defaults)
+    auto_skip_sfm=True,       # init='auto': skip SfM when the given extrinsics are complete and fit well
+    init_check=True,          # verdict rule init_support (share of points the chosen init explains)
     quality=True, quality_groups=None,
     verdict=None,
 )
@@ -956,8 +975,8 @@ def _robust_ba(cg, pc, gr, diag, opts, rng):
               resect_kw=dict(tau_tri=coarse[-1] / 2, tau_pnp=coarse[-1]))
     e = np.asarray(r1.obs_errors, float)
     nf = noise_floor(e, np.nan_to_num(e, nan=np.inf) < coarse[-1], diag=diag)
-    u = _noise_unit(nf)
-    fine = tuple(tuple(min(float(t * u), coarse[-1]) for t in rnd) for rnd in opts['fine'])
+    u = _noise_unit(nf, opts['noise_unit'])
+    fine = _fine_schedule(opts['fine'], u, coarse[-1])
     rej = B.RejectSchedule()
     rej = B.RejectSchedule(frame=tuple(u * t for t in rej.frame), keypoint=tuple(u * t for t in rej.keypoint),
                            obs=tuple(u * t for t in rej.obs), min_frame_pts=rej.min_frame_pts,
@@ -975,6 +994,19 @@ def _robust_ba(cg, pc, gr, diag, opts, rng):
                     kept=not (r1.reverted and r2.reverted), result=r2), settings
 
 
+def _fine_schedule(fine, u, cap):
+    """The fine MSAC rounds in px: ``t x u``, dropping thresholds above ``cap`` (the last coarse
+    threshold already covered them) so each round keeps its ratios; a round entirely above the cap
+    keeps one threshold, at the cap. (1.1.0: ``min(t x u, cap)`` flattened every round to the cap
+    when ``u`` was large.)"""
+    out = []
+    for rnd in fine:
+        ts = [float(t * u) for t in rnd]
+        keep = [t for t in ts if t <= cap]
+        out.append(tuple(keep) if keep else (float(min(min(ts), cap)),))
+    return tuple(out)
+
+
 def _heldout_mask(pc, gr, every):
     """Point mask [N] (or [N,J] -> per frame) of held-out windows: every ``every``-th block."""
     N = pc.shape[1]
@@ -990,54 +1022,138 @@ def _heldout_mask(pc, gr, every):
     return (block % every) == (2 % every)
 
 
-def _loo_median(cg, p, tau_tri):
+def _loo_stats(cg, p, tau_tri, agree_px):
+    """Held-out LOO summary: ``(median of per-camera medians, mean agree@agree_px, mean coverage)``
+    (inf / 0 / 0 when nothing could be measured)."""
     from .. import quality as Q
-    r = Q.loo_reprojection(cg, p, tau_tri=tau_tri)
+    r = Q.loo_reprojection(cg, p, tau_tri=tau_tri, min_others=min(3, max(len(cg.cameras) - 1, 1)),
+                           thresholds=(agree_px,))
     m = r.medians()
-    return float(np.nanmedian(m)) if np.isfinite(m).any() else np.inf
+    key = [k for k in next(iter(r.per_camera.values())) if k.startswith('agree@')][0]
+    ag = [v[key] for v in r.per_camera.values() if v[key] is not None]
+    cv = [v['coverage'] for v in r.per_camera.values() if v['coverage'] is not None]
+    return (float(np.nanmedian(m)) if np.isfinite(m).any() else np.inf,
+            float(np.mean(ag)) if ag else 0.0, float(np.mean(cv)) if cv else 0.0)
+
+
+def _loo_median(cg, p, tau_tri):
+    return _loo_stats(cg, p, tau_tri, 8.0 * tau_tri / 5.0)[0]
+
+
+def _invalid_lenses(cg):
+    """Names of the cameras whose lens model is not invertible over the image."""
+    from .. import quality as Q
+    bad = []
+    for cam in cg.cameras:
+        try:
+            lv = Q.lens_validity(cam, max_nonfinite_frac=0.05 if getattr(cam, 'fisheye', False) else 0.0)
+            if not lv['valid']:
+                bad.append(cam.get_name())
+        except Exception:  # pragma: no cover
+            pass
+    return bad
+
+
+def _share_spec(share, names):
+    """``options['intrinsics_share']`` -> ``ParamSpec(share=)`` groups over the present cameras."""
+    if share is None:
+        return None
+    if isinstance(share, str):
+        if share != 'all':
+            raise ValueError("options['intrinsics_share'] must be None, 'all' or a list of camera groups")
+        return [list(names)] if len(names) > 1 else None
+    out = []
+    for g in share:
+        g = [names[c] if isinstance(c, (int, np.integer)) and not isinstance(c, bool) else str(c) for c in g]
+        g = [n for n in g if n in names]
+        if len(g) > 1:
+            out.append(g)
+    return out or None
 
 
 def _gate_intrinsics(cg, pc, gr, mode, nf, opts, rng):
-    """Evidence-gated focal + k1 refinement. Returns ``(cgroup, info)``."""
+    """Evidence-gated focal + k1 refinement. Returns ``(cgroup, info)``.
+
+    A refined lens that is not invertible over the image (``quality.lens_validity``) is put back
+    to the given one (that camera only, then an extrinsics re-fit). ``'auto'`` keeps the refinement
+    only if, on held-out windows, the LOO median improves by ``intrinsics_gain`` and neither the
+    LOO agreement nor the LOO coverage gets worse. Never raises: a failed fit keeps the given
+    intrinsics (``decision='kept'``, the error in ``reason``)."""
+    try:
+        return _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng)
+    except Exception as exc:
+        return cg, dict(decision='kept', reason='intrinsics refinement failed ({}: {}); kept the given '
+                        'intrinsics'.format(type(exc).__name__, exc), free=list(opts['intrinsics_free']))
+
+
+def _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng):
     from .. import bundle as B
     from ..params import IntrinsicsPrior, ParamSpec
-    u = _noise_unit(nf)
+    u = _noise_unit(nf, opts['noise_unit'])
     tau = 10.0 * u
-    spec = ParamSpec(intrinsics=tuple(opts['intrinsics_free']),
+    C = len(cg.cameras)
+    names = cg.get_names()
+    share = _share_spec(opts['intrinsics_share'], names)
+    spec = ParamSpec(intrinsics=tuple(opts['intrinsics_free']), share=share,
                      priors=IntrinsicsPrior(cg.copy(), sigma_logf=opts['intrinsics_sigma_logf'],
                                             sigma_k=opts['intrinsics_sigma_k']))
+    f_scale = 3 * max(nf, MIN_NOISE_PX)
+    min_views = min(3, C)
 
     def fit(group, p):
+        before = group.copy()
         _, _, inl = _robust_points(group, p, tau, min_inliers=2)
         flat = _flat(p)
-        keep = inl & (inl.sum(0) >= 3)[None]
+        keep = inl & (inl.sum(0) >= min_views)[None]
         q = np.where(keep[..., None], flat, np.nan)
-        B.bundle_adjust_lm(group, q, spec=spec, loss='cauchy', f_scale=3 * max(nf, MIN_NOISE_PX),
-                           n_iter=30, rng=rng)
-        return group
+        B.bundle_adjust_lm(group, q, spec=spec, loss='cauchy', f_scale=f_scale, n_iter=30, rng=rng)
+        bad = _invalid_lenses(group)
+        if bad:      # revert those lenses, re-settle the extrinsics
+            for cam, cb in zip(group.cameras, before.cameras):
+                if cam.get_name() in bad:
+                    _set_intrinsics(cam, to_numpy(cb.get_camera_matrix()), to_numpy(cb.get_distortions()))
+            B.bundle_adjust_lm(group, q, only_extrinsics=True, loss='cauchy', f_scale=f_scale, n_iter=20, rng=rng)
+        return group, bad
+    base_info = dict(free=list(opts['intrinsics_free']), share=share)
     if mode is True:
-        return fit(cg, pc), dict(decision='refined', reason='refine_intrinsics=True', free=list(opts['intrinsics_free']))
+        _, bad = fit(cg, pc)
+        return cg, dict(base_info, decision='refined', reason='refine_intrinsics=True', reverted_invalid=bad)
+    if C < 3:
+        return cg, dict(base_info, decision='kept', reason='the held-out LOO check needs >= 3 cameras')
     ho = _heldout_mask(pc, gr, opts['heldout_every'])
     train = pc.copy()
     train[:, ho] = np.nan
     test = pc.copy()
     test[:, ~ho] = np.nan
     if not ho.any() or ho.all():
-        return cg, dict(decision='kept', reason='not enough windows for a held-out check')
+        return cg, dict(base_info, decision='kept', reason='not enough windows for a held-out check')
     base = cg.copy()
-    B.bundle_adjust_lm(base, _flat(train), only_extrinsics=True, loss='cauchy',
-                       f_scale=3 * max(nf, MIN_NOISE_PX), n_iter=20, rng=rng)
-    trial = fit(base.copy(), train)
-    e0, e1 = _loo_median(base, test, 5.0 * u), _loo_median(trial, test, 5.0 * u)
+    B.bundle_adjust_lm(base, _flat(train), only_extrinsics=True, loss='cauchy', f_scale=f_scale, n_iter=20, rng=rng)
+    trial, bad = fit(base.copy(), train)
+    agree_px = 8.0 * u
+    e0, a0, c0 = _loo_stats(base, test, 5.0 * u, agree_px)
+    e1, a1, c1 = _loo_stats(trial, test, 5.0 * u, agree_px)
     gain = (e0 - e1) / e0 if np.isfinite(e0) and e0 > 0 else 0.0
-    info = dict(heldout_loo_fixed_px=e0, heldout_loo_refined_px=e1, gain=gain,
-                min_gain=opts['intrinsics_gain'], free=list(opts['intrinsics_free']),
-                n_heldout_points=int(ho.sum()))
-    if np.isfinite(e1) and gain > opts['intrinsics_gain']:
-        fit(cg, pc)
-        info.update(decision='refined', reason='held-out LOO improved by {:.1%}'.format(gain))
+    info = dict(base_info, heldout_loo_fixed_px=e0, heldout_loo_refined_px=e1, gain=gain,
+                heldout_agree_fixed=a0, heldout_agree_refined=a1, heldout_coverage_fixed=c0,
+                heldout_coverage_refined=c1, agree_px=agree_px, min_gain=opts['intrinsics_gain'],
+                n_heldout_points=int(ho.sum()), invalid_in_trial=bad)
+    if bad and len(bad) == C:
+        info.update(decision='kept', reason='every refined lens was invalid')
+        return cg, info
+    why = []
+    if not (np.isfinite(e1) and gain > opts['intrinsics_gain']):
+        why.append('LOO median gain {:.1%} <= {:.1%}'.format(gain, opts['intrinsics_gain']))
+    if a1 < a0 - 0.002:
+        why.append('LOO agree@{:.3g}px fell {:.3f} -> {:.3f}'.format(agree_px, a0, a1))
+    if c1 < c0 - 0.005:
+        why.append('LOO coverage fell {:.3f} -> {:.3f}'.format(c0, c1))
+    if not why:
+        _, bad = fit(cg, pc)
+        info.update(decision='refined', reason='held-out LOO improved by {:.1%} (agree {:.3f} -> {:.3f})'.format(
+            gain, a0, a1), reverted_invalid=bad)
     else:
-        info.update(decision='kept', reason='held-out LOO did not improve enough ({:.1%})'.format(gain))
+        info.update(decision='kept', reason='held-out check failed: ' + '; '.join(why))
     return cg, info
 
 
@@ -1109,10 +1225,12 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
       below 0.5, fail below 0.1;
     - ``scale_rejected``: a requested scale was refused (fail).
     """
-    from ..init import RecipeReport, make_intrinsics_group, select
+    from ..init import RecipeReport, make_intrinsics_group, select, _has_extrinsics
     from ..init import _refine as _legacy_refine
+    from .. import scale as S
     timer = Timer()
     opts = merge_options(W2_DEFAULTS, options)
+    _check_noise_unit(opts['noise_unit'])
     rpt = RecipeReport()
     fallbacks, settings = [], {}
     dev = _device(device)
@@ -1125,35 +1243,89 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         p = np.asarray(to_numpy(points), dtype='float64')
     if p.ndim not in (3, 4, 5) or p.shape[-1] != 2:
         raise ValueError('points must be C x N x 2 or C x N x J x 2, got {}'.format(p.shape))
-    if p.ndim == 5 and init != 'people':
-        raise ValueError("C x F x P x J x 2 points need init='people'")
+    from ..cameras import CameraGroup
+    rig_init = isinstance(init, CameraGroup) or (isinstance(init, str) and init == 'vggt')
+    if p.ndim == 5 and init != 'people' and not rig_init:
+        raise ValueError("C x F x P x J x 2 points need init='people', init='vggt' (with frames=) or a "
+                         "CameraGroup init")
     base = make_intrinsics_group(opts['cam_names'], opts['sizes'], intrinsics, fisheye=opts['fisheye'])
+    _check_cameras(base, 'intrinsics')
     names = base.get_names()
     if p.shape[0] != len(names):
         raise ValueError('points have {} cameras, intrinsics {}'.format(p.shape[0], len(names)))
     gr = _parse_groups(groups, p.shape[1:-1] if p.ndim < 5 else p.shape[1:2])
     diag = _diag(base, p) or 1000.0
     settings['image_diag_px'] = diag
+    tau_coarse = float(opts['coarse'][-1] * diag)
+    res = PointCalibration(init_report=rpt)
+    shape_in = list(p.shape)
+    track_ids = opts['track_ids']
+    pk = dict(opts['people_kwargs'] or {})
+    if track_ids is None:
+        track_ids = pk.get('track_ids')
+    elif init == 'people':
+        pk.setdefault('track_ids', track_ids)
+    opts['people_kwargs'] = pk
+
+    def finish_fail(reason, cands=(), extra=None):
+        res.verdict = 'fail'
+        res.reasons = ['fail: ' + reason]
+        res.report = dict(per_camera={n: dict(placed=False) for n in names}, unplaced=list(names), runaway=[],
+                          rules=[], noise_floor_px=None, init=None, candidates=list(cands),
+                          errors=dict(rpt.errors), overall=None)
+        res.report.update(extra or {})
+        res.settings = settings
+        res.provenance = provenance('calibrate_from_points', inputs=dict(n_cameras=len(names), shape=shape_in),
+                                    fallbacks=fallbacks + ['init {} failed: {}'.format(k, v)
+                                                           for k, v in rpt.errors.items()],
+                                    timings=timer.times)
+        _save(res, out)
+        return res
     # ---- candidates + selection
+    init_spec = init
+    ref_support = None
+    if isinstance(init, str) and init == 'auto' and opts['auto_skip_sfm'] and p.ndim < 5 and _has_extrinsics(base):
+        with timer('init_check'):
+            ref_support = _init_support(_on_device(base, dev), p, tau_coarse)
+        settings['auto_reference_support'] = ref_support
+        if ref_support['min_camera'] is not None and ref_support['min_camera'] >= 0.5 \
+                and ref_support['overall'] >= 0.7:
+            init_spec = ['reference'] + (['vggt'] if frames is not None else [])
+            fallbacks.append('init auto: SfM skipped, the given extrinsics explain {:.0%} of the multi-view '
+                             'observations (worst camera {:.0%})'.format(ref_support['overall'],
+                                                                         ref_support['min_camera']))
     with timer('init'):
-        cands = _candidates(base, p, init, frames, gr, opts, rng, rpt, names)
+        cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names)
         if p.ndim == 5 and 'people' in cands:
             from ..init import people
-            assoc, _ = people.associate_people(base, p, **(opts['people_kwargs'] or {}).get('association_kwargs', {}) or {})
+            akw = dict(pk.get('association_kwargs') or {})
+            akw.setdefault('track_ids', track_ids)
+            assoc, _ = people.associate_people(base, p, **akw)
             C_, F_, G_, J_, _ = assoc.shape
             p = assoc.reshape(C_, F_ * G_, J_, 2)
             gr = dict(frame=np.arange(F_ * G_), window=np.repeat(np.arange(F_), G_))
+        elif p.ndim == 5 and cands:
+            # unassociated detections + a rig (VGGT / given): associate_views, then as for 4D input
+            from .reconstruction import associate_views
+            key0 = 'vggt' if 'vggt' in cands else next(iter(cands))
+            try:
+                av = associate_views(cands[key0], [p[c] for c in range(p.shape[0])],
+                                     track_ids=None if track_ids is None else
+                                     [np.asarray(track_ids)[c] for c in range(p.shape[0])])
+                ap = np.asarray(av.points, float)
+            except Exception as exc:
+                rpt.errors['associate'] = '{}: {}'.format(type(exc).__name__, exc)
+                ap = np.zeros(p.shape[:2] + (0,) + p.shape[3:])
+            rpt.init_reports['associate'] = dict(rig=key0, n_identities=int(ap.shape[2]))
+            if ap.shape[2] == 0:
+                return finish_fail('the {} rig associated no identity across cameras: that rig is probably '
+                                   'wrong{}'.format(key0, _vggt_spread_note(rpt)), cands)
+            C_, F_, G_, J_, _ = ap.shape
+            p = ap.reshape(C_, F_ * G_, J_, 2)
+            gr = dict(frame=np.arange(F_ * G_), window=np.repeat(np.arange(F_), G_))
     rpt.candidates = list(cands)
-    res = PointCalibration(init_report=rpt)
     if not cands:
-        res.verdict = 'fail'
-        res.reasons = ['fail: no initialisation succeeded: {}'.format(rpt.errors)]
-        res.report = dict(errors=rpt.errors)
-        res.settings = settings
-        res.provenance = provenance('calibrate_from_points', inputs=dict(n_cameras=len(names), shape=list(p.shape)),
-                                    fallbacks=fallbacks, timings=timer.times)
-        _save(res, out)
-        return res
+        return finish_fail('no initialisation succeeded: {}'.format(rpt.errors), cands)
     complete = {k: v for k, v in cands.items() if set(v.get_names()) == set(names)}
     pool = complete if complete else cands
     with timer('select'):
@@ -1162,7 +1334,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         else:
             common = [n for n in names if all(n in v.get_names() for v in pool.values())]
             idx = [names.index(n) for n in common]
-            skw = dict(rng=rng)
+            skw = dict(rng=rng, min_inliers=min(3, len(common)))
             skw.update(opts['select_kwargs'] or {})
             _, rpt.selection = select(pool, p[idx], cam_names=common, **skw)
             key = rpt.selection.best
@@ -1173,25 +1345,38 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         chosen = chosen.subset_cameras_names(present)
     unplaced = [n for n in names if n not in present]
     pc = p[[names.index(n) for n in present]]
+    init_centers = S.camera_centers(chosen)
     cg = chosen.to(dev) if dev != 'cpu' else chosen
+    init_support = None
+    if opts['init_check']:
+        with timer('init_check'):
+            init_support = ref_support if (key == 'reference' and ref_support is not None and not unplaced) \
+                else _init_support(cg, pc, tau_coarse)
     # ---- refinement
-    nf = MIN_NOISE_PX
     ba = None
-    with timer('bundle_adjust'):
-        method = opts['refine']
-        if method in ('robust', 'auto'):
-            ba, rpt.refine, st = _robust_ba(cg, pc, gr, diag, opts, rng)
-            settings.update(st)
-            nf = st['noise_floor_px']
-        elif method:
-            cg, rpt.refine = _legacy_refine(cg, pc, gr.get('frame'), method, rng, opts['ba_kwargs'])
-            nf, _ = _points_noise(cg, pc, diag)
-            settings['noise_floor_px'] = nf
-        else:
-            rpt.refine = dict(method=None)
-            nf, _ = _points_noise(cg, pc, diag)
-            settings['noise_floor_px'] = nf
-    u = _noise_unit(nf)
+    try:
+        with timer('bundle_adjust'):
+            method = opts['refine']
+            if method in ('robust', 'auto'):
+                ba, rpt.refine, st = _robust_ba(cg, pc, gr, diag, opts, rng)
+                settings.update(st)
+            elif method:
+                cg, rpt.refine = _legacy_refine(cg, pc, gr.get('frame'), method, rng, opts['ba_kwargs'])
+            else:
+                rpt.refine = dict(method=None)
+    except Exception as exc:
+        rpt.errors['refine'] = '{}: {}'.format(type(exc).__name__, exc)
+        return finish_fail('refinement of the {} init failed: {}: {}'.format(key, type(exc).__name__, exc),
+                           cands, dict(init=key))
+    # verdict noise floor: the points under the refined rig at a loose threshold (as W4), not the
+    # errors at the last schedule threshold (that one is ~threshold / 3 by construction)
+    with timer('noise'):
+        nf, _ = _points_noise(cg, pc, diag)
+    if 'noise_floor_px' in settings:
+        settings['noise_floor_fit_px'] = settings['noise_floor_px']
+    settings['noise_floor_px'] = nf
+    u = _noise_unit(nf, opts['noise_unit'])
+    settings['noise_unit_final'] = u
     # ---- intrinsics (evidence gated)
     with timer('intrinsics'):
         if refine_intrinsics in (False, None):
@@ -1203,7 +1388,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     # ---- stations
     if stations is not None:
         with timer('stations'):
-            res.report['stations'] = _stations_ba(cg, pc, gr, stations, nf, rng)
+            res.report['stations'] = _stations_ba(cg, pc, gr, stations, nf, rng, opts['noise_unit'])
     if dev != 'cpu':
         cg = cg.to('cpu')
     # ---- scale
@@ -1211,7 +1396,6 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     if scale is not None:
         with timer('scale'):
             if isinstance(scale, (int, float)) and not isinstance(scale, bool):
-                from .. import scale as S
                 S.rescale(cg, float(scale), source='manual')
                 rpt.scale = dict(s=float(scale), source='manual')
             else:
@@ -1222,35 +1406,46 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
                 else:
                     scale_rejected = True
     # ---- quality
+    Cp = len(present)
     fit_mask = None
     if ba is not None and 'fit' in ba.excluded:
-        fit_mask = ~np.asarray(ba.excluded['fit'], bool).reshape(len(present), -1)
+        fit_mask = ~np.asarray(ba.excluded['fit'], bool).reshape(Cp, -1)
     with timer('quality'):
         if opts['quality']:
             from .. import quality as Q
             try:
-                rpt.quality = res.quality = Q.report(_on_device(cg, dev), pc, groups=opts['quality_groups'], tau=10.0 * u,
-                                                     tau_tri=5.0 * u, max_loo_px=60.0 * u,
-                                                     thresholds=tuple(t * u for t in (5, 8, 10)),
-                                                     fit_mask=fit_mask)
+                rpt.quality = res.quality = Q.report(
+                    _on_device(cg, dev), pc, groups=opts['quality_groups'], tau=10.0 * u, tau_tri=5.0 * u,
+                    max_loo_px=60.0 * u, thresholds=tuple(t * u for t in (5, 8, 10)), fit_mask=fit_mask,
+                    min_views=min(3, Cp), loo=Cp >= 3, min_others=min(3, max(Cp - 1, 1)))
             except Exception as exc:  # pragma: no cover
                 rpt.errors['quality'] = '{}: {}'.format(type(exc).__name__, exc)
     # ---- verdict
     flat = _flat(pc)
     valid = np.isfinite(flat).all(-1)
     per_cam = {}
-    loo_worst = None
+    loo_worst, unsupported = None, []
     if res.quality is not None and res.quality.loo is not None:
         le = np.asarray(res.quality.loo.errors, float)
         use = res.quality.loo.eligible & (fit_mask if fit_mask is not None else True)
         meds = []
         for c, n in enumerate(present):
+            ne = int(use[c].sum())
             e = le[c][use[c] & np.isfinite(le[c])]
             m = float(np.median(e)) if e.size else None
-            per_cam[n] = dict(loo_fit_median_px=m)
+            per_cam[n] = dict(loo_fit_median_px=m, loo_fit_supported_frac=(e.size / ne) if ne else None)
             if m is not None:
                 meds.append(m)
+            elif ne:
+                unsupported.append(n)
         loo_worst = float(np.max(meds)) if meds else None
+    two_view = None
+    if Cp < 3 and res.quality is not None:
+        mv = [res.quality.per_camera[n].get('median_px') for n in present]
+        mv = [v for v in mv if v is not None]
+        two_view = float(max(mv)) if mv else None
+        for n in present:
+            per_cam.setdefault(n, {})['two_view_median_px'] = res.quality.per_camera[n].get('median_px')
     fm = fit_mask if fit_mask is not None else valid
     frame_ids = gr.get('frame')
     if frame_ids is None:
@@ -1270,18 +1465,23 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
             min_frames = nfr
         if min_frac is None or frac < min_frac:
             min_frac, worst_frac_cam = frac, n
-    from .. import scale as S
-    cen = S.camera_centers(cg)
-    d = np.linalg.norm(cen - np.median(cen, 0), axis=1)
-    md = np.median(d) if len(d) else 0.0
-    runaway = [n for n, v in zip(present, d) if md > 0 and v > opts['runaway_ratio'] * md]
+    for n in unplaced:
+        per_cam[n] = dict(placed=False)
+    runaway, moved_frac = _runaways(cg, init_centers, present, opts)
+    for n, v in moved_frac.items():
+        per_cam[n]['moved_from_init_frac'] = v
     worst_loo_cam = None
-    if per_cam:
-        vals = [(v.get('loo_fit_median_px') or -1, n) for n, v in per_cam.items()]
+    vals = [(v.get('loo_fit_median_px') or -1, n) for n, v in per_cam.items() if n in present]
+    if vals:
         worst_loo_cam = max(vals)[1]
     mf = opts['min_inlier_frames']
+    loo_note = 'worst per-camera LOO median ({})'.format(worst_loo_cam)
+    if unsupported:
+        loo_note += '; unsupported (no held-out point triangulated by the other cameras): {}'.format(unsupported)
     rules = [
-        Rule('loo_worst_px', loo_worst, 3 * nf, 10 * nf, 'worst per-camera LOO median ({})'.format(worst_loo_cam)),
+        Rule('loo_worst_px', loo_worst, 3 * nf, 10 * nf, loo_note),
+        Rule('loo_unsupported', len(unsupported) if res.quality is not None and res.quality.loo is not None
+             else None, 0, None, 'cameras whose LOO is unsupported: {}'.format(unsupported) if unsupported else ''),
         Rule('unplaced_cameras', len(unplaced), None, 0, 'not placed: {}'.format(unplaced) if unplaced else ''),
         Rule('runaway_cameras', len(runaway), None, 0, 'runaway: {}'.format(runaway) if runaway else ''),
         Rule('min_inlier_frames', min_frames, mf, mf / 4.0, 'fewest frames with inliers', higher_is_worse=False),
@@ -1290,15 +1490,27 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
         Rule('scale_rejected', scale_rejected, None, True,
              'scale refused: {}'.format(getattr(res.scale, 'reasons', '')) if scale_rejected else ''),
     ]
+    if init_support is not None:
+        rules.append(Rule('init_support', init_support['overall'], 0.3, 0.05,
+                          'share of multi-view observations the {} init explains within {:.3g} px{}'.format(
+                              key, tau_coarse, _vggt_spread_note(rpt) if str(key).startswith('vggt') else ''),
+                          higher_is_worse=False))
+    if Cp < 3:
+        rules.append(Rule('two_view_only', True, None, None,
+                          'only {} camera(s) placed: no leave-one-camera-out check, only the 2-view '
+                          'reprojection error'.format(Cp)))
+        rules.append(Rule('two_view_px', two_view, 0.005 * diag, 0.02 * diag,
+                          'worst per-camera 2-view reprojection median'))
     verdict, reasons, table = _rules(rules, opts)
     settings['loo_warn_px'], settings['loo_fail_px'] = 3 * nf, 10 * nf
     res.report.update(per_camera=per_cam, unplaced=unplaced, runaway=runaway, rules=table, noise_floor_px=nf,
-                      init=key, candidates=list(cands), errors=dict(rpt.errors),
+                      init=key, candidates=list(cands), errors=dict(rpt.errors), init_support=init_support,
+                      loo_unsupported=unsupported,
                       overall=None if res.quality is None else res.quality.overall)
     res.cgroup, res.selected_init = cg, key
     res.verdict, res.reasons, res.settings = verdict, reasons, settings
     res.provenance = provenance('calibrate_from_points',
-                                inputs=dict(n_cameras=len(names), cam_names=names, shape=list(p.shape),
+                                inputs=dict(n_cameras=len(names), cam_names=names, shape=shape_in,
                                             init=init if isinstance(init, str) else 'given',
                                             frames=frames is not None, stations=stations is not None),
                                 fallbacks=fallbacks + ['init {} failed: {}'.format(k, v) for k, v in rpt.errors.items()],
@@ -1309,12 +1521,71 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     return res
 
 
-def _stations_ba(cg, pc, gr, stations, nf, rng):
+def _check_cameras(cg, what):
+    """Workflows need pinhole / fisheye cameras: a clear error for affine (telecentric) ones."""
+    bad = [getattr(c, 'name', i) for i, c in enumerate(getattr(cg, 'cameras', [])) if type(c).__name__ == 'AffineCamera']
+    if bad:
+        raise ValueError('{}: cameras {} are AffineCamera (telecentric) models, which the workflows do not '
+                         'support; convert them first with AffineCamera.to_pinhole(support) (a long-focal '
+                         'pinhole that reproduces the affine projection over the working volume)'.format(what, bad))
+
+
+def _init_support(cg, p, tau):
+    """How well a rig explains the data: per camera, the share of its observations of points seen by
+    >= min(3, C) cameras that are MSAC inliers at ``tau`` px; ``overall`` pooled; ``min_camera``."""
+    _, _, inl = _robust_points(cg, p, tau)
+    flat = _flat(p)
+    fin = np.isfinite(flat).all(-1)
+    multi = fin.sum(0) >= min(3, fin.shape[0])
+    per = {}
+    for c, n in enumerate(cg.get_names()):
+        obs = fin[c] & multi
+        per[n] = float(inl[c][obs].mean()) if obs.any() else None
+    vals = [v for v in per.values() if v is not None]
+    tot = fin[:, multi].sum()
+    return dict(per_camera=per, overall=float(inl[:, multi].sum() / tot) if tot else 0.0,
+                min_camera=float(min(vals)) if vals else None, tau_px=float(tau))
+
+
+def _vggt_spread_note(rpt):
+    st = (rpt.init_reports.get('vggt') or {}).get('stats') if hasattr(rpt, 'init_reports') else None
+    if not st or st.get('rot_disp_deg') is None:
+        return ''
+    rd = np.asarray(st['rot_disp_deg'], float)
+    cd = np.asarray(st.get('center_disp', np.nan), float)
+    return ' (VGGT templates: median rotation spread {:.1f} deg, centre spread {:.2f} rig units, {} used)'.format(
+        float(np.nanmedian(rd)), float(np.nanmedian(cd)), st.get('n_used'))
+
+
+def _runaways(cg, init_centers, present, opts):
+    """Runaway cameras: centre farther than ``runaway_ratio`` x the median from the rig centre AND
+    moved more than ``runaway_move`` x the rig scale from its init (after a similarity fit of the
+    result onto the init). A telephoto camera that was already far away in the init is no runaway."""
+    from .. import scale as S
+    cen = S.camera_centers(cg)
+    d = np.linalg.norm(cen - np.median(cen, 0), axis=1)
+    md = np.median(d) if len(d) else 0.0
+    far = [md > 0 and v > opts['runaway_ratio'] * md for v in d]
+    moved = np.full(len(cen), np.inf)
+    try:
+        if len(cen) >= 3:
+            _, _, _, r, _ = S.fit_similarity(cen, init_centers)
+            rig = S._rig_scale(init_centers)
+            if rig > 0 and np.isfinite(rig):
+                moved = r / rig
+    except Exception:  # pragma: no cover
+        pass
+    frac = {n: (float(v) if np.isfinite(v) else None) for n, v in zip(present, moved)}
+    run = [n for n, f, m in zip(present, far, moved) if f and not (m <= opts['runaway_move'])]
+    return run, frac
+
+
+def _stations_ba(cg, pc, gr, stations, nf, rng, noise_unit=None):
     """Final extrinsics LM with one pose per station (``groups['time']`` per frame)."""
     from .. import bundle as B
     if 'time' not in gr:
         raise ValueError("stations= needs groups['time'] (frame times, s)")
-    u = _noise_unit(nf)
+    u = _noise_unit(nf, noise_unit)
     _, _, inl = _robust_points(cg, pc, 10 * u)
     flat = _flat(pc)
     t = np.asarray(gr['time'], float)
@@ -1333,9 +1604,13 @@ def _stations_ba(cg, pc, gr, stations, nf, rng):
 
 W3_DEFAULTS = dict(
     board_kwargs=None,        # passed to scale.from_board (relative gates: frame MAD, spread)
-    lengths_kwargs=None,      # passed to scale.from_lengths (tau defaults to 10 noise units)
+    lengths_kwargs=None,      # passed to scale.from_lengths (tau defaults to 5 noise units)
     reference_kwargs=None,    # passed to scale.from_reference
     ground_points=None, up='z', origin='centroid',   # align='ground'
+    noise_unit='auto',        # 'auto' (capped noise floor / 0.5 px) or a float (1 = absolute pixel defaults)
+    lengths_check=0.03,       # lengths: re-measured bones (strict threshold) off by more than this -> warn
+    n_frames=None,            # board_points={cam: video(s)}: frames sampled per video (None: every `skip`-th)
+    skip=20, detector='auto', detector_kwargs=None, n_workers=1,     # ... board detection in the videos
     verdict=None,
 )
 
@@ -1371,18 +1646,66 @@ def _scale_sigma(r):
     return None
 
 
+def _video_n_frames(path):
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+
+
+def _board_rows_from_videos(cgroup, videos, board, opts):
+    """``{camera name: video | [videos]}`` -> per-camera rows (W1's detection). With
+    ``options['n_frames']``, the same evenly spaced frame indices in every camera (synchronised
+    videos), sampled from the shortest video."""
+    names = cgroup.get_names()
+    unknown = [k for k in videos if str(k) not in names]
+    if unknown:
+        raise ValueError('board_points has videos for cameras not in the group: {}'.format(unknown))
+    per = []
+    for n in names:
+        v = videos.get(n, [])
+        per.append([v] if isinstance(v, (str, os.PathLike)) else list(v))
+    det = opts['detector']
+    if det == 'auto':
+        det = 'deepcharuco' if _deepcharuco_available(board) else 'opencv'
+    if not hasattr(board, 'detector_name'):
+        det = None
+    kw = dict(verbose=False, n_workers=opts['n_workers'], skip=opts['skip'], detector_kwargs=opts['detector_kwargs'])
+    if opts['n_frames']:
+        counts = [_video_n_frames(v) for vs in per for v in vs]
+        counts = [c for c in counts if c > 0]
+        if counts:
+            kw['frame_indices'] = [int(f) for f in np.unique(np.linspace(0, min(counts) - 1, int(opts['n_frames']))
+                                                            .round().astype(int))]
+    rows = cgroup.get_rows_videos(per, board, detector=det, **kw)
+    return rows, dict(detector=det if isinstance(det, (str, type(None))) else type(det).__name__,
+                      n_videos=sum(len(v) for v in per), n_rows=[len(r) for r in rows],
+                      frame_indices=kw.get('frame_indices'))
+
+
 @thread_guard
 def estimate_scale(cgroup, board=None, board_points=None, lengths=None, reference=None, align='auto',
                    apply=True, options=None, *, object=None, object_points=None):
     """W3: metric scale (and optionally the world frame) of a calibrated rig.
 
-    Exactly one source:
+    Exactly one scale source:
 
-    - ``board`` + ``board_points`` (rows or ``[C,F,K,2]`` corners; also ``object=`` +
-      ``object_points=`` for a :class:`~aniposelib.boards.PointObject`): ``scale.from_board``;
+    - ``board`` + ``board_points`` (rows, ``[C,F,K,2]`` corners, or videos ``{camera name: video
+      | [videos]}``, detected as in W1; ``options['n_frames']`` frames per video, the same indices
+      in every camera; also ``object=`` + ``object_points=`` for a
+      :class:`~aniposelib.boards.PointObject`): ``scale.from_board``;
     - ``lengths=dict(points=[C,N,J,2], pairs=[(a, b), ...], ref=[...], joints=None)``:
-      ``scale.from_lengths`` (MSAC threshold 10 noise units);
+      ``scale.from_lengths`` (MSAC threshold 5 noise units, >= min(3, C) agreeing views); the bones
+      are then re-measured on the scaled rig with a threshold half as large
+      (``report['lengths_check']``): rule ``lengths_check``;
     - ``reference`` (a ``CameraGroup`` of the same cameras): ``scale.from_reference``.
+
+    ``reference`` may also be given together with ``board`` / ``lengths`` and
+    ``align='reference'``: the scale comes from the board / lengths, the world frame (rotation and
+    translation only) from the reference; ``details['reference_scale']`` is the scale the
+    reference alone would give.
 
     ``align``: ``'auto'`` (= ``'reference'`` when a reference is given, else None),
     ``'reference'`` (similarity-align the gauge onto the reference: ``scale.align_to``),
@@ -1390,34 +1713,49 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
     ``origin``) or None. ``apply``: return a rescaled copy in ``result.cgroup`` (units, source and
     quality in its metadata). The input group is never modified.
 
+    ``options['noise_unit']``: 'auto' (default; capped noise floor / 0.5 px) or a float that forces
+    the unit of the lengths thresholds (1 = 5 px).
+
     Verdict rules: ``scale_rejected`` (the backend refused the estimate: too few frames / pairs,
     frame MAD above its relative gate; fail); ``scale_flags`` (number of quality flags such as
-    ``board_scale_spread`` / ``lengths_spread`` / ``scale_reference_mismatch``; warn).
+    ``board_scale_spread`` / ``lengths_spread`` / ``scale_reference_mismatch``; warn);
+    ``lengths_check`` (lengths: the bones re-measured on the scaled rig at the strict
+    threshold; warn above ``options['lengths_check']`` (3 %), fail above 10 %).
     """
     from .. import scale as S
     opts = merge_options(W3_DEFAULTS, options)
+    _check_noise_unit(opts['noise_unit'])
     timer = Timer()
     if object is not None:
         if board is not None:
             raise ValueError('give board= or object=, not both')
         board, board_points = object, object_points if object_points is not None else board_points
     sources = [n for n, v in (('board', board), ('lengths', lengths), ('reference', reference)) if v is not None]
+    frame_ref = False
+    if len(sources) == 2 and 'reference' in sources and align == 'reference':
+        sources.remove('reference')        # scale from the other source, frame from the reference
+        frame_ref = True
     if len(sources) != 1:
-        raise ValueError('estimate_scale needs exactly one of board=, lengths=, reference= (got {})'.format(
-            sources or 'none'))
+        raise ValueError('estimate_scale needs exactly one of board=, lengths=, reference= (got {}); a '
+                         "reference may be added to board= / lengths= with align='reference'".format(
+                             sources or 'none'))
     src = sources[0]
     if align == 'auto':
         align = 'reference' if src == 'reference' else None
     if align not in (None, 'reference', 'ground'):
         raise ValueError("align must be 'auto', 'reference', 'ground' or None")
-    if align == 'reference' and src != 'reference':
+    if align == 'reference' and reference is None:
         raise ValueError("align='reference' needs reference=")
-    settings = dict(source=src, align=align)
+    settings = dict(source=src, align=align, frame_from_reference=frame_ref)
+    extra = {}
+    check = None
     with timer('estimate'):
         if src == 'board':
             if board_points is None:
-                raise ValueError('board= needs board_points= (rows or corners)')
-            if hasattr(board, 'rows_from_array') and not isinstance(board_points, (list, tuple)):
+                raise ValueError('board= needs board_points= (rows, corners or {camera: video})')
+            if isinstance(board_points, dict):
+                board_points, extra['detection'] = _board_rows_from_videos(cgroup, board_points, board, opts)
+            elif hasattr(board, 'rows_from_array') and not isinstance(board_points, (list, tuple)):
                 bp = np.asarray(to_numpy(board_points), float)
                 if getattr(board, 'static', False) and bp.ndim == 4 and bp.shape[1] > 1:
                     with np.errstate(all='ignore'):
@@ -1442,19 +1780,41 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
             ref = lengths.get('ref', lengths.get('lengths', lengths.get('ref_lengths')))
             diag = _diag(cgroup, pts)
             nf, _ = _points_noise(cgroup, pts, diag)
-            kw = dict(tau=10.0 * _noise_unit(nf))
+            u = _noise_unit(nf, opts['noise_unit'])
+            kw = dict(tau=5.0 * u, min_inliers=min(3, len(cgroup.cameras)))
             kw.update(opts['lengths_kwargs'] or {})
-            settings.update(noise_floor_px=nf, tau_px=kw['tau'])
-            r = S.from_lengths(cgroup, pts, lengths['pairs'], ref, joints=lengths.get('joints'),
-                               **{k: v for k, v in kw.items()})
+            settings.update(noise_floor_px=nf, noise_unit=u, tau_px=kw['tau'], min_inliers=kw['min_inliers'])
+            r = S.from_lengths(cgroup, pts, lengths['pairs'], ref, joints=lengths.get('joints'), **kw)
+            if r.scale is not None and r.accepted:
+                # self-consistency: the bones re-measured on the scaled rig at a stricter threshold
+                tmp = cgroup.copy()
+                S.rescale(tmp, r.scale)
+                kc = dict(kw, tau=0.5 * kw['tau'])
+                rc = S.from_lengths(tmp, pts, lengths['pairs'], ref, joints=lengths.get('joints'), **kc)
+                per = {k: dict(length_after=v.get('median_length'), reference=v.get('reference'),
+                               ratio=(v['median_length'] / v['reference']) if v.get('median_length') else None,
+                               n=v.get('n'))
+                       for k, v in (rc.details or {}).get('per_pair', {}).items()}
+                rat = [v['ratio'] for v in per.values() if v['ratio'] is not None]
+                mr = float(np.median(rat)) if rat else None
+                check = abs(mr - 1) if mr is not None else None
+                extra['lengths_check'] = dict(tau_px=kc['tau'], per_pair=per, median_ratio=mr, rel_dev=check)
         else:
             r = S.from_reference(cgroup, reference, **(opts['reference_kwargs'] or {}))
     details = r.to_dict()
+    if frame_ref:
+        try:
+            rr = S.from_reference(cgroup, reference, **(opts['reference_kwargs'] or {}))
+            details['reference_scale'] = rr.scale
+            if r.scale and rr.scale:
+                details['reference_scale_ratio'] = float(rr.scale / r.scale)
+        except Exception as exc:  # pragma: no cover
+            details['reference_scale_error'] = str(exc)
     out = None
     if apply and r.accepted and r.scale is not None:
         with timer('apply'):
             out = cgroup.copy()
-            if align == 'reference':
+            if align == 'reference' and not frame_ref:
                 al = S.align_to(out, reference)
                 md = out.metadata
                 md['scale_source'] = 'reference'
@@ -1466,17 +1826,28 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
                 details['align'] = al.to_dict()
             else:
                 r.apply(out)
+                if frame_ref:
+                    units = out.metadata.get('units')
+                    al = S.align_to(out, reference, with_scale=False)
+                    if units is not None:
+                        out.metadata['units'] = units
+                    details['align'] = al.to_dict()
             if align == 'ground':
                 al = S.align_world(out, opts['ground_points'], up=opts['up'], origin=opts['origin'])
                 details['align'] = al.to_dict()
     rules = [Rule('scale_rejected', not r.accepted, None, True,
                   'scale refused: {}'.format(r.reason) if not r.accepted else ''),
              Rule('scale_flags', len(r.flags), 0, None, 'flags: {}'.format(r.flags) if r.flags else '')]
+    if src == 'lengths':
+        rules.append(Rule('lengths_check', check, opts['lengths_check'], 0.1,
+                          '|median bone length / reference - 1| re-measured on the scaled rig at half the threshold'))
     verdict, reasons, table = _rules(rules, opts)
-    return ScaleEstimate(report=dict(rules=table, stats=r.stats, flags=list(r.flags), reason=r.reason,
-                                     units=r.units),
+    report = dict(rules=table, stats=r.stats, flags=list(r.flags), reason=r.reason, units=r.units)
+    report.update(extra)
+    return ScaleEstimate(report=report,
                          verdict=verdict, reasons=reasons, settings=settings,
-                         provenance=provenance('estimate_scale', inputs=dict(source=src, cameras=cgroup.get_names()),
+                         provenance=provenance('estimate_scale', inputs=dict(source=src, cameras=cgroup.get_names(),
+                                                                             frame_from_reference=frame_ref),
                                                timings=timer.times),
                          scale=r.scale, sigma=_scale_sigma(r), source=r.source, accepted=bool(r.accepted),
                          details=details, cgroup=out)
@@ -1486,9 +1857,20 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
 
 W4_DEFAULTS = dict(
     min_others=3,             # LOO: other cameras that must see a point
-    detect_moves_kwargs=None, # passed to stations.detect_moves (tau / huber scaled by the noise unit)
+    detect_moves_kwargs=None, # passed to stations.detect_moves (tau / huber scaled by the noise unit; z_thr 10)
     compare_kwargs=None,      # passed to quality.compare
     min_ray_deg=2.0,          # ray-angle degeneracy threshold
+    noise_unit='auto',        # 'auto' (capped noise floor / 0.5 px) or a float (1 = absolute pixel defaults)
+    cam_names=None,           # camera names of the points' first axis (default: the group's order)
+    tau_px=None,              # robust triangulation threshold (default 10 noise units)
+    tau_tri_px=None,          # LOO triangulation threshold (default 5 noise units)
+    thresholds_px=None,       # LOO agreement thresholds (default (5, 8, 10) noise units)
+    loo_window_s='auto',      # time-blocked LOO with times=: window (s); 'auto' ~ 20 windows; None = off
+    min_window_obs=50,        # ... windows with fewer eligible observations are not judged
+    bad_window_ratio=0.5,     # ... a window is bad when its LOO agreement < this x the median window
+    compare_to=None,          # {name: CameraGroup}: paired LOO agreement vs other calibrations
+    clusters=None,            # [N] bootstrap cluster per point (default: the LOO windows / 100 frame blocks)
+    n_boot=1000,              # bootstrap resamples of the paired comparison
     verdict=None,
 )
 
@@ -1499,8 +1881,10 @@ class CalibrationEvaluation(WorkflowResult):
     reprojection median, inlier rate, lens validity, area coverage, flags), ``moves``
     (:class:`aniposelib.stations.MoveReport` or None), ``comparison``
     (:class:`aniposelib.quality.CompareResult` or None), ``quality`` (the full
-    :class:`aniposelib.quality.CalibrationReport`)."""
+    :class:`aniposelib.quality.CalibrationReport`), ``per_window`` (time-blocked LOO with
+    ``times=``: per window start time, LOO agreement / median / coverage)."""
     per_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    per_window: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     moves: Any = None
     comparison: Any = None
     quality: Any = None
@@ -1519,6 +1903,52 @@ def _to_builtin(x):
     return _jsonable(x)
 
 
+def _paired_agree(e0, e1, eligible, clusters, thresholds, n_boot, seed=0):
+    """Paired LOO agreement difference ``e1 - e0`` (both ``[C,N]``, same eligibility), clusters
+    resampled (block bootstrap; port of Emory ``evaluate_v2.paired_compare``). Agreement is the
+    mean over cameras of (hits / eligible). Returns ``{agree@T: dict(a, b, delta, ci95)}``."""
+    windows, inv = np.unique(clusters, return_inverse=True)
+    nw, nc = len(windows), e0.shape[0]
+    rng = np.random.default_rng(seed)
+    boots = [rng.integers(nw, size=nw) for _ in range(int(n_boot))]
+    den = np.zeros((nw, nc))
+    for c in range(nc):
+        den[:, c] = np.bincount(inv, weights=eligible[c], minlength=nw)
+
+    def macro(h, d):
+        with np.errstate(all='ignore'):
+            v = np.where(d > 0, h / d, np.nan)
+        return float(np.nanmean(v)) if np.isfinite(v).any() else float('nan')
+    out = {}
+    for thr in thresholds:
+        h0 = np.zeros_like(den)
+        h1 = np.zeros_like(den)
+        for c in range(nc):
+            with np.errstate(invalid='ignore'):
+                h0[:, c] = np.bincount(inv, weights=eligible[c] & np.isfinite(e0[c]) & (e0[c] < thr), minlength=nw)
+                h1[:, c] = np.bincount(inv, weights=eligible[c] & np.isfinite(e1[c]) & (e1[c] < thr), minlength=nw)
+        d = macro((h1 - h0).sum(0), den.sum(0))
+        bs = [macro((h1[k] - h0[k]).sum(0), den[k].sum(0)) for k in boots]
+        bs = [b for b in bs if np.isfinite(b)]
+        out['agree@{:.4g}'.format(thr)] = dict(a=macro(h0.sum(0), den.sum(0)), b=macro(h1.sum(0), den.sum(0)),
+                                               delta=d, ci95=np.percentile(bs, [2.5, 97.5]).tolist() if bs else None,
+                                               n_clusters=int(nw))
+    return out
+
+
+def _auto_window(times):
+    t = np.asarray(times, float)
+    t = t[np.isfinite(t)]
+    if len(t) < 2:
+        return None
+    span = float(t.max() - t.min())
+    if span <= 0:
+        return None
+    w = span / 20.0
+    e = 10 ** np.floor(np.log10(w))       # a round number: 1, 2 or 5 x 10^k
+    return float(min((m * e for m in (1, 2, 5, 10)), key=lambda v: abs(np.log(v / w))))
+
+
 @thread_guard
 def evaluate_calibration(cgroup, points, times=None, reference=None, board=None, options=None, *,
                          board_points=None, object=None, object_points=None, device='auto'):
@@ -1526,9 +1956,14 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
 
     Parameters
     ----------
-    cgroup : the calibration to evaluate.
-    points : ``C x N x 2`` / ``C x N x J x 2`` pixels in ``cgroup`` order (NaN missing).
-    times : ``[N]`` frame times (s): per-window moved-camera check (``stations.detect_moves``).
+    cgroup : the calibration to evaluate (pinhole / fisheye cameras; convert an AffineCamera group
+        with ``AffineCamera.to_pinhole`` first).
+    points : ``C x N x 2`` / ``C x N x J x 2`` pixels in ``cgroup`` order (NaN missing), or in the
+        order of ``options['cam_names']``: then only the group's cameras are kept
+        (``report['cameras_dropped']``) and group cameras without points are left out of the
+        evaluation (``report['cameras_missing']``).
+    times : ``[N]`` frame times (s): per-window moved-camera check (``stations.detect_moves``) and a
+        time-blocked LOO (``per_window``).
     reference : a ``CameraGroup`` to compare with (``quality.compare``: aligned centre residuals,
         rotation / focal deltas, paired LOO).
     board, board_points : a board and its detections (rows or corners) -> board shape residual
@@ -1536,43 +1971,94 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     device : ``'auto'`` (cuda when available), ``'cpu'`` or ``'cuda'``: where the triangulations
         run (a copy of ``cgroup`` is moved there; ``cgroup`` is not modified, results are numpy).
 
+    Options (besides the verdict overrides): ``noise_unit`` ('auto' or a float: 1 = the 1.0
+    absolute pixel defaults), ``tau_px`` / ``tau_tri_px`` / ``thresholds_px`` (the robust and LOO
+    triangulation thresholds and the LOO agreement thresholds in px, e.g. Emory's yardstick
+    ``tau_tri_px=5, thresholds_px=(5, 8, 10)``), ``loo_window_s`` (time-blocked LOO window with
+    ``times=``; 'auto' ~ 20 windows), ``compare_to={name: CameraGroup}`` with ``clusters=[N]``
+    (paired LOO agreement difference with a cluster bootstrap: ``report['compare_to']``),
+    ``detect_moves_kwargs`` (``z_thr`` defaults to 10), ``cam_names``.
+
     Contents: LOO per camera (fixed denominator), coverage, inlier rates, lens validity, ray
     angles, plus moves / comparison / board shape when their inputs are given. Project policy
-    (e.g. a reuse ladder) belongs downstream, on top of ``per_camera``.
+    (e.g. a reuse ladder) belongs downstream, on top of ``per_camera``. With 2 cameras there is no
+    LOO: the 2-view reprojection error is reported instead.
 
     Verdict rules (``nf`` = noise floor of the observations under this calibration):
 
     - ``loo_worst_px``: worst per-camera LOO median; warn above 3 nf, fail above 10 nf;
-    - ``loo_coverage_min``: smallest per-camera LOO coverage; warn below 0.5, fail below 0.2;
+    - ``loo_coverage_min``: smallest per-camera LOO coverage; warn below 0.5, fail below 0.2
+      (the reason names cameras with a low inlier rate that probably cause it);
+    - ``loo_unsupported``: cameras whose held-out points never triangulate from the others (warn);
     - ``lens_invalid``: cameras whose lens model is not invertible over the image (warn);
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
+    - ``bad_windows_frac``: share of time windows whose LOO agreement is below
+      ``bad_window_ratio`` x the median window (desync / broken data; warn above 5 %);
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
-      warn 1 %, fail 5 %;
-    - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %.
+      warn 1 % (warn only: a reference is often rougher than the calibration under test);
+    - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
+    - ``two_view_only`` / ``two_view_px`` (2 cameras): no LOO (warn); worst per-camera 2-view
+      reprojection median, warn above 0.5 %, fail above 2 % of the image diagonal.
     """
     from .. import quality as Q
+    from ._common import reindex_cameras
     opts = merge_options(W4_DEFAULTS, options)
+    _check_noise_unit(opts['noise_unit'])
     timer = Timer()
+    _check_cameras(cgroup, 'evaluate_calibration')
     if object is not None:
         board, board_points = object, object_points if object_points is not None else board_points
     p = np.asarray(to_numpy(points), dtype='float64')
+    gnames = cgroup.get_names()
+    missing, dropped = [], []
+    if opts['cam_names'] is not None:
+        if p.ndim not in (3, 4):
+            raise ValueError('points must be C x N x 2 or C x N x J x 2, got {}'.format(p.shape))
+        p, missing, dropped = reindex_cameras(p, opts['cam_names'], gnames)
+        keep = [n for n in gnames if n not in missing]
+        if len(keep) < 2:
+            raise ValueError('only {} of the group cameras {} are in cam_names'.format(keep, gnames))
+        if missing:
+            p = p[[gnames.index(n) for n in keep]]
+            cgroup = cgroup.subset_cameras_names(keep)
     names = cgroup.get_names()
     if p.ndim not in (3, 4) or p.shape[0] != len(names) or p.shape[-1] != 2:
         raise ValueError('points must be C x N x 2 or C x N x J x 2 with C={}, got {}'.format(len(names), p.shape))
     if board is not None and board_points is None:
         raise ValueError('board= needs board_points= (rows or corners)')
+    C = len(names)
+    J = p.shape[2] if p.ndim == 4 else 1
     diag = _diag(cgroup, p) or 1000.0
     cg = _on_device(cgroup, device)
     with timer('noise'):
         nf, _ = _points_noise(cg, p, diag)
-    u = _noise_unit(nf)
-    settings = dict(image_diag_px=diag, noise_floor_px=nf, noise_unit=u, tau_px=10 * u, tau_tri_px=5 * u,
-                    loo_warn_px=3 * nf, loo_fail_px=10 * nf)
+    u = _noise_unit(nf, opts['noise_unit'])
+    tau = float(opts['tau_px']) if opts['tau_px'] is not None else 10.0 * u
+    tau_tri = float(opts['tau_tri_px']) if opts['tau_tri_px'] is not None else 5.0 * u
+    thr = tuple(float(t) for t in opts['thresholds_px']) if opts['thresholds_px'] is not None \
+        else tuple(t * u for t in (5, 8, 10))
+    agree_t = thr[1] if len(thr) >= 3 else thr[len(thr) // 2]
+    min_others = min(int(opts['min_others']), max(C - 1, 1))
+    use_loo = C >= 3
+    settings = dict(image_diag_px=diag, noise_floor_px=nf, noise_unit=u, tau_px=tau, tau_tri_px=tau_tri,
+                    thresholds_px=list(thr), min_others=min_others, loo_warn_px=3 * nf, loo_fail_px=10 * nf)
+    # time windows of the blocked LOO
+    win = None
+    if times is not None and use_loo and opts['loo_window_s'] is not None:
+        tt = np.asarray(times, float).reshape(-1)
+        if tt.shape[0] != p.shape[1]:
+            raise ValueError('times has {} entries for {} frames'.format(tt.shape[0], p.shape[1]))
+        ws = _auto_window(tt) if opts['loo_window_s'] == 'auto' else float(opts['loo_window_s'])
+        if ws:
+            t0 = float(np.nanmin(tt))
+            win = np.floor((tt - t0) / ws).astype(int)
+            settings['loo_window_s'] = ws
     with timer('report'):
-        qr = Q.report(cg, p, tau=10.0 * u, tau_tri=5.0 * u, max_loo_px=60.0 * u,
-                      thresholds=tuple(t * u for t in (5, 8, 10)), min_others=opts['min_others'])
+        qr = Q.report(cg, p, tau=tau, tau_tri=tau_tri, max_loo_px=60.0 * u, thresholds=thr,
+                      min_others=min_others, loo=use_loo, min_views=min(3, C),
+                      groups=None if win is None else np.repeat(win, J))
     per = {n: dict(qr.per_camera[n]) for n in names}
     with timer('lens'):
         n_lens_bad = 0
@@ -1583,30 +2069,56 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 n_lens_bad += not lv['valid']
             except Exception:  # pragma: no cover
                 pass
-        cov = Q.coverage(p, min_cams=opts['min_others'], cgroup=cgroup)
+        cov = Q.coverage(p, min_cams=min(opts['min_others'], C), cgroup=cgroup)
         for n in names:
             per[n]['area'] = cov['per_camera'][n].get('area')
     with timer('rays'):
-        X, _, inl = _robust_points(cg, p, 10.0 * u)
+        X, _, inl = _robust_points(cg, p, tau)
         X[inl.sum(0) < 2] = np.nan
         ok = np.isfinite(X).all(1)
         grazing = None
         if ok.any():
             ra = Q.ray_angles(cg, X[ok], _flat(p)[:, ok], min_deg=opts['min_ray_deg'])
             grazing = float(ra['frac_points_below'])
-    report = dict(overall=qr.overall, coverage=cov, rules=None)
+    report = dict(overall=qr.overall, coverage=cov, rules=None, cameras_missing=missing, cameras_dropped=dropped)
     moves = comparison = None
     moved, center_frac, shape_rel = [], None, None
     if times is not None:
         with timer('moves'):
             from ..stations import detect_moves
-            kw = dict(tau=10.0 * u, huber_px=3.0 * u)
+            kw = dict(tau=tau, huber_px=3.0 * u, z_thr=10.0)
             kw.update(opts['detect_moves_kwargs'] or {})
             moves = detect_moves(cg, p, times, **kw)
             moved = list(moves.moved)
             settings['detect_moves'] = {k: v for k, v in kw.items() if isinstance(v, (int, float))}
+            report['moves_info'] = {k: v for k, v in moves.info.items() if k in ('retest', 'low_support')}
             for n in names:
                 per[n]['moved'] = n in moved
+    # time-blocked LOO
+    per_window, bad_frac, bad_windows = {}, None, []
+    if win is not None and qr.per_group:
+        key = 'loo_' + Q._thr_key(agree_t)
+        nel = {}
+        if qr.loo is not None:
+            wf = np.repeat(win, J)
+            for lab in np.unique(wf):
+                nel[str(lab)] = int(qr.loo.eligible[:, wf == lab].sum())
+        ws = settings['loo_window_s']
+        t0 = float(np.nanmin(np.asarray(times, float)))
+        for lab, gd in sorted(qr.per_group.items(), key=lambda kv: int(kv[0])):
+            per_window['{:.6g}'.format(t0 + int(lab) * ws)] = dict(
+                window=int(lab), n_eligible=nel.get(lab, 0), loo_agree=gd.get(key),
+                loo_median_px=gd.get('loo_median_px'), loo_coverage=gd.get('loo_coverage'))
+        judged = {k: v for k, v in per_window.items()
+                  if v['n_eligible'] >= opts['min_window_obs'] and v['loo_agree'] is not None}
+        if len(judged) >= 3:
+            med = float(np.median([v['loo_agree'] for v in judged.values()]))
+            bad_windows = [k for k, v in judged.items() if v['loo_agree'] < opts['bad_window_ratio'] * med]
+            bad_frac = len(bad_windows) / len(judged)
+            for k, v in per_window.items():
+                v['bad'] = k in bad_windows
+            report['windows'] = dict(window_s=ws, n_windows=len(per_window), n_judged=len(judged),
+                                     median_agree=med, bad=bad_windows, agree_px=agree_t)
     if reference is not None:
         with timer('compare'):
             try:
@@ -1616,6 +2128,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                     per[n]['reference'] = d
             except ValueError as exc:
                 report['compare_error'] = str(exc)
+    if opts['compare_to']:
+        with timer('compare_to'):
+            report['compare_to'] = _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device)
     if board is not None:
         with timer('board'):
             bs = Q.board_shape_residual(cg, board_points, board)
@@ -1626,28 +2141,103 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 shape_rel = bs['median'] / size
     loo = np.array([np.nan if per[n].get('loo_median_px') is None else per[n]['loo_median_px'] for n in names])
     covs = np.array([np.nan if per[n].get('loo_coverage') is None else per[n]['loo_coverage'] for n in names])
+    unsupported = [n for n in names if use_loo and per[n].get('loo_median_px') is None
+                   and (per[n].get('loo_n_eligible') or 0) > 0]
+    for n in names:
+        if per[n].get('loo_coverage') is not None:
+            per[n]['loo_unsupported_frac'] = 1.0 - per[n]['loo_coverage']
     worst_cam = names[int(np.nanargmax(loo))] if np.isfinite(loo).any() else None
-    loo_worst = float(np.nanmax(loo)) if np.isfinite(loo).any() else float('nan')
+    loo_worst = float(np.nanmax(loo)) if np.isfinite(loo).any() else None
     low_cov = names[int(np.nanargmin(covs))] if np.isfinite(covs).any() else None
+    # cameras that disagree with the others in the all-camera robust triangulation: a camera's
+    # unsupported LOO points are usually caused by one of them (the bad camera is among the 'others')
+    rates = {n: per[n].get('inlier_rate') for n in names if per[n].get('inlier_rate') is not None}
+    suspects = []
+    if len(rates) >= 3:
+        mr = float(np.median(list(rates.values())))
+        suspects = [n for n, v in rates.items() if v < 0.5 * mr]
+    report['low_inlier_cameras'] = suspects
+    cov_note = 'smallest LOO coverage ({})'.format(low_cov)
+    if low_cov is not None and suspects and low_cov not in suspects:
+        cov_note += '; probably caused by {} (low inlier rate: disagrees with the other cameras)'.format(suspects)
+    loo_note = 'worst per-camera LOO median ({})'.format(worst_cam)
+    if unsupported:
+        loo_note += '; unsupported (no held-out point triangulated by the other cameras): {}'.format(unsupported)
+    two_view = None
+    if not use_loo:
+        mv = [per[n].get('median_px') for n in names if per[n].get('median_px') is not None]
+        two_view = float(max(mv)) if mv else None
     rules = [
-        Rule('loo_worst_px', loo_worst, 3 * nf, 10 * nf, 'worst per-camera LOO median ({})'.format(worst_cam)),
+        Rule('loo_worst_px', loo_worst, 3 * nf, 10 * nf, loo_note),
         Rule('loo_coverage_min', float(np.nanmin(covs)) if np.isfinite(covs).any() else None, 0.5, 0.2,
-             'smallest LOO coverage ({})'.format(low_cov), higher_is_worse=False),
+             cov_note, higher_is_worse=False),
+        Rule('loo_unsupported', len(unsupported) if use_loo else None, 0, None,
+             'cameras whose LOO is unsupported: {}'.format(unsupported) if unsupported else ''),
         Rule('lens_invalid', n_lens_bad, 0, None, 'lens model not invertible over the image'),
         Rule('grazing_frac', grazing, 0.5, None, 'points with all ray angles < {} deg'.format(opts['min_ray_deg'])),
         Rule('moved_cameras', len(moved) if times is not None else None, None, 0,
              'moved: {}'.format(moved) if moved else ''),
-        Rule('center_residual_frac', center_frac, 0.01, 0.05, 'aligned centre residual vs reference / rig scale'),
+        Rule('center_residual_frac', center_frac, 0.01, None, 'aligned centre residual vs reference / rig scale'),
         Rule('board_shape_rel', shape_rel, 0.005, 0.02, 'board shape residual / object size'),
+        Rule('bad_windows_frac', bad_frac, 0.05, None,
+             'time windows with LOO agreement < {} x the median window: {}'.format(
+                 opts['bad_window_ratio'], bad_windows[:10]) if bad_windows else ''),
     ]
+    if missing:
+        rules.append(Rule('cameras_missing', len(missing), 0, None, 'group cameras without points: {}'.format(missing)))
+    if not use_loo:
+        rules.append(Rule('two_view_only', True, None, None,
+                          'only {} cameras: no leave-one-camera-out check, only the 2-view reprojection error'.format(C)))
+        rules.append(Rule('two_view_px', two_view, 0.005 * diag, 0.02 * diag,
+                          'worst per-camera 2-view reprojection median'))
     verdict, reasons, table = _rules(rules, opts)
     report['rules'] = table
+    report['loo_unsupported'] = unsupported
     report['per_camera_flags'] = {n: per[n].get('flags', []) for n in names}
     return CalibrationEvaluation(report=report, verdict=verdict, reasons=reasons, settings=settings,
                                  provenance=provenance('evaluate_calibration',
                                                        inputs=dict(cameras=names, shape=list(p.shape),
                                                                    times=times is not None,
                                                                    reference=reference is not None,
-                                                                   board=board is not None),
+                                                                   board=board is not None,
+                                                                   compare_to=list(opts['compare_to'] or [])),
                                                        timings=timer.times),
-                                 per_camera=per, moves=moves, comparison=comparison, quality=qr)
+                                 per_camera=per, per_window=per_window, moves=moves, comparison=comparison,
+                                 quality=qr)
+
+
+def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device):
+    """``options['compare_to']``: paired LOO agreement of this calibration vs each other one, on
+    the same observations (other - this; positive = the other one agrees more)."""
+    from .. import quality as Q
+    names = cg.get_names()
+    N = p.shape[1]
+    if opts['clusters'] is not None:
+        cl = np.asarray(opts['clusters']).reshape(-1)
+        if cl.shape[0] == N and J > 1:
+            cl = np.repeat(cl, J)
+        if cl.shape[0] != N * J:
+            raise ValueError('clusters must have one label per point ({}), got {}'.format(N, cl.shape[0]))
+    elif win is not None:
+        cl = np.repeat(win, J)
+    else:
+        cl = np.repeat(np.arange(N) // max(1, int(np.ceil(N / 100))), J)
+    if qr.loo is not None:
+        e0, el = qr.loo.errors, qr.loo.eligible
+    else:
+        e0, el = Q.loo_errors(cg, p, tau_tri=tau_tri, min_others=min_others)
+    out = {}
+    for name, other in dict(opts['compare_to']).items():
+        try:
+            on = other.get_names()
+            miss = [n for n in names if n not in on]
+            if miss:
+                raise ValueError('cameras {} are not in {!r}'.format(miss, name))
+            og = other if on == names else other.subset_cameras_names(names)
+            og = _on_device(og, device)
+            e1, _ = Q.loo_errors(og, p, tau_tri=tau_tri, min_others=min_others)
+            d = _paired_agree(e0, e1, el, cl, thr, opts['n_boot'])
+            out[str(name)] = d
+        except Exception as exc:
+            out[str(name)] = dict(error='{}: {}'.format(type(exc).__name__, exc))
+    return out
