@@ -315,3 +315,63 @@ def test_speed_12cams_100k(device):
         dt = time.time() - t
         assert dt < budget, (method, dt)
         assert np.nanmedian(rel(true, res.p3d.cpu().numpy(), X)) < 1e-3
+
+
+def _barrel_rig():
+    from scipy.spatial.transform import Rotation
+    from aniposelib.cameras import Camera, CameraGroup
+    K = np.array([[500., 0, 500], [0, 500, 500], [0, 0, 1]])
+    cams = []
+    for i, ang in enumerate(np.linspace(-0.6, 0.6, 4)):
+        R = np.array([[np.cos(ang), 0, np.sin(ang)], [0, 1, 0], [-np.sin(ang), 0, np.cos(ang)]])
+        c = np.array([-4 * np.sin(ang), 0.3 * i, -4 * np.cos(ang)])
+        cams.append(Camera(matrix=K, dist=[-0.4, 0, 0, 0, 0], size=(1000, 1000),
+                           rvec=Rotation.from_matrix(R).as_rotvec(), tvec=-R @ c, name=str(i)))
+    return CameraGroup(cams)
+
+
+def test_lens_fold_check_in_function():
+    """1.1 (plan 04 decision 24): the lens-fold / ray-consistency check lives in
+    triangulation.triangulate_robust / triangulate_possible, so function and method agree."""
+    cg = _barrel_rig()
+    rng = np.random.default_rng(0)
+    X = rng.uniform(-3, 3, (1500, 3)); X[:, 2] = rng.uniform(-1, 1, len(X))
+    p2d = synth.project(cg, X) + rng.normal(scale=0.5, size=(4, len(X), 2))
+    P = G.pack(cg)
+    a = T.triangulate_robust(P, p2d)
+    b = cg.triangulate_robust(p2d)
+    off = T.triangulate_robust(P, p2d, check_invertible=False)
+    np.testing.assert_array_equal(a.p3d, b.p3d)
+    np.testing.assert_array_equal(a.inliers, b.inliers)
+    e = lambda r: np.nanmedian(np.linalg.norm(r.p3d - X, axis=-1))
+    assert e(a) < 0.9 * e(off)
+    # masked observations (past the fold) still have their errors reported
+    masked = ~np.isfinite(synth.to_np(T._mask_noninvertible(P, torch.as_tensor(p2d)))).all(-1) \
+        & np.isfinite(p2d).all(-1) & np.all((p2d >= 0) & (p2d < 1000), axis=-1)
+    assert masked.sum() > 50
+    assert np.isfinite(a.errors[masked & np.isfinite(a.p3d).all(-1)[None]]).all()
+    pa = T.triangulate_possible(P, p2d[:, :, None])
+    pb = cg.triangulate_possible(p2d[:, :, None])
+    np.testing.assert_array_equal(pa.p3d, pb[0])
+
+
+def test_scores_soft_weights(outdoor):
+    """scores are soft weights: corrupted views below tau, marked by low scores, count less."""
+    true, P, p3d, p2d = outdoor
+    p2d = p2d[:, :300]
+    X = p3d[:300]
+    rng = np.random.default_rng(3)
+    bad = (rng.random(p2d.shape[:2]) < 0.25) & np.isfinite(p2d).all(-1)
+    corrupted = p2d + np.where(bad[..., None], rng.normal(scale=4.0, size=p2d.shape), 0.0)
+    scores = np.where(bad, 0.05, 1.0)
+    plain = T.triangulate_robust(P, corrupted)
+    soft = T.triangulate_robust(P, corrupted, scores=scores)
+    ones = T.triangulate_robust(P, corrupted, scores=np.ones_like(scores))
+    np.testing.assert_allclose(ones.p3d, plain.p3d, atol=1e-9 * synth.rig_scale(true))
+    e = lambda r: np.nanmedian(rel(true, r.p3d, X))
+    assert e(soft) < 0.7 * e(plain)
+    # no hard drop: a low-score view is still an inlier when it agrees
+    assert soft.inliers[bad].mean() > 0.5
+    for method in ('irls', 'reject'):
+        assert e(T.triangulate_robust(P, corrupted, method=method, scores=scores)) < \
+            e(T.triangulate_robust(P, corrupted, method=method))

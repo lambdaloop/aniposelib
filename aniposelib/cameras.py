@@ -1648,8 +1648,9 @@ class CameraGroup(nn.Module):
         (Cauchy) or 'reject' (fit, drop outliers, refit). Keywords: tau, min_inliers,
         n_refine, sigma, n_iter, min_weight, reject_px, rel_factor, contrib (bool [C]: cameras
         allowed to define points), weights, mask_out_of_bounds, undistort, extrinsics, ridge,
-        chunk; and check_invertible=True (default; CameraGroup only): observations where the
-        lens model is not invertible are not used to fit (their errors are still reported).
+        chunk, scores (soft confidence weights in [0, 1]); and check_invertible=True (default):
+        observations where the lens model is not invertible are not used to fit (their errors
+        are still reported).
         Needs cameras that packed() can represent."""
         return self._triangulate_robust(points, method=method, **kwargs)
 
@@ -1663,91 +1664,17 @@ class CameraGroup(nn.Module):
 
     @staticmethod
     def _mask_noninvertible(P, pts):
-        """NaN out pixel observations where the lens model is not invertible (past the fold of
-        a strong barrel distortion): their undistorted rays are wrong and would bias the refit."""
+        """See aniposelib.triangulation._mask_noninvertible (any leading shape)."""
         C = pts.shape[0]
-        und = _G._undistort_flat(P, pts.reshape(C, -1, 2), check_invertible=True)
-        bad = (~torch.isfinite(und).all(-1)).reshape(pts.shape[:-1])
-        return torch.where(bad[..., None], torch.full_like(pts, float('nan')), pts)
-
-    @staticmethod
-    def _ray_inconsistent(P, X, E, pts, tau):
-        """[C,N] True where an observation's undistorted ray disagrees with the direction to the
-        point X (normalised distance > 3 tau / f) although its pixel error may be small: the
-        projection lies past the fold of a strong barrel distortion, where the pixel has a
-        second (central) preimage. Such rays bias the linear refit."""
-        C = pts.shape[0]
-        und = _G._undistort_flat(P, pts.reshape(C, -1, 2))
-        pc = _G._cam_points(E, torch.nan_to_num(X))
-        z = pc[..., 2]
-        zs = torch.where(z.abs() > 1e-12, z, torch.full_like(z, 1e-12))
-        xn = pc[..., :2] / zs[..., None]
-        f = 0.5 * (P.K[:, 0, 0].abs() + P.K[:, 1, 1].abs())
-        d = torch.linalg.norm(und - xn, dim=-1)
-        _, _, (a, b, c, e) = _G._distort_norm(P, xn[..., 0], xn[..., 1], jac=True)
-        return (d * f[:, None] > 3 * tau) | ~(a * e - b * c > 0)
+        return _T._mask_noninvertible(P, pts.reshape(C, -1, 2)).reshape(pts.shape)
 
     def _triangulate_robust(self, points, method='msac', check_invertible=True, **kwargs):
+        # the lens-fold / ray-consistency check lives in triangulation.triangulate_robust (1.1)
         P = self._robust_packed('triangulate_robust')
         if kwargs.get('extrinsics') is not None:
             kwargs['extrinsics'] = self._tensor(kwargs['extrinsics'])
-        pts = self._tensor(points)
-        undistort = kwargs.get('undistort', True)
-        if check_invertible and undistort:
-            pts = self._mask_noninvertible(P, pts)
-        res = _T.triangulate_robust(P, pts, method=method, return_grad=True, **kwargs)
-        if check_invertible and undistort and res.p3d.numel() > 0:
-            # an inlier explained by a point past its lens fold had a wrong ray in the linear
-            # refit: drop those observations and triangulate the affected points again
-            C = pts.shape[0]
-            Xf = res.p3d.reshape(-1, 3)
-            E = kwargs.get('extrinsics')
-            Ef = P.extrinsics() if E is None else _T._prep_ext(P, E, Xf.shape[0])
-            tau = float(kwargs.get('tau', 10.0))
-            fold = self._ray_inconsistent(P, Xf, Ef, pts, tau) & res.inliers.reshape(C, -1) \
-                & torch.isfinite(Xf).all(-1)[None]
-            redo = torch.nonzero(fold.any(0))[:, 0]
-            if redo.numel() > 0:
-                pf = pts.reshape(C, -1, 2).clone()
-                sub = pf[:, redo]
-                sub = torch.where(fold[:, redo, None], torch.full_like(sub, float('nan')), sub)
-                kw = dict(kwargs)
-                if E is not None:
-                    kw['extrinsics'] = Ef if Ef.ndim == 3 else Ef[:, redo]
-                if kw.get('weights') is not None:
-                    kw['weights'] = self._tensor(kw['weights']).reshape(C, -1)[:, redo]
-                r2 = _T.triangulate_robust(P, sub, method=method, return_grad=True, **kw)
-                lead = res.p3d.shape[:-1]
-                fields = {}
-                for name in ('p3d', 'inliers', 'errors', 'weights', 'n_inliers'):
-                    v = getattr(res, name)
-                    w = getattr(r2, name)
-                    if name == 'p3d':
-                        v = v.reshape(-1, 3).clone(); v[redo] = w
-                    elif name == 'n_inliers':
-                        v = v.reshape(-1).clone(); v[redo] = w
-                    else:
-                        v = v.reshape(C, -1).clone(); v[:, redo] = w
-                    fields[name] = v
-                res = _T.TriangulationResult(
-                    p3d=fields['p3d'].reshape(lead + (3,)),
-                    inliers=fields['inliers'].reshape((C,) + tuple(lead)),
-                    errors=fields['errors'].reshape((C,) + tuple(lead)),
-                    weights=fields['weights'].reshape((C,) + tuple(lead)),
-                    n_inliers=fields['n_inliers'].reshape(lead))
-        if pts is not points and check_invertible:
-            # report errors for every observation, including the masked ones
-            raw = self._tensor(points)
-            masked = torch.isfinite(raw).all(-1) & ~torch.isfinite(pts).all(-1)
-            if bool(masked.any()):
-                E = kwargs.get('extrinsics')
-                C = raw.shape[0]
-                Xf = torch.nan_to_num(res.p3d.reshape(-1, 3))
-                Ef = P.extrinsics() if E is None else _T._prep_ext(P, E, Xf.shape[0])
-                e = _G._reproj_err_flat(P, Xf, raw.reshape(C, -1, 2), Ef).reshape(masked.shape)
-                e = torch.where(torch.isfinite(res.p3d).all(-1)[None], e, torch.full_like(e, float('nan')))
-                res.errors = torch.where(masked, e, res.errors)
-        return res
+        return _T.triangulate_robust(P, self._tensor(points), method=method,
+                                     check_invertible=check_invertible, return_grad=True, **kwargs)
 
     @returns_like_input()
     def triangulate_possible(self, points, undistort=True, min_cams=2, progress=False,
@@ -1767,32 +1694,12 @@ class CameraGroup(nn.Module):
 
     def _triangulate_possible(self, points, undistort=True, min_cams=2, progress=False,
                               batch_size=None, tau=10.0, n_refine=2):
+        # the lens-fold check lives in triangulation.triangulate_possible (1.1)
         P = self._robust_packed('triangulate_possible')
-        pts = self._tensor(points)
-        if undistort:
-            pts = self._mask_noninvertible(P, pts)
-        kw = dict(tau=tau, min_inliers=min_cams, n_refine=n_refine, undistort=undistort,
-                  chunk=batch_size, return_grad=True)
-        res = _T.triangulate_possible(P, pts, **kw)
-        if undistort and res.p3d.shape[0] > 0:
-            # as in triangulate_robust: chosen views whose ray disagrees with the point (past
-            # the lens fold) biased the refit; drop that camera for those points and redo them
-            chosen = res.picked >= 0
-            bad = self._ray_inconsistent(P, res.p3d, P.extrinsics(), res.points_2d, tau) \
-                & chosen & torch.isfinite(res.p3d).all(-1)[None]
-            redo = torch.nonzero(bad.any(0))[:, 0]
-            if redo.numel() > 0:
-                sub = pts[:, redo]
-                sub = torch.where(bad[:, redo, None, None], torch.full_like(sub, float('nan')), sub)
-                r2 = _T.triangulate_possible(P, sub, **kw)
-                res.p3d[redo] = r2.p3d
-                res.picked[:, redo] = r2.picked
-                res.points_2d[:, redo] = r2.points_2d
-                res.errors[:, redo] = r2.errors
-                res.n_inliers[redo] = r2.n_inliers
+        res = _T.triangulate_possible(P, self._tensor(points), tau=tau, min_inliers=min_cams,
+                                      n_refine=n_refine, undistort=undistort, chunk=batch_size,
+                                      check_invertible=undistort, return_grad=True)
         return res.legacy()
-
-
 
     @returns_like_input()
     def triangulate_ransac(self, points, undistort=True, min_cams=2, progress=False, tau=10.0,
