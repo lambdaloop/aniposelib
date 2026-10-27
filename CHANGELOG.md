@@ -117,8 +117,9 @@ dancing). Behaviour changes say how to get the previous behaviour.
   `z_thr=10` (was 6), and `stations.detect_moves` gets `min_support_frac=0.25` (windows with few points cannot form a
   step), `max_resid_ratio=5` (windows whose offset fit leaves residuals above 5 x the camera's median window are
   dropped: a rotation does not explain them) and `retest=True` (flagged cameras re-tested without the confirmed moved
-  ones). Old: `detect_moves_kwargs=dict(z_thr=6, min_support_frac=None, max_resid_ratio=None, retest=False)`. An `AffineCamera` group raises a
-  `ValueError` pointing to `AffineCamera.to_pinhole`.
+  ones). Old: `detect_moves_kwargs=dict(z_thr=6, min_support_frac=None, max_resid_ratio=None, retest=False)`. An all-`AffineCamera`
+  group is evaluated through exact telephoto pinholes (as W6; see below); a mixed group raises a `ValueError`
+  pointing to `AffineCamera.to_pinhole`.
 - `scale.fit_similarity(robust_init=True)`: LMedS start (3-point subsets + leave-one-out), so one runaway camera no
   longer drags `align_to` / `from_reference` / `quality.compare` (motobs: 669 mm -> 0 median residual). Results on
   clean data are unchanged; `robust_init=False` for the old fit.
@@ -327,6 +328,27 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
 - `optim_points(normalize=True)`: joints that are never triangulated start at the scene centre instead of the world origin.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
 - Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
+
+
+### W4 ranks calibrations (1.1, real-data gaps)
+
+- **`evaluate_calibration` reports a standard yardstick by default** (new options `yardstick_px=(5, 8, 10)`,
+  `yardstick_tau_px=5.0`): leave-one-camera-out agreement at 5 / 8 / 10 absolute px with an MSAC 5 px triangulation
+  (per camera `loo_agree@8px`, ..., `yardstick_loo_median_px`, `yardstick_loo_coverage`; means in the new
+  `report['summary']`, which also has `loo_median_px` / `loo_worst_px` / `loo_coverage_mean`). The noise-scaled
+  `tau_tri_px` / `thresholds_px` (and every verdict rule) are unchanged; with a noise unit above 1 this costs one
+  extra LOO pass (and one per `compare_to` calibration). Why: the noise-scaled thresholds were agree@10/16/20 px on
+  Emory, so its agree@8 needed `options={'tau_tri_px': 5, 'thresholds_px': (5, 8, 10)}`; the defaults now give
+  it (0.2113 / 0.2308 univ, 0.2493 / 0.2412 emory, = `common.project_loo`). Off: `options={'yardstick_px': None}`.
+- `compare_to` entries gain the yardstick (`agree@5px` / `agree@8px` / `agree@10px`), `this_minus_other` and
+  `this_minus_other_ci95` (this - other: the sign of Emory's `paired_compare(e_other, e_this)`; `delta` stays
+  other - this), `rank_by` and `better` (`'this'` / `'other'` / `'tie'` on `agree@8px`, `options['rank_by']=8`).
+  New `report['ranking']` (all calibrations best first, `better_others` / `worse_others` / `ties`) and rule
+  `compare_to_better` (warn; only with `compare_to`): another calibration is significantly better by >=
+  `options['rank_min_delta']` (0.01). Old verdicts: `options={'verdict': {'compare_to_better': None}}`.
+- **W4 accepts all-`AffineCamera` groups** (`settings['cameras']`), converted with the same exact telephoto
+  pinholes as W6 (`AffineCamera.to_pinhole` over the data, <= 0.01 px), also for `compare_to` calibrations. Before:
+  `ValueError` (tailcycle johnson-fly).
 
 ## 1.0.0
 

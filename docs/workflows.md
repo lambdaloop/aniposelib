@@ -265,12 +265,27 @@ the same direction, which triangulate poorly. Some inputs switch on extra checks
 - a board or `PointObject` and its detections: it checks that the board comes out the right shape.
 - `options={'compare_to': {'lab': lab_calibration}}`: compares how well each calibration predicts the same points,
   with a confidence interval (`result.report['compare_to']`). Give `options['clusters']` (for example a recording or
-  block ID per frame) so the interval accounts for frames that aren't independent.
+  block ID per frame) so the interval accounts for frames that aren't independent. Each entry says which one is
+  `'better'` (`'this'`, `'other'` or `'tie'` when the interval includes zero). `delta` is the other calibration minus
+  this one; `this_minus_other` is the opposite sign, the one Emory's `paired_compare` uses (candidate minus
+  reference). `result.report['ranking']` lists all the calibrations, best first. When another calibration is clearly
+  better (by at least 0.01), the verdict warns with `compare_to_better`.
+
+To rank calibrations, look at `result.report['summary']['loo_agree@8px']`: the share of each camera's points that
+land within 8 px of where the other cameras put them (leave-one-camera-out, triangulated with a 5 px cut-off, averaged
+over cameras; higher is better). These standard pixel cut-offs (`loo_agree@5px`, `@8px`, `@10px`, also per camera)
+are the same for every data set, so the numbers can be compared between calibrations and match the Emory
+yardstick. The checks behind the verdict use cut-offs that grow with the noise in the points instead. `compare_to`
+ranks by `agree@8px` too.
+
+An `AffineCamera` (telecentric) group can be checked directly: it is converted to equivalent long-focal pinhole
+cameras, exactly as in `reconstruct_3d`.
 
 If your points include cameras the calibration doesn't have, or are in another order, pass their camera names as
 `options={'cam_names': [...]}`. Cameras that aren't in the calibration are dropped, and calibration cameras without
 points are left out of the check; both are listed in `result.report`. To use your own pixel cut-offs for the
-leave-one-camera-out check, pass `options={'tau_tri_px': 5, 'thresholds_px': (5, 8, 10)}`.
+noise-scaled leave-one-camera-out check, pass `options={'tau_tri_px': 5, 'thresholds_px': (5, 8, 10)}`; for the
+standard ones, `options={'yardstick_px': (5, 8, 10), 'yardstick_tau_px': 5}` (the defaults).
 
 With only two cameras there's no leave-one-camera-out check; you get the plain two-camera error and a `'warn'`.
 
