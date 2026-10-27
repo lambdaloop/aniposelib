@@ -134,8 +134,9 @@ def umeyama(src, dst, with_scale=True):
 def _lmeds_init(src, dst, ok, with_scale, n_subsets=500, seed=0):
     """Least-median-of-squares hypothesis over minimal 3-point subsets (all of them when there
     are at most ``n_subsets`` combinations, else a seeded random sample) plus the leave-one-out
-    fits (N <= 50). Collinear subsets are skipped. Returns ``(s, R, t, median residual)`` of the
-    hypothesis with the smallest median residual over the finite points, or None."""
+    fits (N <= 50). Collinear subsets are skipped. Returns ``(s, R, t, score)`` of the hypothesis
+    with the smallest score, the h-th smallest residual over the finite points with
+    ``h = max(3, min(N - 1, N // 2 + 2))`` (1.1.0 final: was the median), or None."""
     import itertools
     from math import comb
     idx = np.flatnonzero(ok)
@@ -143,6 +144,10 @@ def _lmeds_init(src, dst, ok, with_scale, n_subsets=500, seed=0):
     if n < 4:
         return None
     S, D = src[idx], dst[idx]
+    # score = the h-th smallest residual, h > 3 so that a 3-point subset is judged on at least
+    # one point it was not fitted on (the plain median of 5 is the subset's own 3rd residual:
+    # the start then keeps those 3 cameras only)
+    h = max(3, min(n - 1, n // 2 + 2))
     if comb(n, 3) <= n_subsets:
         sub = np.array(list(itertools.combinations(range(n), 3)))
     else:
@@ -167,7 +172,7 @@ def _lmeds_init(src, dst, ok, with_scale, n_subsets=500, seed=0):
         sc = (Sg * Dg).sum(1) / var if with_scale else np.ones(len(d))
         t = b.mean(1) - sc[:, None] * np.einsum('kij,kj->ki', R, a.mean(1))
         res = np.linalg.norm(sc[:, None, None] * np.einsum('kij,nj->kni', R, S) + t[:, None] - D, axis=2)
-        med = np.median(res, axis=1)
+        med = np.partition(res, h - 1, axis=1)[:, h - 1]
         k = int(np.nanargmin(np.where(np.isfinite(med), med, np.inf)))
         if np.isfinite(med[k]):
             hyps.append((float(sc[k]), R[k], t[k], float(med[k])))
@@ -175,7 +180,7 @@ def _lmeds_init(src, dst, ok, with_scale, n_subsets=500, seed=0):
         for i in range(n):
             keep = np.arange(n) != i
             s1, R1, t1 = umeyama(S[keep], D[keep], with_scale)
-            m1 = float(np.median(np.linalg.norm(s1 * S @ R1.T + t1 - D, axis=1)))
+            m1 = float(np.partition(np.linalg.norm(s1 * S @ R1.T + t1 - D, axis=1), h - 1)[h - 1])
             if np.isfinite(m1):
                 hyps.append((s1, R1, t1, m1))
     return min(hyps, key=lambda h: h[3]) if hyps else None
@@ -193,9 +198,11 @@ def fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=
 
     ``robust_init`` (default True; ignored for the plain fit): the refinement is also run from a
     least-median-of-squares start (minimal 3-point subsets + leave-one-out fits; initial fit set =
-    residual <= ``trim`` x the best median, or the ``inlier_frac`` quantile, at least ``min_keep``
+    residual <= ``trim`` x the best score (the h-th smallest residual, see ``_lmeds_init``), or the ``inlier_frac`` quantile, at least ``min_keep``
     points), and that result replaces the all-point-start one when its median residual over the
-    finite points is less than half. So a single runaway point (e.g. one camera centre far
+    finite points is less than half. Before that comparison, every point within ``trim`` x the
+    start's noise level (median residual of its fit set, corrected for the 7 fitted degrees of
+    freedom) is re-admitted, so a 3-point start does not keep only its 3 points. So a single runaway point (e.g. one camera centre far
     outside the rig) can no longer drag the fit; on clean data the result is unchanged.
     ``robust_init=False`` is the pre-1.1 behaviour (all-point start only)."""
     src = np.asarray(src, dtype='float64')
@@ -224,6 +231,21 @@ def fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=
         r[~ok] = np.nan
         return s, R, t, r, use
 
+    def readmit(fit):
+        # after the LMedS start: re-admit every point within trim x the noise level of the fit
+        # set, its median residual corrected for the fitted degrees of freedom (a 3-point
+        # similarity fits its own points almost exactly: the raw median would keep only those)
+        for _ in range(len(src)):
+            r, use = fit[3], fit[4]
+            n = int(use.sum())
+            dof = 3 * n - (7 if with_scale else 6)
+            corr = np.sqrt(dof / (3.0 * n)) if dof > 0 else 0.3
+            new = ok & (np.nan_to_num(r, nan=np.inf) <= max(trim * np.median(r[use]) / corr, floor))
+            if new.sum() <= n:
+                break
+            fit = refine(new, *umeyama(src[new], dst[new], with_scale))
+        return fit
+
     use = ok.copy()
     out = refine(use, *umeyama(src[use], dst[use], with_scale))
     # (trim=inf keeps every point whatever the start: nothing to gain)
@@ -242,6 +264,8 @@ def fit_similarity(src, dst, trim=2.5, min_keep=4, with_scale=True, inlier_frac=
                 use0 = np.zeros_like(ok)
                 use0[np.argsort(r0)[:max(min_keep, 3)]] = True
             cand = refine(use0, *umeyama(src[use0], dst[use0], with_scale))
+            if inlier_frac is None:
+                cand = readmit(cand)
             if np.median(cand[3][ok]) < 0.5 * np.median(out[3][ok]):
                 out = cand
     return out

@@ -250,7 +250,7 @@ lens model behaves well across the whole image. It also flags pairs of cameras t
 the same direction, which triangulate poorly. Some inputs switch on extra checks:
 
 - `times=`, the time of each frame: it looks for cameras that moved during the recording, and when. It also splits
-  the recording into about 20 time windows and repeats the leave-one-camera-out check in each one
+  the recording into about 20 time windows (at most an hour each) and repeats the leave-one-camera-out check in each one
   (`result.per_window`). A window where a camera suddenly agrees much less than usual is flagged; this is usually
   a sync problem or broken data, not the calibration. Set the window length with `options={'loo_window_s': 3600}`.
 - With `times=` it also tries to re-place a camera that was bumped so hard that the others can't use it any more
@@ -344,7 +344,8 @@ Two optional extras:
 
 Short gaps in the middle of a track (up to 10 frames, `options={'max_gap': ...}`) are filled in, but a track is never
 extended before its first or after its last detection, and longer gaps stay empty. Pass `times=` (seconds) to fill
-by time instead (`options={'max_gap_s': 0.5}`). If your frames aren't a continuous video, for example labelled frames
+by time instead (`options={'max_gap_s': 0.5}`; by default a gap is filled only if it lasts at most 11 typical frame
+periods, so a long pause in the recording is never bridged). If your frames aren't a continuous video, for example labelled frames
 picked here and there, use `fill='none'`. If the recording is made of separate clips or windows, pass their ids as
 `segments=`: nothing is filled, smoothed or joined across two clips.
 

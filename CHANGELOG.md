@@ -276,6 +276,20 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
 - `reconstruct_3d` `options['mask_regions']={cam: [(x, y, r), ...]}`: observations inside these image circles are
   dropped (`report['n_removed']['mask_regions']`).
 
+### Final real-data rerun fixes (1.1, final6)
+
+- **W6 `reconstruct_3d(times=...)`:** `max_gap_s` now defaults to `(max_gap + 1)` x the median frame period, so
+  `fill='interior'` never bridges a long time hole (outdoor mouse 05_04 filled 71k points across gaps of up to
+  7844 s). The effective value is in `settings['max_gap_s']`. Old behaviour: `options={'max_gap_s': float('inf')}`.
+- **`scale.fit_similarity(robust_init=True)`:** the least-median start scores each hypothesis by the h-th smallest
+  residual (`h = max(3, min(N - 1, N // 2 + 2))`, was the median), and after the start every point within `trim` x
+  its noise level (corrected for the fitted degrees of freedom) is re-admitted. With 5 cameras the start kept only
+  3 of them in 72 % of trials (evovision reference scale p90 error 0.90 %, now 0.38 %; 0.37 % without the robust
+  start). Old behaviour: `robust_init=False` (no robust start at all).
+- **W4 `loo_window_s='auto'`:** at most 3600 s per window (was span / 20: 20000 s windows on a 46 h session, so a
+  broken first hour never made a bad window and `moves_bad_window_frac` could not demote a false move in it).
+  Old behaviour: `options={'loo_window_s': <span / 20>}`.
+
 ### Defaults settled after the real-data check
 
 - `associate_views`: `switch_min_frames` 3 -> 10 (3 over-split a real IoU tracker: 7 identities for 4 people);
