@@ -1360,6 +1360,7 @@ _W5_DEFAULTS = {
     'epipolar_F': 'auto',         # 'calibrated' (cgroup) | 'self' (F fitted per offset) | 'both' | 'auto'
     'epipolar_search_frames': 10.0,   # half-width of the epipolar search (frames)
     'epipolar_boot': 20,
+    'drift_min_z': 3.0,           # a fitted clock rate below this x its sigma counts as no drift (rate 0)
     'max_residual_frames': 2.0,   # offset graph: drop edges with residual above this (frames)
     'refine_accel_frac': 10.0,    # STBA motion prior: accel_sigma = this x rig scale / s^2
     'refine_offset_sigma_min': 1e-3,   # s, floor on the STBA offset prior sigma
@@ -1766,6 +1767,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
         # ------------------------------------------------------------ drift
         if drift:
             with timer('drift'):
+                not_sig = []
                 meas = {}   # stream -> (t, offset relative to ref)
                 for (a, b), (wt, wo) in windows.items():
                     if a == ref:
@@ -1787,6 +1789,11 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                     if len(t) < 3:
                         continue
                     fit = S.fit_drift(t, o)
+                    if fit.identifiable and np.isfinite(fit.sigma_rate) and \
+                            abs(fit.rate) < opts['drift_min_z'] * fit.sigma_rate:
+                        # a rate within the noise of the windows: no drift (0), not a failure
+                        not_sig.append(n)
+                        continue
                     drift_fits[n] = fit
                     if fit.identifiable:
                         rates_out[n] = float(fit.rate)
@@ -1795,7 +1802,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                 # streams with audio but no windowed estimate: the rate was never fitted
                 for n in names:
                     if n != ref and data[n]['audio'] is not None and n not in drift_fits \
-                            and offsets.get(n) is not None:
+                            and n not in not_sig and offsets.get(n) is not None:
                         drift_fail.append(n)
         for n in names:
             if offsets.get(n) is None:
@@ -1807,6 +1814,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
             else:
                 a0s[n] = offsets[n]
         settings['drift_t_ref'] = {n: float(f.t_ref) for n, f in drift_fits.items()}
+        settings['drift_not_significant'] = not_sig if drift else []
     else:
         graph = None
         missing = [n for n in names if seed_maps.get(n) is None]
