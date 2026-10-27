@@ -280,6 +280,21 @@ and fits sub-frame offsets from the 2D tracks.
 It never changes your data. Use `result.timemaps` to line the frames up yourself. A camera it couldn't place in time
 (no sound overlap, nothing to compare) is reported, not guessed.
 
+A few things that help:
+
+- When you pass video files, the sound is lined up with the first video frame using the start times stored in
+  the file. Long recordings (more than 5 minutes) are matched in pieces, so slightly fast or slow clocks don't
+  blur the match.
+- Without a calibration, 2D tracks are still compared camera pair by camera pair (`options={'epipolar_F':
+  'self'}` is what it does then; `'calibrated'` or `'both'` with a calibration).
+- If one camera recorded several files, say which camera each file belongs to:
+  `options={'stream_camera': {'P2-clip1': 'phone2', 'P2-clip2': 'phone2'}}`.
+- The frame rate used for the checks comes from the 2D tracks, else from the video files. Set it with
+  `options={'fps': 30}` if neither is right.
+- To refine an earlier result without redoing the sound, pass it back: `estimate_offsets(streams, cgroup,
+  seed=result, refine=True)`. A short window only shifts the clocks; their speed is changed only when there's a
+  long enough stretch of tracks (`options['refine_rate']`).
+
 ## Going from 2D to 3D: `reconstruct_3d`
 
 Use this to turn 2D keypoints from several cameras into 3D tracks.
@@ -302,8 +317,30 @@ Two optional extras:
   adjusted so those lengths stay steady.
 - `smooth=`: smooths the tracks over time. Off by default.
 
-Gaps in the middle of a track are filled in, but a track is never extended before its first or after its last
-detection.
+Short gaps in the middle of a track (up to 10 frames, `options={'max_gap': ...}`) are filled in, but a track is never
+extended before its first or after its last detection, and longer gaps stay empty. Pass `times=` (seconds) to fill
+by time instead (`options={'max_gap_s': 0.5}`). If your frames aren't a continuous video, for example labelled frames
+picked here and there, use `fill='none'`. If the recording is made of separate clips or windows, pass their ids as
+`segments=`: nothing is filled, smoothed or joined across two clips.
+
+Bones are kept steady only as far as the data say they are: a bone whose length really changes (a tail, a spine)
+gets little weight, and if keeping bones steady would make the points fit the images worse, the triangulated points
+are kept. So `bones=` is safe to pass, but it helps most for truly rigid pairs.
+
+Other useful things:
+
+- `result.point_error`: how well each 3D point fits its cameras, in pixels. `options={'max_point_err_px': 5}` drops
+  points worse than that.
+- Moving cameras: pass the cameras' position in every frame as `extrinsics=` (one 4x4 matrix per camera and frame).
+  If the cameras moved and you didn't say so, the check `error_drift` notices that the errors change over the
+  recording.
+- Points outside the image are not used, and are counted separately (`result.out_of_image`), not as bad detections.
+- `options={'min_joints_per_view': 10}` ignores a camera in a frame where it saw fewer than 10 keypoints;
+  `options={'min_views': 3}` only keeps points seen by 3 cameras or more (fewer points, but each one checked).
+- If the points are in a different camera order than the calibration, say so with `options={'cam_names': [...]}`.
+- The output of `associate_views` (with an axis for each animal) can be passed in directly; each animal is
+  rebuilt on its own.
+- Telecentric (affine) cameras work too.
 
 ## Several animals at once: `associate_views`
 
@@ -318,7 +355,16 @@ result.labels          # for each detection, which individual it was matched to 
 
 If your 2D tracker already links each animal over time within a camera, pass those IDs as `track_ids=`. Whole tracks
 are then matched across cameras, which is more reliable than matching frame by frame. Without them, each frame is
-matched on its own and the matches are joined up over time.
+matched on its own and the matches are joined up over time. Individuals that show up for fewer than 5 frames are
+dropped (they are usually ghosts: two wrong detections that happen to line up), and an individual can be out of
+view for up to 30 frames (`options={'link_max_gap': ...}`, or `link_max_gap_s` with `fps`) and keep its identity.
+If you know how many animals there are, say so: `options={'n_identities': 4}`.
+
+Trackers sometimes swap two animals. When a track stops agreeing with the other cameras part way through, it is cut
+there and the pieces are matched again, and identities that follow each other in time and space are joined up.
+
+`result.frame_ids` says which frame each row of `result.points` is. When the frame numbers are large and far apart,
+only the frames with detections are kept (`options={'frame_axis': 'dense'}` keeps every frame number).
 
 ---
 
