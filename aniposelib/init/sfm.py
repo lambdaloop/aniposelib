@@ -153,7 +153,9 @@ class _Frames:
         counts = np.bincount(inv, minlength=len(self.frames))
         self.order = np.argsort(inv, kind='stable')
         self.rows = inv[self.order]
-        self.cols = (np.concatenate([np.arange(c) for c in counts]) if len(counts)
+        # position of each point within its frame (vectorised concatenation of aranges)
+        starts0 = np.r_[0, np.cumsum(counts)[:-1]] if len(counts) else np.zeros(0, int)
+        self.cols = (np.arange(len(self.rows)) - np.repeat(starts0, counts) if len(counts)
                      else np.zeros(0, int))
         self.width = int(counts.max()) if len(counts) else 0
         self.counts = counts
@@ -165,6 +167,13 @@ class _Frames:
 
     def score(self, res, thresh):
         """Number of usable frames with median residual < thresh, and those frames."""
+        if self.width == 1:
+            # one point per frame: the median is the residual itself (exactly)
+            r = res[self.order]
+            med = np.full(len(self.frames), np.inf)
+            med[self.rows] = np.where(np.isnan(r), np.inf, r)
+            ok = self.keep & (med < thresh)
+            return int(ok.sum()), self.frames[ok]
         g = np.full((len(self.frames), self.width), np.inf)
         r = res[self.order]
         g[self.rows, self.cols] = np.where(np.isnan(r), np.inf, r)  # behind camera = outlier
