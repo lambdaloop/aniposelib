@@ -672,8 +672,11 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
     if check and N > 0:
         # an inlier explained by a point past its lens fold had a wrong ray in the linear
         # refit: drop those observations and triangulate the affected points again
-        fold = _ray_inconsistent(P, p3d, E, pts, float(tau), und=und) & inliers \
-            & torch.isfinite(p3d).all(-1)[None]
+        # chunked over points (independent): bounded memory for millions of points
+        step = max(1, int(4 * max_elems // max(1, C)))
+        fold = torch.cat([_ray_inconsistent(P, p3d[s:s + step], _sub_ext(E, slice(s, s + step)),
+                                            pts[:, s:s + step], float(tau), und=und[:, s:s + step])
+                          for s in range(0, N, step)], 1) & inliers & torch.isfinite(p3d).all(-1)[None]
         redo = torch.nonzero(fold.any(0))[:, 0]
         if redo.numel() > 0:
             sub = pts[:, redo]
@@ -691,11 +694,13 @@ def triangulate_robust(P, points, method='msac', *, tau=10.0, min_inliers=2, n_r
         masked = _valid_obs(P, raw, raw, mask_out_of_bounds) & ~torch.isfinite(pts).all(-1)
         if weights is not None:
             masked = masked & (torch.nan_to_num(weights) > 0)
-        if bool(masked.any()):
-            Pr = P
-            e = G._reproj_err_flat(Pr, torch.nan_to_num(p3d), raw, E)
-            e = torch.where(torch.isfinite(p3d).all(-1)[None], e, torch.full_like(e, float('nan')))
-            errors = torch.where(masked, e, errors)
+        cols = torch.nonzero(masked.any(0))[:, 0]
+        if cols.numel() > 0:
+            # only the points with masked observations
+            Xc = p3d[cols]
+            e = G._reproj_err_flat(P, torch.nan_to_num(Xc), raw[:, cols], _sub_ext(E, cols))
+            e = torch.where(torch.isfinite(Xc).all(-1)[None], e, torch.full_like(e, float('nan')))
+            errors[:, cols] = torch.where(masked[:, cols], e, errors[:, cols])
     n_inl = inliers.sum(0)
     return TriangulationResult(
         p3d=p3d.reshape(tuple(lead) + (3,)),

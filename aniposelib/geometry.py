@@ -527,6 +527,9 @@ def _project_jac_flat(P, X, E, eps=FISHEYE_EPS):
     return uv, z, torch.stack([J0, J1], -2)
 
 
+UNDISTORT_CHUNK = 1 << 21       # observations per undistortion batch
+
+
 def _undistort_flat(P, uv, n_iter=20, tol=1e-12, check_invertible=False, n_fixed=None):
     """uv [C,N,2] pixels -> normalised [C,N,2] (NaN in = NaN out).
 
@@ -538,18 +541,19 @@ def _undistort_flat(P, uv, n_iter=20, tol=1e-12, check_invertible=False, n_fixed
     out = torch.full(xd0.shape + (2,), float('nan'), dtype=xd0.dtype, device=xd0.device)
     for model in (0, 1):
         sel = finite & _col(P.model == model)
-        ci, ni = torch.nonzero(sel, as_tuple=True)
-        if ci.numel() == 0:
-            continue
-        d = P.dist[ci]
-        xd, yd = xd0[ci, ni][:, None], yd0[ci, ni][:, None]
-        if model == 0:
-            x, y, ok = _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed)
-        else:
-            x, y, ok = _undistort_kb(d, xd, yd, n_iter, check_invertible)
-        v = torch.stack([x[:, 0], y[:, 0]], -1)
-        v = torch.where(ok[:, 0, None], v, torch.full_like(v, float('nan')))
-        out = out.index_put((ci, ni), v)
+        ci_all, ni_all = torch.nonzero(sel, as_tuple=True)
+        # bounded memory: the solvers keep a few dozen temporaries per observation
+        for s0 in range(0, ci_all.numel(), UNDISTORT_CHUNK):
+            ci, ni = ci_all[s0:s0 + UNDISTORT_CHUNK], ni_all[s0:s0 + UNDISTORT_CHUNK]
+            d = P.dist[ci]
+            xd, yd = xd0[ci, ni][:, None], yd0[ci, ni][:, None]
+            if model == 0:
+                x, y, ok = _undistort_brown(d, xd, yd, n_iter, tol, check_invertible, n_fixed)
+            else:
+                x, y, ok = _undistort_kb(d, xd, yd, n_iter, check_invertible)
+            v = torch.stack([x[:, 0], y[:, 0]], -1)
+            v = torch.where(ok[:, 0, None], v, torch.full_like(v, float('nan')))
+            out = out.index_put((ci, ni), v)
     return out
 
 

@@ -156,6 +156,9 @@ def _summarize_loo_(errors, eligible, names, thresholds):
     return per, overall
 
 
+LOO_BATCH = 1 << 20      # held-out columns per batched LOO triangulation
+
+
 def loo_errors(cgroup, p2ds, tau_tri=5.0, min_others=3, robust=True, chunk=None):
     """Raw LOO errors ``(errors [C,N], eligible [C,N])`` (see :func:`loo_reprojection`)."""
     P = G.pack(cgroup)
@@ -174,30 +177,34 @@ def loo_errors(cgroup, p2ds, tau_tri=5.0, min_others=3, robust=True, chunk=None)
             idxs.append(idx)
     if not cams:
         return errors, eligible
-    # one batched triangulation: every target camera's eligible points, with its row removed
-    held = np.concatenate([pts[:, idx] for idx in idxs], axis=1)
+    # batched triangulations: every target camera's eligible points, with its row removed, in
+    # batches of at most LOO_BATCH columns (bounded memory for millions of points)
     off = np.cumsum([0] + [len(i) for i in idxs])
-    for k, c in enumerate(cams):
-        held[c, off[k]:off[k + 1]] = np.nan
-    held_t = torch.as_tensor(held, dtype=P.dtype, device=P.device)
+    allcols = torch.as_tensor(np.concatenate(idxs), device=P.device)
+    heldcam = torch.as_tensor(np.repeat(cams, [len(i) for i in idxs]), device=P.device)
+    pts_t = torch.as_tensor(pts, dtype=P.dtype, device=P.device)
     with torch.no_grad():
-        if robust:
-            # undistort every observation once, not once per held-out camera
-            und = G._undistort_flat(P, torch.as_tensor(pts, dtype=P.dtype, device=P.device),
-                                    check_invertible=True)
-            cols = torch.as_tensor(np.concatenate(idxs), device=P.device)
-            held_u = und[:, cols]
-            heldc = torch.as_tensor(np.repeat(cams, [len(i) for i in idxs]), device=P.device)
-            held_u[heldc, torch.arange(len(cols), device=P.device)] = float('nan')
-            tr = T.triangulate_robust(P, held_t, tau=tau_tri, min_inliers=min_others, chunk=chunk,
-                                      _und=held_u)
-            X = tr.p3d
-            support = (tr.errors < tau_tri).sum(0)   # recompute support after refinement (Emory)
-            good = (support >= min_others) & torch.isfinite(X).all(-1)
-        else:
-            X = T.triangulate_linear(P, held_t, min_cams=2, chunk=chunk)
-            good = torch.isfinite(X).all(-1)
-        X = torch.where(good[:, None], X, torch.full_like(X, float('nan')))
+        # undistort every observation once, not once per held-out camera
+        und = G._undistort_flat(P, pts_t, check_invertible=True) if robust else None
+        Xs = []
+        for b0 in range(0, int(off[-1]), LOO_BATCH):
+            cols, hc = allcols[b0:b0 + LOO_BATCH], heldcam[b0:b0 + LOO_BATCH]
+            ar = torch.arange(len(cols), device=P.device)
+            held_t = pts_t[:, cols]
+            held_t[hc, ar] = float('nan')
+            if robust:
+                held_u = und[:, cols]
+                held_u[hc, ar] = float('nan')
+                tr = T.triangulate_robust(P, held_t, tau=tau_tri, min_inliers=min_others,
+                                          chunk=chunk, _und=held_u)
+                Xb = tr.p3d
+                support = (tr.errors < tau_tri).sum(0)   # recompute support after refinement (Emory)
+                good = (support >= min_others) & torch.isfinite(Xb).all(-1)
+            else:
+                Xb = T.triangulate_linear(P, held_t, min_cams=2, chunk=chunk)
+                good = torch.isfinite(Xb).all(-1)
+            Xs.append(torch.where(good[:, None], Xb, torch.full_like(Xb, float('nan'))))
+        X = torch.cat(Xs, 0)
         for k, c in enumerate(cams):
             sl = slice(int(off[k]), int(off[k + 1]))
             Pc = P.subset([c])
