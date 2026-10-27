@@ -405,6 +405,9 @@ class DeepCharucoDetector:
     backend : 'torch' or 'onnx'
     batch_size : int
         Frames per network call in :meth:`detect_batch`.
+    max_batch_pixels : float
+        Cap on the (scaled) pixels per network call (default 4e6: two 1440x1080 frames at
+        ``scale=1``, 16 frames at 640x360); on a CUDA out-of-memory error the batch is halved.
     refine : bool
         Run RefineNet (1/8-pixel corners).
     scale : float
@@ -422,7 +425,7 @@ class DeepCharucoDetector:
 
     def __init__(self, board, *, weights_dir=None, repo=HF_REPO, revision=None,
                  device='auto', backend='torch', batch_size=16, refine=True, scale=1.0,
-                 min_score=0.0, subpix=False, color_order='bgr', download=True):
+                 min_score=0.0, subpix=False, color_order='bgr', download=True, max_batch_pixels=4e6):
         if isinstance(board, (tuple, list)):
             squaresX, squaresY = int(board[0]), int(board[1])
             legacy = None
@@ -445,6 +448,7 @@ class DeepCharucoDetector:
         self.device = _resolve_device(device)
         self.backend = backend
         self.batch_size = max(1, int(batch_size))
+        self.max_batch_pixels = float(max_batch_pixels)
         self.scale = float(scale)
         self.min_score = float(min_score)
         self.subpix = bool(subpix)
@@ -494,11 +498,24 @@ class DeepCharucoDetector:
         for n, (x, _) in enumerate(prepped):
             groups.setdefault(x.shape, []).append(n)
         for shape, idxs in groups.items():
-            for start in range(0, len(idxs), self.batch_size):
-                chunk = idxs[start:start + self.batch_size]
+            # frames per network call: batch_size, capped by the pixel budget (full-HD frames at
+            # batch 16 need ~18 GB of activations)
+            per = max(1, min(self.batch_size, int(self.max_batch_pixels // max(1, shape[0] * shape[1]))))
+            start = 0
+            while start < len(idxs):
+                chunk = idxs[start:start + per]
                 batch = torch.from_numpy(np.stack([prepped[n][0] for n in chunk]))[:, None]
                 batch = batch.to(self.device)
-                loc, ids = self.detector(batch)
+                try:
+                    loc, ids = self.detector(batch)
+                except torch.OutOfMemoryError:
+                    if per == 1:
+                        raise
+                    del batch
+                    torch.cuda.empty_cache()
+                    per = max(1, per // 2)
+                    continue
+                start += len(chunk)
                 decoded = [decode(loc[b], ids[b], self.n_ids) for b in range(len(chunk))]
                 if self.min_score > 0:
                     decoded = [(xy[s >= self.min_score], i[s >= self.min_score], s[s >= self.min_score])
