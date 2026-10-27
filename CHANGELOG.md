@@ -397,6 +397,13 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   `options={'switch_min_frames': 3}` for trackers that swap often.
 - `evaluate_calibration`: `min_window_obs` 50 -> 200, so sparse hours are not judged; `bad_windows_frac` is warn-only.
 
+### After 1.1.0 (unreleased)
+
+- `calibrate_from_board`: new `result.lenses`, every camera with its calibrated lens, also when the board never
+  linked the cameras (each camera filmed on its own: `component_groups` now hold the lens-only groups instead of
+  being empty). `options['sizes']` also accepts `{camera name: (width, height)}`.
+- docs/workflows.md: how the workflows hand data to each other (big picture, getting data in, routes start to finish).
+
 ### Removed
 
 - **`aniposelib.io`.** The file formats are gone: MATLAB (`from/to_matlab`), OpenCV YAML

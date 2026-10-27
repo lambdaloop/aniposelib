@@ -194,15 +194,19 @@ class BoardCalibration(WorkflowResult):
     calibration (disconnected board graph without a bridge); then ``component_groups`` holds
     one calibrated group per connected component (each in its own gauge, metric scale of the
     board). ``detections``: per-camera rows (with board poses); ``lens_models``: per camera,
-    the selected lens model and the ladder table (or the DLT / fallback used)."""
+    the selected lens model and the ladder table (or the DLT / fallback used). ``lenses``: every
+    camera with its calibrated lens (positions may be meaningless when ``cgroup`` is None), the
+    ``intrinsics=`` to hand to :func:`calibrate_from_points` even when the board never linked
+    the cameras."""
     cgroup: Any = None
     detections: Any = None
     lens_models: Dict[str, Any] = field(default_factory=dict)
     components: List[List[str]] = field(default_factory=list)
     component_groups: List[Any] = field(default_factory=list)
     bridge: Optional[Dict[str, Any]] = None
+    lenses: Any = None
 
-    _skip = ('cgroup', 'detections', 'component_groups')
+    _skip = ('cgroup', 'detections', 'component_groups', 'lenses')
 
     def __iter__(self):
         yield self.cgroup
@@ -374,6 +378,11 @@ def _base_group(C, cam_names, init, fisheye, sizes):
         cg = CameraGroup([FisheyeCamera(name=str(n)) if f else Camera(name=str(n))
                           for n, f in zip(names, fish)])
     if sizes is not None:
+        if isinstance(sizes, dict):                       # {camera name: (width, height)}
+            missing = [n for n in cg.get_names() if n not in sizes]
+            if missing:
+                raise ValueError('sizes: no image size for cameras {}'.format(missing))
+            sizes = [sizes[n] for n in cg.get_names()]
         s = np.asarray(sizes)
         s = np.tile(s, (C, 1)) if s.ndim == 1 else s
         for cam, sz in zip(cg.cameras, s):
@@ -873,6 +882,12 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
                     cgroup = cg
                     comps = [[n for n in names if n not in uncovered]]
                 bridge_rep['bridged'] = sorted(bridged, key=names.index)
+    if cgroup is None and not comp_groups and comps:
+        # no shared board views at all (each camera filmed the board on its own): the lenses are
+        # still calibrated, so hand them back per component (lenses only, poses not refined)
+        comp_groups = [cg.subset_cameras_names(list(comp)) for comp in comps]
+        fallbacks.append('no board frame seen by two cameras: component_groups hold the lenses only '
+                         '(use them as intrinsics= for calibrate_from_points)')
     # ---- static: the object's frame is the world
     if cgroup is not None and static:
         anchor = _static_anchor(cgroup, rows, board)
@@ -1044,7 +1059,8 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
                       fallbacks=fallbacks, timings=timer.times)
     res = BoardCalibration(report=report, verdict=verdict, reasons=reasons, settings=settings,
                            provenance=prov, cgroup=cgroup, detections=rows, lens_models=lens,
-                           components=comps, component_groups=comp_groups, bridge=bridge_rep)
+                           components=comps, component_groups=comp_groups, bridge=bridge_rep,
+                           lenses=cgroup if cgroup is not None else cg)
     if cgroup is not None:
         cgroup.metadata['calibration'] = dict(workflow='calibrate_from_board', verdict=verdict,
                                               noise_floor_px=float(nf))
@@ -2371,7 +2387,7 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
       :class:`~aniposelib.boards.PointObject`): ``scale.from_board`` (corner pairs more than two squares
       apart; ``options={'board_kwargs': {'min_pair_dist': None}}`` = every pair, the 1.1 pre-release);
     - ``lengths=dict(points=[C,N,J,2], pairs=[(a, b), ...], ref=[...], joints=None)``:
-      ``scale.from_lengths`` (MSAC threshold 5 noise units, >= min(3, C) agreeing views); the bones
+      ``scale.from_lengths`` (MSAC threshold 5 px, or 5 x ``options['noise_unit']`` when given; >= min(3, C) agreeing views); the bones
       are then re-measured on the scaled rig with a threshold half as large
       (``report['lengths_check']``): rule ``lengths_check``;
     - ``reference`` (a ``CameraGroup`` of the same cameras): ``scale.from_reference``.

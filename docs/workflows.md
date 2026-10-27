@@ -2,20 +2,262 @@
 
 aniposelib has a lot of tools in it. Most projects, though, only ever do a handful of things: calibrate the cameras,
 check the calibration, sometimes sync the cameras, and turn 2D keypoints into 3D. Each of those jobs has one function
-that does the whole thing with sensible defaults. This guide explains when to use each one and what it gives back.
+that does the whole thing with sensible defaults.
 
-- [Before you start: what every function has in common](#before-you-start)
-- [Calibrating with a board](#calibrating-with-a-board-calibrate_from_board)
-- [Calibrating with an object of known shape](#calibrating-with-an-object-of-known-shape-pointobject)
-- [Calibrating from the animals themselves](#calibrating-from-the-animals-themselves-calibrate_from_points)
-- [Getting real-world units](#getting-real-world-units-estimate_scale)
-- [Checking a calibration](#checking-a-calibration-evaluate_calibration)
-- [Syncing cameras](#syncing-cameras-estimate_offsets)
-- [Going from 2D to 3D](#going-from-2d-to-3d-reconstruct_3d)
-- [Several animals at once](#several-animals-at-once-associate_views)
-- [Putting it together](#putting-it-together)
+This guide starts with the big picture: how the seven functions hand data to each other, and where each kind of
+input comes from. Then it walks through the common routes from start to finish, and ends with a section on each
+function.
 
-## Before you start
+- [The big picture](#the-big-picture)
+- [Getting your data in](#getting-your-data-in)
+- [Common routes, start to finish](#common-routes-start-to-finish)
+- [Things every function has in common](#things-every-function-has-in-common)
+- The seven functions:
+  [calibrate_from_board](#calibrating-with-a-board-calibrate_from_board) ·
+  [PointObject](#calibrating-with-an-object-of-known-shape-pointobject) ·
+  [calibrate_from_points](#calibrating-from-the-animals-themselves-calibrate_from_points) ·
+  [estimate_scale](#getting-real-world-units-estimate_scale) ·
+  [evaluate_calibration](#checking-a-calibration-evaluate_calibration) ·
+  [estimate_offsets](#syncing-cameras-estimate_offsets) ·
+  [reconstruct_3d](#going-from-2d-to-3d-reconstruct_3d) ·
+  [associate_views](#several-animals-at-once-associate_views)
+
+## The big picture
+
+Everything revolves around one object: the **calibration**, a `CameraGroup` that knows each camera's lens and where
+it sits. Three functions make one, two improve or check one, and two use one:
+
+```
+                     videos of a board ──► calibrate_from_board ──┐
+                                                                  │
+   2D keypoints / people (no board) ─────► calibrate_from_points ─┤
+                                                                  ▼
+                                                            calibration
+                                                                  │
+            estimate_scale   (puts it in mm, lines it up with the floor or an old calibration)
+            evaluate_calibration   (is it good? did a camera move?)
+                                                                  │
+                                                                  ▼
+   2D keypoints ──────────────────────────────────────────────► reconstruct_3d ──► 3D tracks
+
+   Two helpers sit in front, when you need them:
+     estimate_offsets   cameras not started together      → time maps to line up the frames
+     associate_views    several animals or people in view → one 2D track per individual
+```
+
+In words:
+
+1. **If the cameras weren't synchronised**, sync them first with `estimate_offsets`, and line up your 2D data with the
+   time maps it returns. Everything after this assumes that frame `i` is the same moment in every camera.
+2. **Make a calibration.** With a board in the videos, use `calibrate_from_board`. Without one, use
+   `calibrate_from_points` on the animals themselves, starting from lenses you already know.
+3. **Give it real units if it needs them** with `estimate_scale`. A board calibration is already in the board's units;
+   a calibration from points has no scale until you give it one.
+4. **Check it** with `evaluate_calibration`, on the same kind of points you'll triangulate. This also tells you
+   whether a camera got bumped during the session.
+5. **Several animals?** Work out who is who across cameras with `associate_views`, then use its output wherever 2D
+   points are expected.
+6. **Turn 2D into 3D** with `reconstruct_3d`.
+
+The functions don't read or write files for you (except videos, and `out=` to save a calibration). They take numpy
+arrays and calibrations, and give back numpy arrays and calibrations, so you can stop, save and continue at any
+step: `cgroup.dump('calibration.toml')` and `al.CameraGroup.load('calibration.toml')`.
+
+## Getting your data in
+
+### 2D keypoints
+
+Most functions want 2D points as one array with **the camera first**: `(cameras, frames, keypoints, 2)`, in pixels,
+with NaN wherever a camera didn't see a keypoint. A pose model usually gives you one table per camera, so stack them:
+
+```python
+cam_names = ['cam1', 'cam2', 'cam3']
+points2d = np.stack([load_keypoints(name) for name in cam_names])   # each (frames, keypoints, 2)
+scores   = np.stack([load_scores(name) for name in cam_names])      # each (frames, keypoints), optional
+points2d[scores < 0.05] = np.nan                                    # only drop the hopeless ones
+```
+
+Two things to get right:
+
+- **The same frame number must be the same moment in every camera.** If the cameras weren't synchronised, see
+  [syncing](#syncing-cameras-estimate_offsets) below; the time maps it returns tell you which frame of each camera
+  goes with which moment.
+- **The cameras must be in the calibration's order** (`cgroup.get_names()`). If they aren't, reorder with
+  `al.geometry.reindex_points(points2d, your_names, cgroup)`, or pass `options={'cam_names': your_names}` to
+  `evaluate_calibration` and `reconstruct_3d`.
+
+Keep the scores. `reconstruct_3d` uses them to trust confident detections more, so you don't need a strict cut-off.
+
+### Board detections
+
+You don't usually need to find the board yourself: `calibrate_from_board` and `estimate_scale` both take videos
+directly. But board detections are also useful later (to check the scale, or the board's shape in 3D), and there are
+three ways to get them:
+
+```python
+# 1. reuse the ones calibrate_from_board found: one list of detections per camera
+cgroup, result = al.calibrate_from_board(videos, board)
+board_detections = result.detections
+
+# 2. find the board in a set of synchronised videos, one per camera
+board_detections = al.boards.detect_videos(board, ['cam1.mp4', 'cam2.mp4', 'cam3.mp4'], max_frames=200)
+
+# 3. let estimate_scale read the videos itself
+result = al.estimate_scale(cgroup, board=board, board_points={'cam1': 'cam1.mp4', 'cam2': 'cam2.mp4'})
+```
+
+Any of these can be passed as `board_points=` to `estimate_scale` and `evaluate_calibration`. An array of corner
+positions, `(cameras, frames, corners, 2)`, works too.
+
+### Lenses (intrinsics)
+
+`calibrate_from_points` needs to know each camera's lens, because the animals alone are a poor way to measure focal
+length and distortion. Where to get them, from best to worst:
+
+1. **A board calibration of the same cameras**, even an old one, even one where the board was only waved in front of
+   each camera separately: `intrinsics=al.CameraGroup.load('lab_calibration.toml')`. If it also has good camera
+   positions, it's used as the first guess of where the cameras are.
+2. **A board calibration done just for the lenses**: film the board in front of each camera, one camera at a time,
+   and run `calibrate_from_board` on those videos. Since no two cameras saw the board together it reports `'fail'`
+   for the camera positions, but the lenses are still calibrated: use `intrinsics=result.lenses`.
+3. **Nominal values** from the camera's spec sheet, or from VGGT (`init='vggt'` with `frames=`).
+   `calibrate_from_points` can then fine-tune the focal length and main distortion term, when the data support it.
+
+If all your cameras are the same model, say so with `options={'intrinsics_share': 'all'}`.
+
+### Times
+
+Several functions are better with the time of each frame in seconds (`times=`): `evaluate_calibration` uses them to
+find moved cameras and bad hours, `calibrate_from_points` to drop bad hours and to handle moved cameras, and
+`reconstruct_3d` to fill gaps by time. For a normal video that's just `np.arange(n_frames) / fps`. For a recording
+that stops and starts, use the real timestamps, so gaps show up as gaps.
+
+### Frames for VGGT
+
+If `calibrate_from_points` has no good first guess of the camera positions, VGGT can make one from images. Pass
+`frames=`: a few sets of synchronised video frames, one image per camera in each set (for example 5 to 10 moments
+spread over the session).
+
+## Common routes, start to finish
+
+### A lab rig with a board
+
+The classic Anipose setup: film the board, calibrate once, then triangulate every session.
+
+```python
+import aniposelib as al
+
+board = al.CharucoBoard(7, 5, square_length=25, marker_length=18.75, units='mm')
+cgroup, result = al.calibrate_from_board([['cam1.mp4'], ['cam2.mp4'], ['cam3.mp4']], board,
+                                         cam_names=['cam1', 'cam2', 'cam3'], out='calibration.toml')
+
+# later, for each session
+cgroup = al.CameraGroup.load('calibration.toml')
+check = al.evaluate_calibration(cgroup, points2d)            # still good for this session?
+recon = al.reconstruct_3d(cgroup, points2d, scores=scores)
+```
+
+The calibration comes out in the board's units (mm here), so there's no need for `estimate_scale`.
+
+### No board in the session: calibrate from the animal
+
+The cameras get moved between sessions, so each session is calibrated from the animal's keypoints, starting from known
+lenses. A board video is used for the scale.
+
+```python
+lenses = al.CameraGroup.load('lab_calibration.toml')         # lenses (and maybe rough positions)
+cgroup, result = al.calibrate_from_points(points2d, intrinsics=lenses)
+
+scaled = al.estimate_scale(cgroup, board=board,
+                           board_points={'cam1': 'board_cam1.mp4', 'cam2': 'board_cam2.mp4'})
+cgroup = scaled.cgroup                                       # now in mm
+
+check = al.evaluate_calibration(cgroup, points2d_other_trial)  # a quality gate on data it wasn't fitted to
+recon = al.reconstruct_3d(cgroup, points2d, scores=scores)
+```
+
+No board video? Use known distances instead, such as bone lengths:
+`estimate_scale(cgroup, lengths=dict(points=points2d, pairs=bones, ref=bone_mm))`, or an older calibration of the
+same cameras: `estimate_scale(cgroup, reference=old, align='reference')`.
+
+### Several animals or people
+
+When more than one individual is in view, match them across cameras first. The output of `associate_views` has an
+extra axis for the individuals, `(cameras, frames, individuals, keypoints, 2)`.
+
+```python
+matched = al.associate_views(cgroup, detections, track_ids=track_ids)   # track_ids from your 2D tracker, optional
+recon = al.reconstruct_3d(cgroup, matched.points)                        # (frames, individuals, keypoints, 3)
+```
+
+To calibrate from them, treat each individual in each frame as one set of keypoints:
+
+```python
+C, F, P, J, _ = matched.points.shape
+cgroup, result = al.calibrate_from_points(matched.points.reshape(C, F * P, J, 2), intrinsics=cgroup)
+```
+
+Matching needs a calibration that's roughly right. If you don't have one yet, `calibrate_from_points` can do the
+matching itself: pass the unmatched detections as `(cameras, frames, people, keypoints, 2)` with `init='vggt'` and
+`frames=` (or `init='people'`, from the geometry of the camera pairs alone).
+
+### Cameras that weren't synchronised
+
+Phones and GoPros start whenever you press the button. Sync them from their soundtracks first, then put your 2D
+points on one common clock:
+
+```python
+sync = al.estimate_offsets({'gopro1': 'gopro1.mp4', 'gopro2': 'gopro2.mp4', 'phone': 'phone.mov'})
+
+from aniposelib.sync import align_streams
+aligned = align_streams({name: (frame_times[name], keypoints[name]) for name in cam_names},
+                        rate=30, offsets=sync.timemaps)
+points2d = aligned.values             # (cameras, frames, keypoints, 2) on the common clock
+times = aligned.t_grid                # the common clock, in seconds
+```
+
+`frame_times[name]` is each camera's own time of each frame (for a video, `np.arange(n) / fps`). From here on, the
+other routes work as usual. Sound can only sync to a few milliseconds (sound travels about 3 ms per metre); once you
+have a calibration, `estimate_offsets(..., cgroup=cgroup, seed=sync, refine=True)` refines the sync from the 2D
+tracks themselves.
+
+### Long sessions where cameras get bumped
+
+Outdoors, or in a busy room, a camera can get knocked partway through. `evaluate_calibration` with the frame times
+finds when and which camera moved, and `calibrate_from_points` then gives that camera one pose before and one after:
+
+```python
+check = al.evaluate_calibration(cgroup, points2d, times=times)
+print(check.moves.moved, check.moves.change_points)           # which cameras moved, and when
+
+cgroup2, result = al.calibrate_from_points(points2d, intrinsics=cgroup,
+                                           stations=check.moves.stations, groups={'time': times})
+rig_before = result.rig_at(100.0)                            # the calibration at t = 100 s
+rig_after = result.rig_at(5000.0)
+```
+
+Triangulate each stretch between moves with the calibration for that stretch (`result.rig_at(t)` for a time inside
+it), or pass the cameras' pose in every frame to `reconstruct_3d` as `extrinsics=`. `check.per_window` also points
+out hours where the data broke (cameras out of sync, for example), which is worth knowing before you trust those
+hours' 3D.
+
+### Reusing a calibration while it's still good
+
+If calibrating every session is expensive, check the last calibration on the new data first, and only recalibrate
+when it no longer fits:
+
+```python
+check = al.evaluate_calibration(last_calibration, points2d)
+worst = max(c['loo_median_px'] for c in check.per_camera.values())
+if check.verdict == 'fail' or worst > 15:                    # your own rule
+    cgroup, result = al.calibrate_from_points(points2d, intrinsics=last_calibration)
+```
+
+To compare two calibrations on the same data, use `options={'compare_to': {'old': other_calibration}}`.
+
+---
+
+## Things every function has in common
 
 **Data shapes.** 2D points always have the camera as the first axis: `(cameras, points, 2)`, or
 `(cameras, frames, keypoints, 2)` for poses. Use NaN for a point a camera didn't see. Pass numpy and you get numpy
@@ -69,6 +311,12 @@ threads make the many small steps slower, especially on a shared machine; set `A
 
 ## Calibrating with a board: `calibrate_from_board`
 
+**In context:** the usual first step when you have a board. Its input is your board videos (or detections you
+already have, see [board detections](#board-detections)). Its calibration goes straight to `reconstruct_3d`, and its
+`result.detections` can be reused by `estimate_scale` and `evaluate_calibration`. Its `result.lenses` are the best
+`intrinsics=` for `calibrate_from_points`, even when the cameras never saw the board together.
+
+
 Use this when you've filmed a calibration board (ChArUco or checkerboard) with all your cameras. This is the usual lab
 setup.
 
@@ -120,6 +368,9 @@ calibration (a group of cameras placed back to front fails).
 
 ## Calibrating with an object of known shape: `PointObject`
 
+**In context:** a stand-in for the board in `calibrate_from_board`. Everything downstream works the same.
+
+
 Sometimes you don't have a printed board, but you do have something whose 3D shape you know: a wand with markers on
 it, a 3D-printed fixture, or points in the arena you've measured. You mark those points by hand in each camera, then
 calibrate with the same function.
@@ -146,6 +397,12 @@ If the object isn't flat, aniposelib can estimate the lenses from it, as long as
 points in a frame. With fewer points, pass known lenses as `intrinsics=`.
 
 ## Calibrating from the animals themselves: `calibrate_from_points`
+
+**In context:** the first step when there's no board in the session. It needs 2D keypoints
+([getting them in](#2d-keypoints)) and lenses ([where to get them](#lenses-intrinsics)). The result has no real-world
+scale, so it usually goes to `estimate_scale` next; then to `evaluate_calibration` and `reconstruct_3d`. With several
+animals, feed it the output of `associate_views`.
+
 
 Use this when there's no board in the recording, or the board was only good enough to get the lenses. The 2D points
 can be keypoints from a pose model, people, or anything else you can track in several cameras.
@@ -215,6 +472,11 @@ focal length is less certain, and `reject=None` turns off the removal of whole f
 
 ## Getting real-world units: `estimate_scale`
 
+**In context:** after `calibrate_from_points` (or anything else that leaves the calibration in arbitrary units).
+Its `result.cgroup` is the calibration to use from then on. The board detections can come from
+`calibrate_from_board`, `al.boards.detect_videos`, or straight from videos ([board detections](#board-detections)).
+
+
 Calibrations from points (or from VGGT) come out in arbitrary units. This puts them into millimetres, metres or
 whatever you use. Give it one of three things:
 
@@ -255,6 +517,11 @@ The corners the learned (DeepCharuco) detector finds are then sharpened on the f
 a shrunken copy of the frame to find the board. To turn that off, pass `options={'detector_kwargs': {'subpix': False}}`.
 
 ## Checking a calibration: `evaluate_calibration`
+
+**In context:** after any calibration, before you trust its 3D; or at the start of a session, to decide whether an
+old calibration can be reused. Give it the same kind of 2D points you'll triangulate, ideally from frames the
+calibration wasn't fitted to. Its `result.moves.stations` goes to `calibrate_from_points(stations=...)`.
+
 
 Use this to check a new calibration, to decide whether last week's calibration can still be used today, or to find
 out whether a camera was bumped during a session.
@@ -316,6 +583,12 @@ calibration is reused only while every camera stays under some error.
 
 ## Syncing cameras: `estimate_offsets`
 
+**In context:** the very first step, before anything else, when the cameras weren't started together. Its
+`result.timemaps` go to `align_streams` to put your 2D data on one clock
+([example](#cameras-that-werent-synchronised)). Once there's a calibration, it can be run again with `seed=` and
+`refine=True` to sharpen the sync.
+
+
 Use this when the cameras weren't started together, such as GoPros or phones.
 
 ```python
@@ -360,6 +633,10 @@ A few things that help:
   smoothly, so a fix found in one piece isn't stretched over the whole hour.
 
 ## Going from 2D to 3D: `reconstruct_3d`
+
+**In context:** the last step. It takes a calibration (from any of the calibration functions, after `estimate_scale`
+if you want real units) and 2D keypoints in the same camera order, or the output of `associate_views`.
+
 
 Use this to turn 2D keypoints from several cameras into 3D tracks.
 
@@ -425,6 +702,11 @@ Other useful things:
 
 ## Several animals at once: `associate_views`
 
+**In context:** between a calibration and everything that uses 2D points. It needs a calibration that's roughly
+right. Its `result.points` can go straight to `reconstruct_3d`, or, reshaped to one set of keypoints per individual
+and frame, to `calibrate_from_points` ([example](#several-animals-or-people)).
+
+
 Use this when more than one animal or person is in view, so you first have to work out which detection in each
 camera belongs to which individual.
 
@@ -446,35 +728,6 @@ there and the pieces are matched again, and identities that follow each other in
 
 `result.frame_ids` says which frame each row of `result.points` is. When the frame numbers are large and far apart,
 only the frames with detections are kept (`options={'frame_axis': 'dense'}` keeps every frame number).
-
----
-
-## Putting it together
-
-Here's how the projects that aniposelib was built around would use these steps.
-
-**A lab rig with a board** (for example, the classic Anipose setup):
-calibrate with `calibrate_from_board`, then `reconstruct_3d` for every session.
-
-**A rig that's recalibrated from the animal every session** (for example, the motor observatory):
-`calibrate_from_points` on the pose keypoints → `estimate_scale` from a board video → `evaluate_calibration` as a
-quality gate → `reconstruct_3d`.
-
-**Reusing a calibration while it's still good** (for example, EvoVision):
-`evaluate_calibration` on the last calibration. Only if it's no longer good: `associate_views` →
-`calibrate_from_points` → `estimate_scale` → `reconstruct_3d`.
-
-**Starting from a lab calibration and adjusting it** (for example, Emory):
-`calibrate_from_points` with the lab calibration as the starting point → `estimate_scale` against the lab calibration
-and known bone lengths → `evaluate_calibration` → `reconstruct_3d`.
-
-**Outdoor cameras that get knocked about** (for example, the outdoor mouse project):
-`calibrate_from_points` from VGGT and the tracked trajectory → `evaluate_calibration` with `times=` to catch moved
-cameras → `reconstruct_3d`.
-
-**Unsynced consumer cameras with many people** (for example, the dancing project):
-`estimate_offsets` from the audio → `calibrate_from_board` for each board session, joined with `bridge_points` from
-the dancers → `associate_views` → `calibrate_from_points` → `estimate_offsets(refine=True)` → `reconstruct_3d`.
 
 ## When you need more control
 
