@@ -99,8 +99,9 @@ dancing). Behaviour changes say how to get the previous behaviour.
   `clusters` (paired LOO agreement with a cluster bootstrap, `report['compare_to']`). `center_residual_frac` is now
   warn-only (old: `options={'verdict': {'center_residual_frac': (0.01, 0.05)}}`). `detect_moves` defaults in W4:
   `z_thr=10` (was 6), and `stations.detect_moves` gets `min_support_frac=0.25` (windows with few points cannot form a
-  step) and `retest=True` (flagged cameras re-tested without the confirmed moved ones). Old:
-  `detect_moves_kwargs=dict(z_thr=6, min_support_frac=None, retest=False)`. An `AffineCamera` group raises a
+  step), `max_resid_ratio=5` (windows whose offset fit leaves residuals above 5 x the camera's median window are
+  dropped: a rotation does not explain them) and `retest=True` (flagged cameras re-tested without the confirmed moved
+  ones). Old: `detect_moves_kwargs=dict(z_thr=6, min_support_frac=None, max_resid_ratio=None, retest=False)`. An `AffineCamera` group raises a
   `ValueError` pointing to `AffineCamera.to_pinhole`.
 - `scale.fit_similarity(robust_init=True)`: LMedS start (3-point subsets + leave-one-out), so one runaway camera no
   longer drags `align_to` / `from_reference` / `quality.compare` (motobs: 669 mm -> 0 median residual). Results on

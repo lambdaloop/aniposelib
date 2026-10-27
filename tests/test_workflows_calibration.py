@@ -337,7 +337,7 @@ def test_w4_moved_camera_and_decoy():
     assert res.verdict == 'fail'
     assert res.moves.moved == [names[2]] and res.per_camera[names[2]]['moved']
     assert any('loo_worst_px' in r and names[5] in r for r in res.reasons)
-    assert res.comparison is not None and res.report['rules'][5]['level'] != 'ok'
+    assert res.comparison is not None and {r['rule']: r['level'] for r in res.report['rules']}['center_residual_frac'] != 'ok'
     assert res.settings['loo_fail_px'] == pytest.approx(10 * res.settings['noise_floor_px'])
     json.loads(res.to_json())
     with pytest.raises(ValueError):

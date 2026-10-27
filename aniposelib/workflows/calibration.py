@@ -2171,8 +2171,9 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     - ``grazing_frac``: fraction of points whose largest ray angle is below ``min_ray_deg``
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail);
-    - ``bad_windows_frac``: share of time windows in which some camera's LOO agreement is below
-      ``bad_window_ratio`` x that camera's median window (desync / broken data; warn above 5 %);
+    - ``bad_windows_frac``: share of time windows in which some camera's LOO agreement (among its
+      supported points) is below ``bad_window_ratio`` x that camera's median window (desync / broken
+      data; warn above 5 %);
     - ``center_residual_frac``: worst aligned centre residual vs the reference / rig scale;
       warn 1 % (warn only: a reference is often rougher than the calibration under test);
     - ``board_shape_rel``: median board shape residual / object size; warn 0.5 %, fail 2 %;
@@ -2289,12 +2290,14 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 fin = el[c] & np.isfinite(le[c])
                 sup[c] = np.bincount(inv, weights=fin, minlength=nW)
                 hit[c] = np.bincount(inv, weights=fin & (le[c] < agree_t), minlength=nW)
-            ag = np.where(den > 0, hit / np.maximum(den, 1), np.nan)
+            # agreement among the supported points (as the projects' hourly LOO tables): a window of
+            # false / unmatched detections lowers the coverage, not the agreement
+            ag = np.where(sup > 0, hit / np.maximum(sup, 1), np.nan)
         min_cw = max(10.0, opts['min_window_obs'] / C)
-        judged = (den >= min_cw)
+        judged = (sup >= min_cw)
         cam_med = np.array([np.median(ag[c, judged[c]]) if judged[c].any() else np.nan for c in range(C)])
         badcw = judged & (ag < opts['bad_window_ratio'] * cam_med[:, None])
-        okw = judged.any(0) & (den.sum(0) >= opts['min_window_obs'])
+        okw = judged.any(0) & (sup.sum(0) >= opts['min_window_obs'])
         for k, lab in enumerate(labs):
             key = '{:.6g}'.format(t0 + int(lab) * ws)
             gd = qr.per_group.get(str(lab), {})
@@ -2302,6 +2305,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             per_window[key] = dict(
                 window=int(lab), n_eligible=int(tot),
                 loo_agree=float(hit[:, k].sum() / tot) if tot else None,
+                loo_agree_supported=float(hit[:, k].sum() / sup[:, k].sum()) if sup[:, k].sum() else None,
                 loo_median_px=gd.get('loo_median_px'), loo_coverage=float(sup[:, k].sum() / tot) if tot else None,
                 per_camera={n: (None if not np.isfinite(ag[c, k]) else float(ag[c, k])) for c, n in enumerate(names)},
                 bad_cameras=[n for c, n in enumerate(names) if badcw[c, k]], judged=bool(okw[k]))

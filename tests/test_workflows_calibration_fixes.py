@@ -402,3 +402,22 @@ def test_intrinsics_prior_per_camera_sigma_and_partial_group():
     assert set(out) == {0, 2}                                 # unmatched cameras: no prior (not by position)
     assert out[0]['fx'][1] == 0.3 and out[2]['fx'][1] == 0.05
     assert IntrinsicsPrior(true).priors_for(true.cameras)[3]['fx'][1] == 0.05
+
+
+
+def test_detect_moves_drops_windows_a_rotation_cannot_explain():
+    """outdoor-mouse false move: the last windows of a camera are scattered detections; their
+    rotation fits are wild (47 deg) with residuals far above the camera's usual ones."""
+    rig = synth.load_rig('motobs_7cam')
+    fn = synth.smooth_tracks(rig, n_points=6, amp=0.1, seed=1)
+    t = np.arange(0, 60, 1 / 10)
+    X = np.stack([fn(p, t) for p in range(6)], 1)
+    p2 = synth.add_noise(synth.project(rig, X), 0.5, seed=2)
+    rng = np.random.default_rng(0)
+    bad = t >= 48
+    p2[2, bad] += rng.normal(0, 40, p2[2, bad].shape)
+    mv = ST.detect_moves(rig, p2, t, tau=5.0, z_thr=10.0)
+    assert mv.moved == []
+    assert len(mv.info['bad_fit'].get(rig.get_names()[2], [])) >= 2
+    mv0 = ST.detect_moves(rig, p2, t, tau=5.0, z_thr=10.0, max_resid_ratio=None)
+    assert np.isfinite(mv0.delta_deg[2, -2]).all() and not np.isfinite(mv.delta_deg[2, -2]).all()

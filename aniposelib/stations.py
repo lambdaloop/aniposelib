@@ -420,7 +420,7 @@ def _dense_from_obs(obs, time_tol):
 def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_windows=3, z_thr=6.0,
                  sharp=1.5, tau=10.0, min_points=20, huber_px=3.0, cameras=None, refine=True,
                  skip_s=0.0, max_cp=10, fps=None, time_tol=1e-3, min_other=2, device=None,
-                 min_support_frac=0.25, retest=True):
+                 min_support_frac=0.25, retest=True, max_resid_ratio=5.0):
     """Detect camera bumps / re-aims (see module docstring).
 
     Args:
@@ -439,6 +439,11 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
             ``min_points`` points; sparser windows are NaN in ``delta_deg`` (listed in
             ``info['low_support']``) so a fit on a handful of points cannot form a change point.
             ``None`` / 0: only ``min_points`` (<= 1.0 behaviour).
+        max_resid_ratio: a window whose median residual after its offset fit is above
+            ``max(huber_px, max_resid_ratio x the camera's median window residual)`` is not
+            explained by a rotation (decoys, false detections, broken sync) and is dropped like a
+            low-support window (``info['bad_fit']``); a real re-aim is explained by the offset, so
+            its windows fit as well as the others. ``None``: off.
         retest: after the first pass, flagged cameras are re-tested in order of decreasing z
             with the already-confirmed moved cameras removed from the triangulating views; a
             camera stays flagged only if it is still flagged without them (the strongest one is
@@ -499,9 +504,16 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
                 d[low] = np.nan
                 med = med.copy()
                 med[low] = np.nan
+        badfit = np.zeros(W, bool)
+        if max_resid_ratio:
+            fm = np.isfinite(med) & np.isfinite(d).all(1)
+            if fm.sum() >= 3:
+                lim = max(huber_px, max_resid_ratio * float(np.median(med[fm])))
+                badfit = fm & (med > lim)
+                d[badfit] = np.nan
         cps = detect_steps(d, np.sqrt(np.maximum(cnt, 0)) * np.isfinite(d).all(1),
                            min_step=min_step_deg, min_seg=min_windows, z_thr=z_thr, sharp=sharp, max_cp=max_cp)
-        return dict(delta=d, cnt=cnt, med=med, cps=cps, X=X, sel=sel, low=low, others=others)
+        return dict(delta=d, cnt=cnt, med=med, cps=cps, X=X, sel=sel, low=low, badfit=badfit, others=others)
 
     out = {c: test(c) for c in cams}
     retest_info = {}
@@ -536,7 +548,7 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
     cps_all = []
     stations = Stations(cameras=names)
     rots = {}
-    low_support = {}
+    low_support, bad_fit = {}, {}
     for c in cams:
         r = out[c]
         if r is None:
@@ -544,6 +556,8 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
         delta[c], npts[c], resid[c] = r['delta'], r['cnt'], r['med']
         if r['low'].any():
             low_support[names[c]] = np.flatnonzero(r['low']).tolist()
+        if r['badfit'].any():
+            bad_fit[names[c]] = np.flatnonzero(r['badfit']).tolist()
         X, sel = r['X'], r['sel']
         times_c = []
         for cp in r['cps']:
@@ -578,6 +592,7 @@ def detect_moves(cgroup, data, times=None, window_s=4.0, min_step_deg=0.5, min_w
                       stations=stations, station_rotations=rots,
                       info=dict(min_step_deg=min_step_deg, z_thr=z_thr, tested=[names[c] for c in cams],
                                 min_support_frac=min_support_frac, low_support=low_support,
+                                max_resid_ratio=max_resid_ratio, bad_fit=bad_fit,
                                 retest=retest_info))
 
 
