@@ -204,8 +204,8 @@ class Reconstruction(WorkflowResult):
 _W6_DEFAULTS = {
     'tau_px': None,            # fixed MSAC threshold (px); None = clip(3 x noise floor, 10 px, 1 % of the diagonal)
     'tau_noise_mult': 3.0,
-    'inlier_refit': 'auto',    # Cauchy-weighted refit of the MSAC inliers: 'auto' = when the inlier errors are
-                               # heavier-tailed than Gaussian noise (real keypoints), True = always, False = 1.1 hard inliers
+    'inlier_refit': False,     # Cauchy-weighted refit of the MSAC inliers (opt-in): 'auto' = when the inlier errors are
+                               # heavier-tailed than Gaussian noise, True = always; False = plain least squares on the inliers
     'refit_sigma_mult': 1.5,   # Cauchy scale of that refit, x noise floor
     'refit_tail_frac': 0.12,   # 'auto': refit when more than this share of the inlier errors exceed 2 x their median
                                # (Gaussian pixel noise: 0.06-0.10)
@@ -609,10 +609,12 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             (frames that are not consecutive) use ``'none'``, or pass ``times=``.
         robust: True (MSAC with a noise-derived tau) or False (score-weighted linear DLT).
         options: overrides of ``_W6_DEFAULTS``:
-            ``tau_px`` (fixed MSAC threshold), ``inlier_refit`` ('auto': Cauchy-weighted refit of
-            the MSAC inliers, scale ``refit_sigma_mult`` (1.5) x noise floor, when the score-weighted
-            share of inlier errors above 2 x their median exceeds ``refit_tail_frac`` (0.12), i.e.
-            heavier tails than Gaussian noise; True always, False never: the 1.1 hard inliers),
+            ``tau_px`` (fixed MSAC threshold), ``inlier_refit`` (False, default: plain least squares
+            on the MSAC inliers; 'auto': Cauchy-weighted refit of the inliers, scale
+            ``refit_sigma_mult`` (1.5) x noise floor, when the score-weighted share of inlier errors
+            above 2 x their median exceeds ``refit_tail_frac`` (0.12), i.e. heavier tails than
+            Gaussian noise; True: always. The refit lowers the in-sample reprojection error, not
+            the held-out 3D accuracy, see docs/workflows.md),
             ``min_score`` (hard score cut), ``min_views``
             (2), ``min_joints_per_view`` (None; int, or a fraction of J if < 1: camera-frames
             with fewer finite keypoints are dropped before triangulation), ``mask_out_of_bounds``
@@ -752,6 +754,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         return to_numpy(G.project(P, torch.as_tensor(Xc, device=P.device, dtype=P.dtype),
                                   extrinsics=Ef)[0]).reshape(C, N, J, 2)
 
+    X_msac = None                                       # MSAC points before the inlier refit
     with timer('triangulate'):
         if robust:
             tau0 = max(10.0, opts['first_tau_diag_frac'] * diag) if diag else 20.0
@@ -769,10 +772,11 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             X = to_numpy(res.p3d).reshape(N, J, 3)
             inl = to_numpy(res.inliers).reshape(C, N, J)
             settings.update(first_tau_px=tau0, noise_px=nf, noise_unit=_noise_unit(nf), tau_px=tau)
-            # Cauchy-weighted refit of the inliers: with heavy-tailed keypoint noise, the hard
-            # MSAC inliers at a few px weigh as much as the tight ones and pull the point (motor
-            # observatory: median reprojection 3.29 -> 2.93 px, the project's IRLS 3.06); on
-            # Gaussian noise ('auto' does not trigger) the plain least squares is the best fit
+            # optional Cauchy-weighted refit of the inliers: lowers the in-sample reprojection error on
+            # heavy-tailed keypoints (motor observatory median 3.29 -> 2.94 px, project IRLS 3.06) but not
+            # the held-out accuracy elsewhere (Panoptic MPJPE +0.05 cm, dancing bone CV +5-11 %), so opt-in;
+            # the plain least-squares inlier fit already beats the project's IRLS on leave-one-camera-out
+            # reprojection (4.98 vs 5.20 px)
             mode = opts['inlier_refit']
             if mode not in ('auto', True, False):
                 raise ValueError("options['inlier_refit'] must be 'auto', True or False, got {!r}".format(mode))
@@ -782,6 +786,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
                                         tail > float(opts['refit_tail_frac']))
             sig = float(opts['refit_sigma_mult']) * nf
             if do_refit:
+                X_msac = X.copy()
                 base = to_numpy(res.inliers).astype(float).reshape(C, -1)
                 if swf is not None:
                     base = base * swf
@@ -958,7 +963,9 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         'median_point_error_px': float(np.nanmedian(pe)) if np.isfinite(pe).any() else None,
         'two_view_frac': float(((n_views == 2) & have).sum() / max(have.sum(), 1)),
     }
-    drift = _error_drift(err, usable & have[None])
+    # drift on the MSAC fit: the Cauchy refit absorbs part of a systematic error (moved cameras)
+    err_d = err if X_msac is None else np.linalg.norm(project(X_msac) - pts, axis=-1)
+    drift = _error_drift(err_d, usable & have[None])
     report['error_drift'] = drift
     rules = [
         Rule('reconstructed_frac', float(have.mean()) if have.size else 0.0, 0.5, 0.05,
