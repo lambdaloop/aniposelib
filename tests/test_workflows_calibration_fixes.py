@@ -597,3 +597,65 @@ def test_w1_videos_end_to_end(tmp_path):
     assert cg is not None and cg.get_names() == ['a', 'b']
     C = synth.camera_centers(cg)
     assert abs(np.linalg.norm(C[1] - C[0]) - np.linalg.norm(R1.T @ t1)) < 3.0       # mm (render bias ~1 %)
+
+
+# ------------------------------------------------------------------ init='people' (1.1 gaps: Panoptic 5D)
+
+def _people_fragments(true, n_frames=40, sigma=0.7, seed=4):
+    """Two people, every camera's tracker cuts each person's track once (at a different frame per
+    camera), track ids have no cross-camera meaning."""
+    P3 = np.stack([synth.skeleton(true, n_frames, model=synth.PERSON, size=3.5, spread=0.2, seed=s)[0]
+                   for s in (10, 11)], 1)
+    p2 = synth.add_noise(synth.project(true, P3), sigma, seed=seed)
+    C, F = p2.shape[:2]
+    rng = np.random.default_rng(0)
+    tid = np.zeros((C, F, 2), int)
+    for c in range(C):
+        for k in range(2):
+            cut = rng.integers(10, F - 10)
+            tid[c, :, k] = np.where(np.arange(F) < cut, 10 * k + 1, 10 * k + 2) + 100 * c
+    return p2, tid
+
+
+def test_people_association_merges_track_fragments():
+    """A person's track fragments (tracker cuts) join one identity; before 1.1 the fragment
+    matches lost the dominance test and the groups with two tracks of a camera were dropped,
+    which left most Panoptic detections unassociated (2 of 5 cameras unplaced)."""
+    from aniposelib.init import people
+    true = synth.load_rig('fisheye_5cam')
+    p2, tid = _people_fragments(true)
+    assoc, rep = people.associate_people(WC_no_extrinsics(true), p2, track_ids=tid, rng=0, n_windows=3)
+    assert assoc.shape[2] == 2 and not rep.dropped
+    assert np.isfinite(assoc).all(-1).all(-1).all()            # every camera-frame of both people
+    for g in rep.groups:                                       # one person per group
+        assert len({(t if isinstance(t, int) else t[0]) % 100 // 10 for t in g.values()}) == 1
+
+
+def test_sfm_pnp_threshold_follows_the_keypoint_noise():
+    """5 px keypoint noise: the fixed 8 px frame test placed 2 of 5 cameras; the threshold now
+    scales with the noise measured on the seed pair (noise_mult=None: the old behaviour)."""
+    from aniposelib.init import sfm
+    true = synth.load_rig('fisheye_5cam')
+    p3d, _ = synth.skeleton(true, 40, model=synth.PERSON, size=3.5, spread=0.15, seed=3)
+    p2d = synth.add_noise(synth.project(true, p3d), 5.0, seed=4)
+    cg, rep = sfm.from_correspondences(WC_no_extrinsics(true), p2d, rng=0)
+    assert len(rep.placed) == 5 and 4 < rep.stats['noise_px'] < 6 and rep.stats['pnp_thresh_px'] > 8
+    assert synth.center_error(cg, true).max() < 0.03
+    _, rep0 = sfm.from_correspondences(WC_no_extrinsics(true), p2d, rng=0, noise_mult=None)
+    assert len(rep0.placed) < 5
+
+
+def test_w2_people_fragmented_tracks_associates_once(monkeypatch):
+    """W2 init='people' with fragmented tracks places every camera, and associates only once."""
+    from aniposelib.init import people
+    true = synth.load_rig('fisheye_5cam')
+    p2, tid = _people_fragments(true, sigma=1.0)
+    calls = []
+    orig = people.associate_people
+    monkeypatch.setattr(people, 'associate_people', lambda *a, **k: calls.append(1) or orig(*a, **k))
+    cg, res = calibrate_from_points(p2, WC_no_extrinsics(true), init='people', refine_intrinsics=False,
+                                    options={'track_ids': tid, 'quality': False,
+                                             'people_kwargs': {'association_kwargs': {'n_windows': 3}}})
+    assert len(calls) == 1
+    assert cg is not None and len(cg.get_names()) == 5, res.reasons
+    assert synth.center_error(cg, true).max() < 0.02

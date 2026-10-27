@@ -17,10 +17,12 @@ Per camera pair (disco ``hypotheses`` / ``solve_pair`` / ``match_tracklets``):
 3. with the best E, tracks are matched by votes of those anchors (a track anchored to several
    partners keeps one only if it dominates), and E is re-estimated from all matched joints.
 
-Accepted track pairs are merged across all pairs by union-find on ``(camera, track)`` nodes;
-groups that would contain two tracks of the same camera in the same frame are split off
-(dropped). Track ids must be consistent within a camera (``track_ids``; default: the slot
-index ``p`` is the track).
+Accepted track pairs are merged across all pairs on ``(camera, track)`` nodes, strongest
+(most votes) first; a merge that would put two tracks of one camera visible in the same frame
+into one identity is refused (``report.dropped``). Tracks of one camera that never share a frame
+(fragments of one person, cut by the tracker) do not compete in step 3 and may join one identity.
+Track ids must be consistent within a camera (``track_ids``; default: the slot index ``p`` is
+the track). The camera pairs run on threads with seeds drawn from ``rng`` in pair order.
 """
 
 from dataclasses import dataclass, field, fields
@@ -52,11 +54,12 @@ def _pair_cost(xa, xb, E, f, min_j=6):
     d = _sym_epipolar(xa[:, :, None], xb[:, None], E) * f      # [F,Pa,Pb,J]
     ok = np.isfinite(d)
     n = ok.sum(-1)
-    with np.errstate(all='ignore'):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            med = np.nanmedian(np.where(ok, d, np.nan), axis=-1)
+    # nanmedian by sorting (NaN last): thread safe (no warnings filter) and faster
+    srt = np.sort(np.where(ok, d, np.nan), axis=-1)
+    lo = np.maximum((n - 1) // 2, 0)[..., None]
+    hi = np.maximum(n // 2, 0)[..., None]
+    hi = np.minimum(hi, d.shape[-1] - 1)
+    med = 0.5 * (np.take_along_axis(srt, lo, -1) + np.take_along_axis(srt, hi, -1))[..., 0]
     med[(n < min_j) | ~np.isfinite(med)] = np.inf
     return med
 
@@ -119,6 +122,7 @@ def _solve_pair(xa, xb, ta, tb, f, gate, ratio, win, n_windows, min_corr, max_tr
                     hyps.append(h[0])
     if not hyps:
         return None
+    ov_a, ov_b = _overlap_fn(ta, va), _overlap_fn(tb, vb)
     sel = np.sort(rng.choice(F, min(F, n_score), replace=False))
     scores = [int(_mutual(_pair_cost(xa[sel], xb[sel], E, f), gate, ratio).sum()) for E in hyps]
     E = hyps[int(np.argmax(scores))]
@@ -130,7 +134,7 @@ def _solve_pair(xa, xb, ta, tb, f, gate, ratio, win, n_windows, min_corr, max_tr
         votes = {}
         for a, b in zip(ta[fr, i], tb[fr, j]):
             votes[(int(a), int(b))] = votes.get((int(a), int(b)), 0) + 1
-        acc = _dominant(votes, dominance, min_votes)
+        acc = _dominant(votes, dominance, min_votes, ov_a, ov_b)
         if not acc:
             return None
         pa, pb = [], []
@@ -150,14 +154,28 @@ def _solve_pair(xa, xb, ta, tb, f, gate, ratio, win, n_windows, min_corr, max_tr
                 n_hypotheses=len(hyps))
 
 
-def _dominant(votes, dominance, min_votes):
-    """Track pairs (a, b) that are each other's dominant partner."""
+def _overlap_fn(t, v):
+    """``overlap(x, y)``: whether tracks x and y (ids in ``t [F,P]``, visible where ``v``) share a frame."""
+    frames = {}
+    fr, sl = np.nonzero(v & (t >= 0))
+    for tid in np.unique(t[fr, sl]):
+        frames[int(tid)] = set(fr[t[fr, sl] == tid].tolist())
+    return lambda x, y: bool(frames.get(int(x), set()) & frames.get(int(y), set()))
+
+
+def _dominant(votes, dominance, min_votes, overlap_a=None, overlap_b=None):
+    """Track pairs (a, b) that are each other's dominant partner. ``overlap_a(x, y)`` /
+    ``overlap_b(x, y)``: whether two tracks of camera a / b are visible in a common frame; only
+    those compete (fragments of one person's track, cut by the tracker, are not rivals: each
+    keeps its own match). None: every other track is a rival (the 1.0 rule)."""
     acc = []
     for (a, b), n in votes.items():
         if n < min_votes:
             continue
-        rivals_a = [m for (x, y), m in votes.items() if x == a and y != b]
-        rivals_b = [m for (x, y), m in votes.items() if y == b and x != a]
+        rivals_a = [m for (x, y), m in votes.items() if x == a and y != b
+                    and (overlap_b is None or overlap_b(y, b))]
+        rivals_b = [m for (x, y), m in votes.items() if y == b and x != a
+                    and (overlap_a is None or overlap_a(x, a))]
         if all(n >= dominance * m for m in rivals_a + rivals_b):
             acc.append((a, b))
     return acc
@@ -204,44 +222,83 @@ def associate_people(cgroup, p2ds, track_ids=None, gate=10.0, ratio=1.8, win=20,
             n = parent[n]
         return n
 
-    for i in range(C):
-        for j in range(i + 1, C):
-            r = _solve_pair(x[i], x[j], track_ids[i], track_ids[j], float(np.sqrt(f[i] * f[j])),
-                            gate, ratio, win, n_windows, min_corr, max_tracks, min_votes,
-                            dominance, rng)
-            if r is None:
-                continue
+    # the camera pairs are independent (cv2 releases the GIL): run them on a thread pool, each
+    # with its own seed drawn from rng in pair order (the result does not depend on the threads)
+    todo = [(i, j, int(rng.integers(2 ** 31 - 1))) for i in range(C) for j in range(i + 1, C)]
+
+    def one(job):
+        i, j, seed = job
+        return _solve_pair(x[i], x[j], track_ids[i], track_ids[j], float(np.sqrt(f[i] * f[j])),
+                           gate, ratio, win, n_windows, min_corr, max_tracks, min_votes,
+                           dominance, np.random.default_rng(seed))
+    for (i, j, _), r in zip(todo, _sfm._pmap(one, todo)):
+        if r is not None:
             rep.pairs[(i, j)] = r
-            for a, b in r['matches']:
-                parent[find((j, b))] = find((i, a))
+    # merge the accepted track pairs, strongest first. A person's tracks fragment (an IoU tracker
+    # cuts them at occlusions), so a group may hold several tracks of one camera, but never two
+    # that are visible in the same frame (that merge is refused, i.e. the weaker edge is dropped;
+    # before 1.1 any group with two tracks of one camera was dropped whole, which lost most data)
+    vis = np.isfinite(p).all(-1).sum(-1) >= 1                       # [C,F,P]
+    frames_of = {}
+    for c in range(C):
+        fr, sl = np.nonzero(vis[c] & (track_ids[c] >= 0))
+        for t in np.unique(track_ids[c][fr, sl]):
+            frames_of[(c, int(t))] = set(fr[track_ids[c][fr, sl] == t].tolist())
+    edges = sorted(((n, (i, int(a)), (j, int(b))) for (i, j), r in rep.pairs.items()
+                    for (a, b), n in r['votes'].items()), key=lambda e: -e[0])
+    occ = {}                                                        # root -> {camera: frames}
+
+    def occupancy(n):
+        rt = find(n)
+        if rt not in occ:
+            occ[rt] = {n[0]: set(frames_of.get(n, ()))}
+        return rt, occ[rt]
+
+    for n, na, nb in edges:
+        ra, oa = occupancy(na)
+        rb, ob = occupancy(nb)
+        if ra == rb:
+            continue
+        if any(c in oa and len(oa[c] & fs) > 0 for c, fs in ob.items()):
+            rep.dropped.append(dict(pair=[list(na), list(nb)], votes=int(n), reason='same-frame conflict'))
+            continue
+        parent[rb] = ra
+        for c, fs in ob.items():
+            oa.setdefault(c, set()).update(fs)
+        del occ[rb]
     groups = {}
-    for n in list(parent):
-        groups.setdefault(find(n), []).append(n)
+    for nd in list(parent):
+        groups.setdefault(find(nd), []).append(nd)
     members = []
     for g in groups.values():
-        cams = [c for c, _ in g]
-        if len(set(cams)) < len(cams):
-            rep.dropped.append(sorted(g))
-            continue
-        if len(cams) >= min_pair_cams:
-            members.append(dict(sorted(g)))
-    rep.groups = [{cgroup.get_names()[c]: int(t) for c, t in m.items()} for m in members]
+        m = {}
+        for c, t in sorted(g):
+            m.setdefault(c, []).append(t)
+        if len(m) >= min_pair_cams:
+            members.append(m)
+    members.sort(key=lambda m: -sum(len(frames_of.get((c, t), ())) for c, ts in m.items() for t in ts))
+    rep.groups = [{cgroup.get_names()[c]: (int(ts[0]) if len(ts) == 1 else [int(t) for t in ts])
+                   for c, ts in m.items()} for m in members]
     G = len(members)
     out = np.full((C, F, max(G, 1), J, 2), np.nan)[:, :, :G]
     for g, m in enumerate(members):
-        for c, t in m.items():
-            hit = track_ids[c] == t                       # [F,P]
+        for c, ts in m.items():
+            hit = np.isin(track_ids[c], ts)               # [F,P]
             fr, sl = np.nonzero(hit)
             out[c, fr, g] = p[c, fr, sl]
     return out, rep
 
 
-def from_people(cgroup, p2ds, track_ids=None, association_kwargs=None, **sfm_kwargs):
+def from_people(cgroup, p2ds, track_ids=None, association_kwargs=None, association=None, **sfm_kwargs):
     """Calibrate extrinsics from several unassociated people: :func:`associate_people`, then
     :func:`~aniposelib.init.sfm.from_correspondences` on the associated keypoints (one SfM
-    'frame' per person and frame; windows = frames). Returns ``(CameraGroup, InitReport)``;
-    the association report is in ``report.stats['association']``."""
-    assoc, arep = associate_people(cgroup, p2ds, track_ids=track_ids, **(association_kwargs or {}))
+    'frame' per person and frame; windows = frames). ``association``: a precomputed
+    ``(assoc, AssociationReport)`` of :func:`associate_people` to reuse (then ``track_ids`` and
+    ``association_kwargs`` are ignored). Returns ``(CameraGroup, InitReport)``; the association
+    report is in ``report.stats['association']``."""
+    if association is None:
+        association = associate_people(cgroup, p2ds, track_ids=track_ids, **(association_kwargs or {}))
+    assoc, arep = association
     C, F, G, J, _ = assoc.shape
     if G == 0:
         raise RuntimeError('from_people: no person could be associated across cameras')
