@@ -2400,6 +2400,8 @@ class CameraGroup(nn.Module):
 
         scores: optional CxNxJ confidences; each reprojection residual is multiplied by its
           score (soft weights, use values in [0, 1]).
+        scale_length: bone weight, a float or one weight per strong constraint (array of length
+          K).
         normalize: True (default since 1.1): the optimisation runs in *pixel-equivalent*
           units, so it does not depend on the units of the rig (mm or m give the same result).
           The 3D points are parametrised as ``center + u * q`` with ``u`` the median world
@@ -2538,6 +2540,13 @@ class CameraGroup(nn.Module):
 
         points_tensor = to_tensor(points, device=device, dtype=dtype)
         scores = to_tensor(scores, device=device, dtype=dtype)
+        if np.ndim(scale_length) > 0:
+            # one weight per strong bone (e.g. from each bone's measured length spread)
+            scale_length = to_tensor(np.asarray(scale_length, dtype='float64').reshape(-1),
+                                     device=device, dtype=dtype)
+            if scale_length.shape[0] != len(constraints):
+                raise ValueError('scale_length has {} weights for {} constraints'.format(
+                    scale_length.shape[0], len(constraints)))
         if normalize:
             # squared pixel-equivalent bone residuals (see optim_points)
             scale_length_eff = 10.0 * scale_length
@@ -2784,17 +2793,23 @@ class CameraGroup(nn.Module):
         total_error += sum_smooth
 
         # joint length constraints, all bones at once
-        def bone_error(pairs, targets):
+        def bone_error(pairs, targets, w=None):
             if len(pairs) == 0:
                 return 0
             pairs = torch.as_tensor(np.asarray(pairs), dtype=torch.long, device=p3ds.device).reshape(-1, 2)
             lengths = torch.linalg.norm(p3ds[:, pairs[:, 0]] - p3ds[:, pairs[:, 1]], dim=-1)   # [N,K]
             expected = torch.abs(targets)
             sq = torch.square(lengths - expected).sum(0)                                   # [K]
-            return (sq / expected).sum() if unit is None else sq.sum()
+            if unit is None:
+                sq = sq / expected
+            return sq.sum() if w is None else (sq * w).sum()
 
-        error_lengths = bone_error(constraints, joint_lengths)
-        sum_lengths = error_lengths * scale_length * (100 if unit is None else 1)
+        if torch.is_tensor(scale_length) and scale_length.ndim > 0:   # per-bone weights
+            error_lengths = bone_error(constraints, joint_lengths, scale_length)
+            sum_lengths = error_lengths * (100 if unit is None else 1)
+        else:
+            error_lengths = bone_error(constraints, joint_lengths)
+            sum_lengths = error_lengths * scale_length * (100 if unit is None else 1)
         total_error += sum_lengths
 
         error_lengths_weak = bone_error(constraints_weak, joint_lengths_weak)

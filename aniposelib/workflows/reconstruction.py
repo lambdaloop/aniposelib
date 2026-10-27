@@ -64,8 +64,8 @@ import numpy as np
 import torch
 
 from ._common import (MIN_NOISE_PX, NOISE_DIAG_FRAC, Rule, Timer, WorkflowResult, evaluate_rules,
-                      image_diagonal, merge_options, noise_floor, provenance, save_arrays,
-                      thread_guard, to_numpy, worst)
+                      image_diagonal, merge_options, noise_floor, provenance, reindex_cameras,
+                      save_arrays, thread_guard, to_numpy, worst)
 
 __all__ = ['estimate_offsets', 'OffsetEstimation', 'reconstruct_3d', 'Reconstruction',
            'associate_views', 'Association']
@@ -117,17 +117,22 @@ class Reconstruction(WorkflowResult):
     ``errors [C,N,J]`` reprojection error (px) of every observation against the final points,
     ``n_views [N,J]`` inlier views used (0 for filled cells), ``inliers [C,N,J]`` observations
     used, ``filled [N,J]`` cells filled (gap interpolation / optim_points) rather than
-    triangulated. ``report``: ``per_camera`` usage, ``gaps``, ``bones`` (length CV), ``noise_px``,
-    ``tau_px``, ``rules``."""
+    triangulated, ``point_error [N,J]`` median reprojection error (px) of each triangulated
+    point over its inlier views (NaN for filled / missing cells), ``out_of_image [C,N,J]``
+    observations outside the image (not used with ``mask_out_of_bounds``). ``report``:
+    ``per_camera`` usage, ``gaps``, ``bones`` (length CV), ``noise_px``, ``tau_px``, ``rules``."""
     points3d: Any = None
     errors: Any = None
     n_views: Any = None
     inliers: Any = None
     filled: Any = None
+    point_error: Any = None
+    out_of_image: Any = None
 
     def save(self, out):
         save_arrays(self, out, {'points3d': self.points3d, 'errors': self.errors,
-                                'n_views': self.n_views, 'inliers': self.inliers})
+                                'n_views': self.n_views, 'inliers': self.inliers,
+                                'point_error': self.point_error})
 
 
 _W6_DEFAULTS = {
@@ -136,7 +141,14 @@ _W6_DEFAULTS = {
     'first_tau_diag_frac': 0.01,   # first robust pass: tau = max(10 px, this x image diagonal)
     'min_score': None,         # hard score cut (observations below are removed); None = soft only
     'min_views': 2,
-    'bone_weight': 2.0,        # optim_points scale_length (pixel-equivalent, see optim_points)
+    'min_joints_per_view': None,   # camera-frames with fewer finite keypoints are dropped (int, or a fraction of J if < 1)
+    'mask_out_of_bounds': True,    # observations outside the image are not used (counted as out_of_image)
+    'max_gap': 10,             # fill='interior': longest gap (frames) that is filled; None = every interior gap
+    'max_gap_s': None,         # same in seconds (needs times=)
+    'max_point_err_px': None,  # triangulated points whose point_error is above this are removed (NaN)
+    'cam_names': None,         # camera order of points (reindexed to the group; missing cameras -> NaN)
+    'bone_weight': 'auto',     # 'auto' = per-bone weight from the measured length spread; a float = fixed weight
+    'bone_max_reproj_rise': 0.5,   # bones/smooth: reject a chunk's refinement when its median inlier error rises more than this x noise floor
     'n_iters': 300,            # optim_points Adam iterations per chunk
     'max_lr': 0.1,             # optim_points step (pixels)
     'chunk_frames': 2000,      # optim_points chunk length (frames) for long sequences
@@ -144,21 +156,56 @@ _W6_DEFAULTS = {
     'verdict': None,
 }
 
+BONE_WEIGHT_MAX = 2.0          # 'auto' bone weights never exceed the fixed 1.1 default
+BONE_NOISE_FLOOR = 0.3         # 'auto': true length spread >= this x the expected triangulation noise of the length
 
-def _interior_fill(X):
-    """Linear interpolation of interior gaps per (joint, coordinate) column of X [N,J,3]."""
+
+def _segment_runs(N, segments):
+    """-> list of (start, end) frame runs; a new run starts wherever the segment id changes."""
+    if segments is None or N == 0:
+        return [(0, N)]
+    s = np.asarray(segments).reshape(-1)
+    if len(s) != N:
+        raise ValueError('segments must have one id per frame ({}), got {}'.format(N, len(s)))
+    cut = np.nonzero(s[1:] != s[:-1])[0] + 1
+    b = np.r_[0, cut, N]
+    return [(int(a), int(e)) for a, e in zip(b[:-1], b[1:])]
+
+
+def _fill_keep(have, runs, max_gap, times=None, max_gap_s=None):
+    """Cells to return with fill='interior': triangulated cells plus interior gaps (within a
+    segment run) no longer than ``max_gap`` frames / ``max_gap_s`` seconds."""
+    keep = have.copy()
+    N, J = have.shape
+    for s, e in runs:
+        for j in range(J):
+            ok = np.nonzero(have[s:e, j])[0] + s
+            if len(ok) < 2:
+                continue
+            for a, b in zip(ok[:-1], ok[1:]):
+                if b - a <= 1:
+                    continue
+                if max_gap is not None and (b - a - 1) > max_gap:
+                    continue
+                if max_gap_s is not None and times is not None and (times[b] - times[a]) > max_gap_s:
+                    continue
+                keep[a + 1:b, j] = True
+    return keep
+
+
+def _interior_fill(X, keep, runs, times=None):
+    """Linear interpolation (on ``times`` when given) of the cells ``keep & ~finite`` per
+    (segment run, joint)."""
     out = X.copy()
-    N = X.shape[0]
-    idx = np.arange(N)
-    for j in range(X.shape[1]):
-        ok = np.isfinite(X[:, j]).all(-1)
-        if ok.sum() < 2:
-            continue
-        a, b = np.nonzero(ok)[0][[0, -1]]
-        gap = ~ok & (idx > a) & (idx < b)
-        if gap.any():
+    for s, e in runs:
+        x = (np.arange(s, e) if times is None else times[s:e]).astype(float)
+        for j in range(X.shape[1]):
+            ok = np.isfinite(X[s:e, j]).all(-1)
+            gap = keep[s:e, j] & ~ok
+            if ok.sum() < 2 or not gap.any():
+                continue
             for k in range(3):
-                out[gap, j, k] = np.interp(idx[gap], idx[ok], X[ok, j, k])
+                out[s:e, j, k][gap] = np.interp(x[gap], x[ok], X[s:e, j, k][ok])
     return out
 
 
@@ -176,13 +223,80 @@ def _gap_stats(have):
     return per
 
 
+def _bone_lengths(X, a, b):
+    L = np.linalg.norm(X[:, a] - X[:, b], axis=-1)
+    return L[np.isfinite(L)]
+
+
 def _bone_cv(X, bones):
+    """Robust coefficient of variation per bone: 1.4826 x MAD / median of the length."""
     out = []
     for a, b in bones:
-        L = np.linalg.norm(X[:, a] - X[:, b], axis=-1)
-        L = L[np.isfinite(L)]
+        L = _bone_lengths(X, a, b)
+        m = np.median(L) if len(L) >= 2 else np.nan
+        out.append(float(1.4826 * np.median(np.abs(L - m)) / m) if len(L) >= 2 and m > 0
+                   else float('nan'))
+    return out
+
+
+def _bone_cv_std(X, bones):
+    out = []
+    for a, b in bones:
+        L = _bone_lengths(X, a, b)
         out.append(float(np.std(L) / np.mean(L)) if len(L) >= 2 and np.mean(L) > 0 else float('nan'))
     return out
+
+
+def _length_noise(P, X, inl, a, b, nf, max_frames=2000):
+    """Expected triangulation noise (world units, median over frames) of the length a-b:
+    ``sqrt(u^T (Cov_a + Cov_b) u)`` with ``Cov = nf^2 (sum_c J_c^T J_c)^-1`` over each joint's
+    inlier views (``J`` = projection Jacobian) and ``u`` the bone direction."""
+    from .. import geometry as G
+    fr = np.nonzero(np.isfinite(X[:, a]).all(-1) & np.isfinite(X[:, b]).all(-1))[0]
+    if len(fr) == 0:
+        return float('nan')
+    fr = fr[np.linspace(0, len(fr) - 1, min(len(fr), max_frames)).astype(int)]
+    covs = []
+    for j in (a, b):
+        Xj = torch.as_tensor(X[fr, j], device=P.device, dtype=P.dtype)
+        _, _, Jac = G.project_jacobian(P, Xj)
+        Jac = to_numpy(Jac)                                            # [C,M,2,3]
+        m = inl[:, fr, j].astype(float)                                # [C,M]
+        H = np.einsum('cm,cmki,cmkj->mij', m, np.nan_to_num(Jac), np.nan_to_num(Jac))
+        ok = np.linalg.matrix_rank(H) == 3 if H.ndim == 3 else np.zeros(0, bool)
+        Cv = np.full_like(H, np.nan)
+        Cv[ok] = np.linalg.inv(H[ok])
+        covs.append(Cv)
+    d = X[fr, a] - X[fr, b]
+    u = d / np.linalg.norm(d, axis=-1, keepdims=True)
+    v = np.einsum('mi,mij,mj->m', u, covs[0] + covs[1], u)
+    v = v[np.isfinite(v) & (v >= 0)]
+    return float(nf * np.sqrt(np.median(v))) if len(v) else float('nan')
+
+
+def _auto_bone_weights(P, X, inl, bones, nf, unit):
+    """Per-bone optim_points weights from each bone's measured length spread.
+
+    A bone with robust length spread ``s`` (1.4826 MAD of the triangulated length) and expected
+    triangulation noise ``n`` (:func:`_length_noise`) has a true spread
+    ``t = sqrt(max(s^2 - n^2, (BONE_NOISE_FLOOR n)^2))``. Its weight is that of a Gaussian length
+    prior relative to the squared pixel residuals, ``nf^2 / (10 (t / unit)^2)`` (``unit`` =
+    world length per pixel; optim_points multiplies the bone term by 10), capped at
+    ``BONE_WEIGHT_MAX``. Rigid bones get the cap, non-rigid ones (tails, spines) little weight."""
+    w, info = [], []
+    for a, b in bones:
+        L = _bone_lengths(X, a, b)
+        n = _length_noise(P, X, inl, a, b, nf) if len(L) >= 3 else float('nan')
+        if len(L) < 3 or not np.isfinite(n):
+            w.append(BONE_WEIGHT_MAX)
+            info.append({'spread': None, 'noise': None, 'weight': BONE_WEIGHT_MAX})
+            continue
+        s = 1.4826 * float(np.median(np.abs(L - np.median(L))))
+        true2 = max(s * s - n * n, (BONE_NOISE_FLOOR * n) ** 2, 1e-300)
+        wb = float(min(BONE_WEIGHT_MAX, nf * nf * unit * unit / (10.0 * true2)))
+        w.append(wb)
+        info.append({'spread': s, 'noise': n, 'weight': wb})
+    return np.array(w, float), info
 
 
 OPTIM_GPU_MIN_CELLS = 50000   # device='auto': smaller optim_points chunks (frames x joints) run on the CPU
@@ -202,13 +316,17 @@ def _chunks(N, chunk, overlap):
     return out
 
 
-def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep):
+def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep, bone_w=None,
+                   med_err=None, max_rise=None, base=None):
     """optim_points over overlapping chunks, blended linearly in the overlaps. keep [N,J]:
-    cells to return (the rest NaN)."""
+    cells to return (the rest NaN). ``med_err(X, s, e)``: median inlier error of chunk points;
+    a chunk whose refinement raises it by more than ``max_rise`` px is replaced by ``base``
+    (the triangulated / interpolated points). Returns (points, n_chunks, n_rejected)."""
     C, N, J, _ = obs.shape
     out = np.zeros((N, J, 3))
     wsum = np.zeros((N, 1, 1))
     spans = _chunks(N, int(opts['chunk_frames']), int(opts['overlap_frames']))
+    n_rej = 0
     for s, e in spans:
         seg = obs[:, s:e]
         X0 = init[s:e]
@@ -216,9 +334,15 @@ def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep):
             continue
         X = to_numpy(cg.optim_points(
             seg, X0, constraints=list(bones or []), scale_smooth=scale_smooth,
-            scale_length=opts['bone_weight'], reproj_error_threshold=tau,
+            scale_length=opts['bone_weight'] if bone_w is None else bone_w,
+            reproj_error_threshold=tau,
             scores=None if sw is None else np.sqrt(sw[:, s:e]),
             n_iters=int(opts['n_iters']), max_lr=opts['max_lr'], fill='all', normalize=True))
+        if med_err is not None and max_rise is not None:
+            before, after = med_err(X0, s, e), med_err(X, s, e)
+            if np.isfinite(before) and np.isfinite(after) and after > before + max_rise:
+                X = np.where(np.isfinite(base[s:e]), base[s:e], X)
+                n_rej += 1
         w = np.ones(e - s)
         ov = int(opts['overlap_frames'])
         if len(spans) > 1 and ov > 0:
@@ -233,35 +357,128 @@ def _optim_chunked(cg, obs, init, sw, bones, scale_smooth, opts, tau, keep):
         out = out / wsum
     out[~keep] = np.nan
     out[(wsum[:, 0, 0] == 0)] = np.nan
-    return out, len(spans)
+    return out, len(spans), n_rej
+
+
+def _parse_extrinsics(ext, C, N):
+    """Per-frame extrinsics -> [C,N,4,4] float array (group camera order)."""
+    if ext is None:
+        return None
+    if isinstance(ext, (list, tuple)) and len(ext) and hasattr(ext[0], 'cameras'):
+        if len(ext) != N:
+            raise ValueError('extrinsics: {} camera groups for {} frames'.format(len(ext), N))
+        E = np.stack([np.stack([to_numpy(c.get_extrinsics_mat()) for c in g.cameras]) for g in ext], 1)
+    else:
+        E = np.asarray(to_numpy(ext), dtype=float)
+    if E.ndim == 4 and E.shape[-2:] == (3, 4):
+        pad = np.zeros(E.shape[:2] + (1, 4))
+        pad[..., 0, 3] = 1.0
+        E = np.concatenate([E, pad], -2)
+    if E.ndim != 4 or E.shape[-2:] != (4, 4):
+        raise ValueError('extrinsics must be [C,N,4,4] or [N,C,4,4] (or 3x4), got {}'.format(E.shape))
+    if E.shape[:2] == (C, N):
+        return E.astype(float)
+    if E.shape[:2] == (N, C):
+        return E.transpose(1, 0, 2, 3).astype(float)
+    raise ValueError('extrinsics {} match neither [C,N]=({},{}) nor [N,C]'.format(E.shape[:2], C, N))
+
+
+def _affine_group(cgroup, flat):
+    """All-AffineCamera group -> (telephoto pinhole group, affine projection fn). The pinholes
+    (``AffineCamera.to_pinhole``) match the affine cameras to 0.01 px on the linear affine
+    triangulation of the data; final errors use the exact affine projection."""
+    from ..affine import AffineCamera, triangulate_affine
+    from ..cameras import CameraGroup
+    cams = list(cgroup.cameras)
+    aff = [isinstance(c, AffineCamera) for c in cams]
+    if not any(aff):
+        return None, None
+    if not all(aff):
+        raise ValueError('reconstruct_3d: the group mixes AffineCamera and pinhole cameras; convert '
+                         'the affine ones with AffineCamera.to_pinhole(support_points)')
+    X = to_numpy(triangulate_affine(cams, flat, min_cams=2)).reshape(-1, 3)
+    X = X[np.isfinite(X).all(-1)]
+    if len(X) < 4:
+        raise ValueError('reconstruct_3d: AffineCamera group but fewer than 4 points seen by 2 '
+                         'cameras; convert with AffineCamera.to_pinhole(support_points)')
+    lo, hi = np.percentile(X, 1, axis=0), np.percentile(X, 99, axis=0)
+    ext = hi - lo
+    corners = np.array([[lo[0] if i & 1 else hi[0], lo[1] if i & 2 else hi[1],
+                         lo[2] if i & 4 else hi[2]] for i in range(8)])
+    support = np.concatenate([corners - 0.25 * ext, corners + 0.25 * ext, X[::max(1, len(X) // 2000)]])
+    pin = CameraGroup([c.to_pinhole(support, max_error_px=0.01) for c in cams])
+    A = np.stack([to_numpy(c.A) for c in cams])
+    b = np.stack([to_numpy(c.b) for c in cams])
+
+    def proj(Xf):
+        return np.einsum('cij,nj->cni', A, Xf) + b[:, None]
+    return pin, proj
+
+
+def _error_drift(err, use, n_blocks=8, min_frames=3):
+    """Largest / smallest median error over blocks of frames (in order; the smallest at least
+    MIN_NOISE_PX). Errors that grow over the recording: cameras moved or sync broke."""
+    e = np.where(use, err, np.nan)
+    fr = np.nonzero(np.isfinite(e).any((0, 2)))[0]
+    nb = min(n_blocks, len(fr) // min_frames)
+    if nb < 4:
+        return None
+    meds = [float(np.nanmedian(e[:, b])) for b in np.array_split(fr, nb)]
+    return max(meds) / max(min(meds), MIN_NOISE_PX)
 
 
 @thread_guard
 def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='interior',
-                   robust=True, options=None, device='auto'):
+                   robust=True, options=None, device='auto', times=None, segments=None,
+                   extrinsics=None):
     """W6: 2D -> 3D. See the module docstring.
 
     Args:
-        cgroup: calibrated ``CameraGroup``.
+        cgroup: calibrated ``CameraGroup`` (pinhole / fisheye cameras, or only
+            ``AffineCamera`` s: these are triangulated through exact telephoto pinholes).
         points: ``C x N x J x 2`` (or ``C x N x 2``) pixels, NaN = missing.
         scores: optional ``C x N x J`` confidences: soft observation weights (clipped to [0, 1]).
         bones: optional ``[(a, b), ...]`` joint pairs with constant length (optim_points).
+            With ``bone_weight='auto'`` each bone's weight follows its measured length spread,
+            so non-rigid "bones" are barely enforced; a chunk whose refinement raises the
+            reprojection error above the noise floor is rejected (``bone_max_reproj_rise``).
         smooth: None (default, no smoothing) or a strength (optim_points ``scale_smooth``,
             pixel-equivalent and relative to the typical motion, so unit-free; 1-4 is light).
-        fill: ``'interior'`` (default: gaps between a joint's first and last observation are
-            filled, never extrapolated) or ``'none'``.
+        fill: ``'interior'`` (default: gaps of at most ``max_gap`` frames between a joint's
+            observations are filled, never extrapolated) or ``'none'``. For sparse label frames
+            (frames that are not consecutive) use ``'none'``, or pass ``times=``.
         robust: True (MSAC with a noise-derived tau) or False (score-weighted linear DLT).
-        options: overrides of ``_W6_DEFAULTS`` (``tau_px``, ``min_score``, ``n_iters``,
-            ``chunk_frames``, ``verdict``, ...).
+        options: overrides of ``_W6_DEFAULTS``:
+            ``tau_px`` (fixed MSAC threshold), ``min_score`` (hard score cut), ``min_views``
+            (2), ``min_joints_per_view`` (None; int, or a fraction of J if < 1: camera-frames
+            with fewer finite keypoints are dropped before triangulation), ``mask_out_of_bounds``
+            (True: observations outside the image are not used; counted in ``out_of_image``),
+            ``max_gap`` (10 frames; None = every interior gap) / ``max_gap_s`` (seconds, with
+            ``times``): longest gap filled, ``max_point_err_px`` (None: triangulated points whose
+            ``point_error`` exceeds it are removed before filling), ``cam_names`` (camera order of
+            ``points``; reindexed to the group, missing cameras are NaN), ``bone_weight``
+            ('auto' or a float, the 1.1 fixed weight was 2.0), ``bone_max_reproj_rise`` (0.5
+            noise floors; None = never reject), ``n_iters``, ``chunk_frames``, ``verdict``, ...
         device: ``'auto'`` (cuda if available; ``optim_points`` chunks of fewer than
             ``OPTIM_GPU_MIN_CELLS`` frames x joints stay on the CPU, where they are faster),
             ``'cpu'``, ``'cuda'``.
+        times: optional ``[N]`` frame times (s): gaps are interpolated on time and
+            ``max_gap_s`` applies.
+        segments: optional ``[N]`` segment ids (clips, windows, trials); a new segment starts
+            wherever the id changes. Filling, smoothing, bones and chunks never cross a segment.
+        extrinsics: optional per-frame world-to-camera matrices (moving cameras): ``[C,N,4,4]``
+            or ``[N,C,4,4]`` (3x4 accepted; ``[C,N]`` when C == N), or a list of N camera
+            groups; intrinsics come from ``cgroup``. ``bones`` / ``smooth`` are then skipped.
 
     Verdict rules:
         ``reconstructed_frac`` (triangulated (frame, joint) cells / all; warn < 0.5,
-        fail < 0.05); ``inlier_rate`` (inlier / observed; warn < 0.7, fail < 0.3);
-        ``cameras_unused`` (cameras with no observation or < 20 % of their observations used;
-        warn > 0); ``bone_cv`` (median bone-length CV, with ``bones``; warn > 0.1, fail > 0.3).
+        fail < 0.05); ``inlier_rate`` (inlier / observed inside the image; warn < 0.7,
+        fail < 0.3); ``cameras_unused`` (cameras with no observation or < 20 % of their
+        observations used; warn > 0); ``error_drift`` (largest / smallest median error over 8 blocks
+        of frames, the smallest at least 0.5 px: errors that change over the recording mean
+        moved cameras (pass ``extrinsics=``) or broken sync; warn > 3);
+        ``bone_cv`` (median robust bone-length CV 1.4826 MAD / median, with ``bones``; warn
+        above max(0.1, the triangulated CV), fail above max(0.3, 2 x the triangulated CV)).
     """
     from .. import geometry as G
     from .. import triangulation as T
@@ -276,118 +493,221 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
         pts = pts[:, :, None]
     if pts.ndim != 4 or pts.shape[-1] != 2:
         raise ValueError('points must be C x N x J x 2 or C x N x 2, got {}'.format(pts.shape))
-    C, N, J, _ = pts.shape
     names = list(cgroup.get_names())
+    cam_missing, cam_dropped = [], []
+    if opts['cam_names'] is not None:
+        pts, cam_missing, cam_dropped = reindex_cameras(pts, opts['cam_names'], names)
+    C, N, J, _ = pts.shape
     if C != len(names):
         raise ValueError('points have {} cameras, the group has {}'.format(C, len(names)))
     sw = None
     if scores is not None:
         sw = np.array(to_numpy(scores), dtype=float)
+        if opts['cam_names'] is not None:
+            sw = reindex_cameras(sw.reshape((len(opts['cam_names']),) + sw.shape[1:]),
+                                 opts['cam_names'], names)[0]
         if sw.size != C * N * J:
             raise ValueError('scores must be C x N x J = {}, got {}'.format((C, N, J), sw.shape))
         sw = np.clip(np.nan_to_num(sw.reshape(C, N, J), nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+    tms = None
+    if times is not None:
+        tms = np.asarray(to_numpy(times), dtype=float).reshape(-1)
+        if len(tms) != N:
+            raise ValueError('times must have one value per frame ({}), got {}'.format(N, len(tms)))
+    if opts['max_gap_s'] is not None and tms is None:
+        raise ValueError("options['max_gap_s'] needs times=")
+    runs = _segment_runs(N, segments)
+    E = _parse_extrinsics(extrinsics, C, N)
+    n_low_score = 0
     if opts['min_score'] is not None:
         if sw is None:
             raise ValueError("options['min_score'] needs scores=")
-        pts[sw < float(opts['min_score'])] = np.nan
+        low = (sw < float(opts['min_score'])) & np.isfinite(pts).all(-1)
+        n_low_score = int(low.sum())
+        pts[low] = np.nan
+    n_sparse_views = 0
+    if opts['min_joints_per_view'] is not None:
+        k = float(opts['min_joints_per_view'])
+        k = int(np.ceil(k * J)) if k < 1 else int(k)
+        nj = np.isfinite(pts).all(-1).sum(-1)                    # [C,N]
+        drop = (nj > 0) & (nj < k)
+        n_sparse_views = int(drop.sum())
+        pts[drop] = np.nan
     bones = [tuple(int(v) for v in b) for b in (bones or [])]
     for a, b in bones:
         if not (0 <= a < J and 0 <= b < J):
             raise ValueError('bone {} out of range for {} joints'.format((a, b), J))
+    flat = pts.reshape(C, -1, 2)
+    pin, affine_proj = _affine_group(cgroup, flat)
+    work = pin if pin is not None else cgroup
     observed = np.isfinite(pts).all(-1)
     diag = image_diagonal(cgroup)
-    cg = _group_on(cgroup, device)
+    cg = _group_on(work, device)
     P = G.pack(cg)
-    flat = pts.reshape(C, -1, 2)
+    oob = observed & ~to_numpy(T._valid_obs(P, torch.as_tensor(flat, device=P.device, dtype=P.dtype),
+                                            torch.as_tensor(flat, device=P.device, dtype=P.dtype),
+                                            True)).reshape(C, N, J)
+    mob = bool(opts['mask_out_of_bounds'])
+    usable = observed & ~oob if mob else observed
     swf = None if sw is None else sw.reshape(C, -1)
+    Ef = None if E is None else torch.as_tensor(E, device=P.device, dtype=P.dtype)
     settings = {'weighting': 'soft score weights, clipped to [0, 1], on the squared pixel error '
                              '(MSAC cost, refit, Gauss-Newton; optim_points residual x sqrt(s))'
                              if sw is not None else 'none (no scores)',
                 'min_score': opts['min_score'], 'robust': bool(robust), 'fill': fill,
-                'image_diagonal_px': diag, 'min_views': int(opts['min_views'])}
+                'image_diagonal_px': diag, 'min_views': int(opts['min_views']),
+                'min_joints_per_view': opts['min_joints_per_view'],
+                'mask_out_of_bounds': mob, 'max_gap': opts['max_gap'], 'max_gap_s': opts['max_gap_s'],
+                'max_point_err_px': opts['max_point_err_px'], 'n_segments': len(runs),
+                'per_frame_extrinsics': E is not None,
+                'cameras': 'affine (exact telephoto pinholes, AffineCamera.to_pinhole)'
+                           if pin is not None else 'packed'}
     fallbacks = []
+
+    def project(Xnj):
+        """[N,J,3] -> [C,N,J,2] pixels (NaN rows -> garbage, masked by the caller)."""
+        Xc = np.nan_to_num(Xnj)
+        if affine_proj is not None:
+            return affine_proj(Xc.reshape(-1, 3)).reshape(C, N, J, 2)
+        return to_numpy(G.project(P, torch.as_tensor(Xc, device=P.device, dtype=P.dtype),
+                                  extrinsics=Ef)[0]).reshape(C, N, J, 2)
 
     with timer('triangulate'):
         if robust:
             tau0 = max(10.0, opts['first_tau_diag_frac'] * diag) if diag else 20.0
-            r0 = T.triangulate_robust(P, flat, tau=tau0, scores=swf, min_inliers=opts['min_views'])
+            kw = dict(scores=swf, min_inliers=opts['min_views'], mask_out_of_bounds=mob,
+                      extrinsics=Ef)
+            r0 = T.triangulate_robust(P, flat, tau=tau0, **kw)
             nf = noise_floor(r0.errors, r0.inliers, diag)
             # 5 x noise floor, at least the 1.0 default (10 px) and never looser than the first-pass
             # gate (1 % of the diagonal): on real keypoints a 20 x rule gave 60-190 px and let poor
             # cameras pull the points
             tau = float(opts['tau_px']) if opts['tau_px'] is not None else \
                 float(min(max(float(opts['tau_noise_mult']) * nf, 10.0), max(tau0, 10.0)))
-            res = T.triangulate_robust(P, flat, tau=tau, scores=swf, min_inliers=opts['min_views'])
+            res = T.triangulate_robust(P, flat, tau=tau, **kw)
             X = to_numpy(res.p3d).reshape(N, J, 3)
             inl = to_numpy(res.inliers).reshape(C, N, J)
             settings.update(first_tau_px=tau0, noise_px=nf, noise_unit=_noise_unit(nf), tau_px=tau)
         else:
             w = None if swf is None else np.sqrt(swf)
-            X = to_numpy(T.triangulate_linear(P, flat, weights=w,
+            lin = np.where(usable.reshape(C, -1)[..., None], flat, np.nan)
+            X = to_numpy(T.triangulate_linear(P, lin, weights=w, extrinsics=Ef,
                                               min_cams=opts['min_views'])).reshape(N, J, 3)
-            inl = observed & np.isfinite(X).all(-1)[None]
+            inl = usable & np.isfinite(X).all(-1)[None]
             tau = None
+            nf = None
     have = np.isfinite(X).all(-1)                       # triangulated cells
     if robust:
         inl = inl & have[None]
 
-    scale = _rig_scale(cgroup)
+    def point_err(Xnj, inl_):
+        e = np.linalg.norm(project(Xnj) - pts, axis=-1)
+        e = np.where(inl_ & np.isfinite(Xnj).all(-1)[None], e, np.nan)
+        with np.errstate(all='ignore'), _quiet():
+            return np.nanmedian(e, axis=0), e
+    n_point_err = 0
+    if opts['max_point_err_px'] is not None and have.any():
+        pe0, _ = point_err(X, inl)
+        bad = have & (pe0 > float(opts['max_point_err_px']))
+        n_point_err = int(bad.sum())
+        X[bad] = np.nan
+        inl = inl & ~bad[None]
+        have = have & ~bad
+    if nf is None:
+        nf = noise_floor(point_err(X, inl)[1], diag=diag) if have.any() else MIN_NOISE_PX
+        settings['noise_px'] = nf
+
+    scale = _rig_scale(cgroup) if pin is None else float('nan')
     settings['rig_scale'] = scale
     optimise = bool(bones) or smooth is not None
+    if optimise and E is not None:
+        fallbacks.append('optim_points skipped: bones / smooth are not supported with per-frame '
+                         'extrinsics')
+        optimise = False
     keep = have.copy()
     if fill == 'interior':
-        span = np.zeros_like(have)
-        for j in range(J):
-            ok = np.nonzero(have[:, j])[0]
-            if len(ok):
-                span[ok[0]:ok[-1] + 1, j] = True
-        keep = span
-    n_chunks = 0
+        keep = _fill_keep(have, runs, None if opts['max_gap'] is None else int(opts['max_gap']),
+                          tms, opts['max_gap_s'])
+    n_chunks = n_rej = 0
     with timer('optim_points' if optimise else 'fill'):
+        base = _interior_fill(X, keep, runs, tms)
+        base[~keep] = np.nan
         if optimise and have.sum() >= 2:
             obs_in = np.where(inl[..., None], pts, np.nan)
-            tau_o = tau if tau is not None else 10.0 * _noise_unit(noise_floor(None))
+            tau_o = tau if tau is not None else 10.0 * _noise_unit(nf)
             # optim_points is a loop of small steps: a GPU only pays off for large chunks
             cg_o = cg
             if device in (None, 'auto') and str(cg.device).startswith('cuda') and \
                     min(N, int(opts['chunk_frames'])) * J < OPTIM_GPU_MIN_CELLS:
-                cg_o = _group_on(cgroup, 'cpu')
-            Xo, n_chunks = _optim_chunked(cg_o, obs_in, X, sw, bones,
-                                          0.0 if smooth is None else float(smooth), opts, tau_o,
-                                          keep)
+                cg_o = _group_on(work, 'cpu')
+            bone_w, bone_info = None, None
+            if bones:
+                if opts['bone_weight'] == 'auto':
+                    unit, _ = cg_o._optim_unit(X, obs_in)
+                    bone_w, bone_info = _auto_bone_weights(P, X, inl, bones, nf, unit)
+                else:
+                    bone_w = float(opts['bone_weight'])
+            rise = None if opts['bone_max_reproj_rise'] is None else \
+                float(opts['bone_max_reproj_rise']) * nf
+
+            def med_err(Xc, s, e):
+                Xs = np.full((N, J, 3), np.nan)
+                Xs[s:e] = np.where(have[s:e, :, None], Xc, np.nan)
+                ee = np.linalg.norm(project(Xs) - pts, axis=-1)[:, s:e]
+                m = inl[:, s:e] & have[None, s:e]
+                return float(np.median(ee[m])) if m.any() else float('nan')
+            Xo = np.full((N, J, 3), np.nan)
+            for s0, e0 in runs:
+                if not have[s0:e0].any():
+                    continue
+                Xs, nc, nr = _optim_chunked(
+                    cg_o, obs_in[:, s0:e0], X[s0:e0], None if sw is None else sw[:, s0:e0], bones,
+                    0.0 if smooth is None else float(smooth), opts, tau_o, keep[s0:e0],
+                    bone_w=bone_w,
+                    med_err=(lambda Xc, s, e, s0=s0: med_err(Xc, s0 + s, s0 + e)),
+                    max_rise=rise, base=base[s0:e0])
+                Xo[s0:e0] = Xs
+                n_chunks += nc
+                n_rej += nr
             final = Xo
+            if n_rej:
+                fallbacks.append('optim_points: {} of {} chunks rejected (median inlier error rose '
+                                 'by more than {:.3g} px); triangulated points kept there'.format(
+                                     n_rej, n_chunks, rise))
             settings['optim_points'] = {
-                'bones': bones, 'scale_length': opts['bone_weight'],
+                'bones': bones, 'bone_weight': opts['bone_weight'],
+                'bone_weights': None if bone_w is None else np.atleast_1d(bone_w).tolist(),
+                'bone_spread': bone_info,
                 'scale_smooth': 0.0 if smooth is None else float(smooth),
                 'reproj_error_threshold_px': tau_o, 'n_iters': int(opts['n_iters']),
                 'max_lr_px': opts['max_lr'], 'normalize': True,
                 'chunk_frames': int(opts['chunk_frames']), 'overlap_frames': int(opts['overlap_frames']),
-                'n_chunks': n_chunks,
+                'n_chunks': n_chunks, 'n_rejected_chunks': n_rej, 'max_reproj_rise_px': rise,
                 'bone_targets': 'median length over the frames where both joints are triangulated'}
         else:
             if optimise:
                 fallbacks.append('optim_points skipped: fewer than 2 triangulated cells')
-            final = _interior_fill(X) if fill == 'interior' else X.copy()
+            final = base if fill == 'interior' else X.copy()
             final[~keep] = np.nan
     filled = np.isfinite(final).all(-1) & ~have
     if not optimise:
         final[have] = X[have]
 
     # errors of every observation against the final points
-    fin_flat = final.reshape(-1, 3)
-    proj = to_numpy(cg.project(np.nan_to_num(fin_flat))).reshape(C, N, J, 2)
-    err = np.linalg.norm(proj - pts, axis=-1)
+    err = np.linalg.norm(project(final) - pts, axis=-1)
     err[~np.isfinite(final).all(-1)[None].repeat(C, 0)] = np.nan
     n_views = np.where(have, inl.sum(0), 0)
+    with np.errstate(all='ignore'), _quiet():
+        pe = np.nanmedian(np.where(inl & have[None], err, np.nan), axis=0)
 
     # report
     per_camera = {}
     unused = []
     for c, nm in enumerate(names):
-        n_obs = int(observed[c].sum())
+        n_obs = int(usable[c].sum())
         n_in = int(inl[c].sum())
         e = err[c][inl[c]]
-        per_camera[nm] = {'n_obs': n_obs, 'n_inliers': n_in,
+        per_camera[nm] = {'n_obs': n_obs, 'n_inliers': n_in, 'n_out_of_image': int(oob[c].sum()),
                           'usage': n_in / n_obs if n_obs else 0.0,
                           'median_err_px': float(np.median(e)) if e.size else None}
         if n_obs == 0 or n_in < 0.2 * n_obs:
@@ -396,32 +716,49 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     report = {
         'per_camera': per_camera,
         'cameras_unused': unused,
+        'cameras_missing': cam_missing, 'cameras_dropped': cam_dropped,
         'gaps': {'per_joint': gaps,
                  'missing_frac': float(1 - have.mean()) if have.size else 1.0,
                  'filled_frac': float(filled.mean()) if filled.size else 0.0,
                  'longest_gap': max([g['longest_gap'] for g in gaps], default=0),
+                 'longest_filled': int(max([g['longest_gap'] for g in _gap_stats(~filled)], default=0))
+                 if filled.any() else 0,
                  'extrapolated': 0},
+        'n_out_of_image': int(oob.sum()),
+        'n_removed': {'min_score': n_low_score, 'min_joints_per_view': n_sparse_views,
+                      'max_point_err_px': n_point_err},
         'noise_px': settings.get('noise_px'), 'tau_px': tau,
         'median_err_px': float(np.nanmedian(err[inl])) if inl.any() else None,
+        'median_point_error_px': float(np.nanmedian(pe)) if np.isfinite(pe).any() else None,
+        'two_view_frac': float(((n_views == 2) & have).sum() / max(have.sum(), 1)),
     }
+    drift = _error_drift(err, usable & have[None])
+    report['error_drift'] = drift
     rules = [
         Rule('reconstructed_frac', float(have.mean()) if have.size else 0.0, 0.5, 0.05,
              'share of (frame, joint) cells triangulated from >= {} views'.format(opts['min_views']),
              higher_is_worse=False),
-        Rule('inlier_rate', float(inl.sum() / max(observed.sum(), 1)), 0.7, 0.3,
-             'share of the observations used by the robust triangulation', higher_is_worse=False),
+        Rule('inlier_rate', float(inl.sum() / max(usable.sum(), 1)), 0.7, 0.3,
+             'share of the observations (inside the image) used by the triangulation',
+             higher_is_worse=False),
         Rule('cameras_unused', len(unused), 0, None,
              'cameras with no observations or < 20 % of them used: {}'.format(unused)),
+        Rule('error_drift', drift, 3.0, None,
+             'reprojection error changes over the recording (largest / smallest of 8 blocks): moved '
+             'cameras (pass extrinsics= for moving cameras) or broken sync'),
     ]
     if bones:
         cv_before = _bone_cv(X, bones)
         cv_after = _bone_cv(final, bones)
         med = float(np.nanmedian(cv_after)) if np.isfinite(cv_after).any() else float('nan')
+        med_tri = float(np.nanmedian(cv_before)) if np.isfinite(cv_before).any() else None
         report['bones'] = {'pairs': bones, 'cv': cv_after, 'cv_triangulated': cv_before,
-                           'median_cv': med,
-                           'median_cv_triangulated': float(np.nanmedian(cv_before))
-                           if np.isfinite(cv_before).any() else None}
-        rules.append(Rule('bone_cv', med, 0.1, 0.3, 'median coefficient of variation of bone lengths'))
+                           'median_cv': med, 'median_cv_triangulated': med_tri,
+                           'cv_std': _bone_cv_std(final, bones),
+                           'cv_definition': '1.4826 x MAD / median of each bone length'}
+        ref = med_tri if med_tri is not None and np.isfinite(med_tri) else 0.0
+        rules.append(Rule('bone_cv', med, max(0.1, ref), max(0.3, 2 * ref),
+                          'median robust bone-length CV (vs {:.3g} triangulated)'.format(ref)))
     if not have.any():
         rules.append(Rule('no_points', True, fail_at=True,
                           explain='no point is seen by {} cameras'.format(opts['min_views'])))
@@ -431,12 +768,26 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
     sq = (lambda a: a[..., 0]) if squeeze else (lambda a: a)
     return Reconstruction(
         points3d=out, errors=sq(err), n_views=sq(n_views), inliers=sq(inl), filled=sq(filled),
+        point_error=sq(pe), out_of_image=sq(oob),
         report=report, verdict=verdict, reasons=reasons, settings=settings,
         provenance=provenance('reconstruct_3d',
                               inputs={'shape': [C, N, J], 'cameras': names,
                                       'scores': scores is not None, 'bones': len(bones),
-                                      'smooth': smooth},
+                                      'smooth': smooth, 'times': times is not None,
+                                      'segments': segments is not None,
+                                      'extrinsics': extrinsics is not None},
                               fallbacks=fallbacks, timings=timer.times))
+
+
+class _quiet:
+    def __enter__(self):
+        import warnings
+        self._w = warnings.catch_warnings()
+        self._w.__enter__()
+        warnings.simplefilter('ignore', RuntimeWarning)
+
+    def __exit__(self, *a):
+        self._w.__exit__(*a)
 
 
 # ================================================================== W7 associate_views

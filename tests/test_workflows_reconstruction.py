@@ -245,3 +245,156 @@ def test_offsets_from_audio_files(tmp_path):
                              reference='a', options={'audio_sr': sr})
     assert res.verdict == 'ok', res.reasons
     assert abs(res.offsets['b'] - 0.75) < 1e-3
+
+
+# ------------------------------------------------------------------ W6 options (1.1 real-data fixes)
+
+def _moving(true, p3d, deg_per_frame=0.02):
+    """Per-frame extrinsics [C,N,4,4]: every camera pans at its own rate (the rig is not rigid)."""
+    from aniposelib import geometry as G
+    E0 = synth.to_np(G.pack(true).extrinsics())
+    C, N = E0.shape[0], p3d.shape[0]
+    E = np.empty((C, N, 4, 4))
+    for c in range(C):
+        for t in range(N):
+            a = np.deg2rad(deg_per_frame * t * (c - (C - 1) / 2))
+            M = np.eye(4)
+            M[:3, :3] = [[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]]
+            E[c, t] = M @ E0[c]
+    p2d = synth.to_np(G.project(G.pack(true), p3d, extrinsics=E)[0])
+    return E, p2d
+
+
+def test_reconstruct_max_gap_segments_times(person):
+    true, p3d, p2d, bones = person
+    q = p2d.copy()
+    q[:, 50:80, 2] = np.nan                       # a 30-frame gap of joint 2
+    r = W.reconstruct_3d(true, q)
+    assert np.isnan(r.points3d[50:80, 2]).all()                   # default max_gap = 10 frames
+    assert np.isfinite(r.points3d[40:46, 3]).all()                # short gaps still filled
+    r = W.reconstruct_3d(true, q, options={'max_gap': None})
+    assert np.isfinite(r.points3d[50:80, 2]).all()
+    # times: interpolation on time, max_gap_s in seconds
+    t = np.arange(q.shape[1]) / 30.0
+    r = W.reconstruct_3d(true, q, times=t, options={'max_gap': None, 'max_gap_s': 0.5})
+    assert np.isnan(r.points3d[50:80, 2]).all() and np.isfinite(r.points3d[40:46, 3]).all()
+    with pytest.raises(ValueError):
+        W.reconstruct_3d(true, q, options={'max_gap_s': 0.5})
+    # segments: a gap at a segment boundary is never bridged, also with bones
+    seg = np.r_[np.zeros(43), np.ones(q.shape[1] - 43)]
+    for b in (None, bones):
+        r = W.reconstruct_3d(true, p2d, segments=seg, bones=b, options={'n_iters': 40})
+        assert np.isnan(r.points3d[40:43, 3]).all() and np.isnan(r.points3d[43:46, 3]).all()
+        assert np.isfinite(r.points3d[30:40, 3]).all()
+    assert r.settings['n_segments'] == 2
+
+
+def test_reconstruct_moving_extrinsics(person):
+    true, p3d, _, _ = person
+    E, p2d = _moving(true, p3d)
+    p2d = synth.add_noise(p2d, 0.5, seed=1)
+    static = W.reconstruct_3d(true, p2d, fill='none')
+    moving = W.reconstruct_3d(true, p2d, fill='none', extrinsics=E)
+    assert any('error_drift' in x for x in static.reasons), static.reasons
+    assert moving.verdict == 'ok', moving.reasons
+    assert np.nanmedian(_rel(true, moving.points3d, p3d)) < 1e-3
+    assert np.nanmedian(_rel(true, static.points3d, p3d)) > 5 * np.nanmedian(_rel(true, moving.points3d, p3d))
+    # [N,C,4,4], 3x4 and linear triangulation are accepted too
+    r = W.reconstruct_3d(true, p2d, fill='none', robust=False, extrinsics=E.transpose(1, 0, 2, 3)[..., :3, :])
+    np.testing.assert_allclose(np.nanmedian(_rel(true, r.points3d, p3d)), 0, atol=1e-3)
+    with pytest.raises(ValueError):
+        W.reconstruct_3d(true, p2d, extrinsics=E[:, :5])
+
+
+def test_reconstruct_view_point_filters(person):
+    true, p3d, p2d, _ = person
+    # min_joints_per_view: camera-frames with few keypoints are dropped
+    q = p2d.copy()
+    q[0, 20:30, 2:] = np.nan                       # camera 0 sees only 2 joints there
+    r = W.reconstruct_3d(true, q, options={'min_joints_per_view': 0.5})
+    assert r.report['n_removed']['min_joints_per_view'] >= 10
+    assert not r.inliers[0, 20:30].any()
+    # per-point error and a gate on it
+    r = W.reconstruct_3d(true, p2d)
+    assert r.point_error.shape == p3d.shape[:2]
+    assert np.all(np.isnan(r.point_error[r.filled]))
+    thr = float(np.nanpercentile(r.point_error, 80))
+    g = W.reconstruct_3d(true, p2d, fill='none', options={'max_point_err_px': thr})
+    assert np.nanmax(g.point_error) <= thr + 1e-9
+    assert g.report['n_removed']['max_point_err_px'] > 0
+    # out-of-image observations are counted separately, and used with mask_out_of_bounds=False
+    w, h = synth.to_np(true.cameras[1].get_size())
+    q = p2d.copy()
+    ok = np.isfinite(q[1, :, 0, 0])
+    q[1, ok, 0, 0] = w + 2.0
+    r = W.reconstruct_3d(true, q)
+    assert r.report['per_camera'][true.get_names()[1]]['n_out_of_image'] == ok.sum()
+    assert r.out_of_image[1, ok, 0].all() and not r.inliers[1, ok, 0].any()
+    r2 = W.reconstruct_3d(true, q, options={'mask_out_of_bounds': False})
+    assert r2.report['n_out_of_image'] == ok.sum() and r2.settings['mask_out_of_bounds'] is False
+
+
+def test_reconstruct_cam_names(person):
+    true, p3d, p2d, _ = person
+    names = true.get_names()
+    order = [3, 0, 4, 1, 2]
+    ref = W.reconstruct_3d(true, p2d, fill='none')
+    r = W.reconstruct_3d(true, p2d[order], fill='none',
+                         options={'cam_names': [names[i] for i in order]})
+    np.testing.assert_allclose(r.points3d, ref.points3d, atol=1e-9)
+    r = W.reconstruct_3d(true, p2d[[0, 1, 2, 3]], fill='none',
+                         options={'cam_names': names[:4] + []})
+    assert r.report['cameras_missing'] == [names[4]]
+    r = W.reconstruct_3d(true, np.concatenate([p2d, p2d[:1]]), fill='none',
+                         options={'cam_names': names + ['extra']})
+    assert r.report['cameras_dropped'] == ['extra']
+
+
+def test_reconstruct_affine_group():
+    from aniposelib.affine import AffineCamera
+    from aniposelib.cameras import CameraGroup
+    rng = np.random.default_rng(0)
+    cams = []
+    for c in range(4):
+        a = 2 * np.pi * c / 4
+        d = np.array([np.cos(a), np.sin(a), 0.4])
+        d /= np.linalg.norm(d)
+        u = np.cross(d, [0, 0, 1.0]); u /= np.linalg.norm(u)
+        v = np.cross(d, u)
+        A = 900 * np.stack([u, v]) + rng.normal(scale=5, size=(2, 3))
+        cams.append(AffineCamera(A, np.array([640.0, 512.0]), size=(1280, 1024), name='c{}'.format(c)))
+    cg = CameraGroup(cams)
+    X = rng.normal(scale=0.2, size=(60, 3))
+    p2d = np.stack([X @ c.A.detach().numpy().T + c.b.detach().numpy() for c in cams])
+    p2d += rng.normal(scale=0.3, size=p2d.shape)
+    p2d[1, 5] += 80.0                               # an outlier
+    r = W.reconstruct_3d(cg, p2d)
+    assert r.verdict == 'ok', r.reasons
+    assert 'affine' in r.settings['cameras']
+    assert np.median(np.linalg.norm(r.points3d - X, axis=-1)) < 2e-3
+    assert not r.inliers[1, 5]
+    mixed = CameraGroup([cams[0], synth.load_rig('fisheye_5cam').cameras[0]])
+    with pytest.raises(ValueError, match='to_pinhole'):
+        W.reconstruct_3d(mixed, p2d[:2])
+
+
+def test_reconstruct_bones_auto(person):
+    """'auto' bone weights follow each bone's spread: rigid bones are enforced, a stretchy one is
+    not; on noise-free labels the refinement may not raise the reprojection error."""
+    true, p3d, p2d, bones = person
+    q = p3d.copy()
+    a, b = bones[0]
+    stretch = 1 + 0.25 * np.sin(np.arange(len(q)) / 5.0)            # a non-rigid "bone"
+    q[:, b] = q[:, a] + (q[:, b] - q[:, a]) * stretch[:, None]
+    obs = synth.add_noise(synth.project(true, q), 0.7, seed=4)
+    r = W.reconstruct_3d(true, obs, bones=bones, options={'n_iters': 100})
+    w = r.settings['optim_points']['bone_weights']
+    assert w[0] < 0.01 * np.median(w[1:])
+    assert r.verdict == 'ok', r.reasons                              # bone_cv relative to triangulated
+    L = np.linalg.norm(r.points3d[:, a] - r.points3d[:, b], axis=-1)
+    Lt = np.linalg.norm(q[:, a] - q[:, b], axis=-1)
+    assert np.nanmedian(np.abs(L - Lt) / Lt) < 0.02                  # the stretch is kept
+    # exact labels: the bone term may not pull the points off their exact projections
+    exact = synth.project(true, p3d)
+    r = W.reconstruct_3d(true, exact, bones=bones, options={'n_iters': 100, 'bone_weight': 2.0})
+    assert np.nanmedian(r.errors[r.inliers]) < 0.3
