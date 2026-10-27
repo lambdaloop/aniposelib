@@ -1340,8 +1340,9 @@ class PointObject(CalibrationObject):
                 rvec, tvec = cv2.solvePnPRefineLM(objp, pts, K, D, rvec, tvec)
             except cv2.error:
                 pass
-            if tvec.ravel()[2] <= 0:
-                continue
+            R = cv2.Rodrigues(rvec)[0]
+            if np.median((objp.reshape(-1, 3) @ R.T + tvec.reshape(1, 3))[:, 2]) <= 0:
+                continue   # the object behind the camera
             return rvec, tvec
         return None, None
 
