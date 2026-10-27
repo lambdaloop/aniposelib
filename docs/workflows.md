@@ -218,6 +218,8 @@ scaled = result.cgroup           # a rescaled copy; the original is left alone
 
 It measures the scale in many frames separately and takes the middle value. If those measurements disagree too much,
 it refuses (`result.accepted` is False and the verdict is `'fail'`) rather than give you a scale it doesn't trust.
+With a board, only corners more than two squares apart are compared: on close corners, small detection errors make the
+board look slightly too big. To use every pair as before 1.1, pass `options={'board_kwargs': {'min_pair_dist': None}}`.
 `align='ground'` also turns the calibration so that the floor is flat at height zero.
 
 With known lengths, the lengths are measured again on the rescaled calibration with a stricter cut-off. If they don't

@@ -138,6 +138,36 @@ def test_w3_board_points_from_videos(monkeypatch, tmp_path):
         estimate_scale(true, board=board, board_points={true.get_names()[0]: str(tmp_path / 'missing.mp4')})
 
 
+def test_w3_board_short_pairs_dropped_by_default():
+    """``min_pair_dist='auto'`` (default): only corner pairs more than two squares apart (the motor
+    observatory's 50 mm gate on its 24 mm board). Short pairs inflate the triangulated distance under
+    corner noise (scale biased low: motobs W2 rig + project detections 0.27 % -> 0.16 % vs the reference)."""
+    from aniposelib import scale as S
+    from aniposelib.boards import CharucoBoard
+    board = CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, units='mm')
+    objp = board.get_object_points().reshape(-1, 3)
+    td = np.linalg.norm(objp[:, None] - objp[None], axis=-1)[np.triu_indices(len(objp), 1)]
+    assert abs(S._auto_min_pair_dist(board, td) - 48) < 1e-3
+    small = CharucoBoard(3, 3, 24, 18, marker_bits=4, dict_size=50)     # 2 x 2 corners: keep the side pairs
+    o3 = small.get_object_points().reshape(-1, 3)
+    t3 = np.linalg.norm(o3[:, None] - o3[None], axis=-1)[np.triu_indices(len(o3), 1)]
+    assert (t3 > S._auto_min_pair_dist(small, t3)).all()
+    two = synth.load_rig('allen_7cam').subset_cameras([0, 3])
+    new, old = [], []
+    for seed in (1, 2, 3):
+        rows = synth.board_rows(two, board, n_frames=30, noise=4.0, seed=seed)
+        r = estimate_scale(two, board=board, board_points=rows)
+        r0 = estimate_scale(two, board=board, board_points=rows, options={'board_kwargs': {'min_pair_dist': None}})
+        assert r.accepted and r0.accepted
+        assert r.report['stats']['n_pairs'] < r0.report['stats']['n_pairs']
+        new.append(r.scale - 1)
+        old.append(r0.scale - 1)
+    assert np.mean(old) < -1e-3                      # all pairs: biased low
+    assert abs(np.mean(new)) < 0.5 * abs(np.mean(old))
+    with pytest.raises(ValueError):
+        S.from_board(two, rows, board, min_pair_dist='half')
+
+
 # ------------------------------------------------------------------ W2
 
 def test_w2_intrinsics_gate_share_and_never_raises(mo):

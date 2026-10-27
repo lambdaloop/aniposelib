@@ -2055,7 +2055,8 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
       indices in every camera), stopping once ``options['max_frames']`` (200; None = no limit)
       frames show the board in at least two cameras; ``report['detection']`` says what was read;
       also ``object=`` + ``object_points=`` for a
-      :class:`~aniposelib.boards.PointObject`): ``scale.from_board``;
+      :class:`~aniposelib.boards.PointObject`): ``scale.from_board`` (corner pairs more than two squares
+      apart; ``options={'board_kwargs': {'min_pair_dist': None}}`` = every pair, the 1.1 pre-release);
     - ``lengths=dict(points=[C,N,J,2], pairs=[(a, b), ...], ref=[...], joints=None)``:
       ``scale.from_lengths`` (MSAC threshold 5 noise units, >= min(3, C) agreeing views); the bones
       are then re-measured on the scaled rig with a threshold half as large
