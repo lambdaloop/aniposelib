@@ -110,7 +110,7 @@ def test_w3_board_points_from_videos(monkeypatch, tmp_path):
     seen = {}
 
     def fake_detect(board_, videos, **kw):
-        seen.update(kw, videos=videos)
+        seen.update(kw, videos=videos, kwargs=board_.detector_kwargs, name=board_.detector_name)
         kw['info'].update(stopped='end')
         return rows
     monkeypatch.setattr(B, 'detect_videos', fake_detect)
@@ -125,6 +125,11 @@ def test_w3_board_points_from_videos(monkeypatch, tmp_path):
     assert seen['min_cameras'] == 2 and seen['prefix'] == 0
     det = res.report['detection']
     assert det['sampling'] == 'sequential' and det['frame_indices'] == seen['frame_indices']
+    estimate_scale(true, board=board, board_points=vids, options={'detector': 'deepcharuco'})
+    assert seen['name'] == 'deepcharuco' and seen['kwargs'] == {'scale': 'auto'}     # frame-size input scale
+    estimate_scale(true, board=board, board_points=vids,
+                   options={'detector': 'deepcharuco', 'detector_kwargs': {'scale': 0.3}})
+    assert seen['kwargs'] == {'scale': 0.3}
     with pytest.raises(ValueError):
         estimate_scale(true, board=board, board_points={'nope': 'x.mp4'})
     with pytest.raises(FileNotFoundError):

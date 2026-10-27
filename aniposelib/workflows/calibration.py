@@ -297,7 +297,12 @@ def _detect_videos(videos, board, det, opts, names, *, max_boards=None, max_fram
     Returns per-camera rows (``framenum = (segment, frame)``) and a summary dict."""
     from ..boards import detect_videos
     from ..cameras import _board_with_detector, _is_index_seq
-    b = board if det is None else _board_with_detector(board, det, opts.get('detector_kwargs'))
+    dkw = opts.get('detector_kwargs')
+    if det == 'deepcharuco':
+        # input scale from the frame size unless given (scale 1 misses most boards in >= 1080p)
+        dkw = dict(getattr(board, 'detector_kwargs', None) or {}) if dkw is None else dict(dkw)
+        dkw.setdefault('scale', 'auto')
+    b = board if det is None else _board_with_detector(board, det, dkw)
     nw = _n_workers(opts.get('n_workers'))
     fi = opts.get('frame_indices')
     C = len(videos)
@@ -632,6 +637,15 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
     - ``bridge_inlier_frac`` (with ``bridge_points``): smallest share of a bridged component's
       bridge observations that the final rig explains; warn below 0.5, fail below 0.2. With a
       bridge, the board rules use the board observations alone (re-triangulated), not the joint BA.
+
+    Video detection (``options``): the videos of all cameras are read together, front to back
+    (no seeking; video ``j`` of every camera is one synchronised segment), and the board is
+    detected in every ``skip``-th frame (20), in ``n_frames`` evenly spaced frames, or in
+    ``frame_indices`` (one int sequence, or the per-camera / per-video forms of
+    ``CameraGroup.get_rows_videos``, which use the per-video reader). Reading stops once every
+    camera has ``max_boards`` boards (200; None = read everything). ``n_workers``: decoding /
+    OpenCV-detection threads (``'auto'`` = up to 8). ``settings['detection']`` reports what was
+    read and why it stopped. A missing video raises ``FileNotFoundError``.
 
     ``options['focal_guess']`` (a float or ``{camera name: f}``, px) adds focal starts to the lens
     ladder (phones / unusual lenses); ``prior_sigma_logf`` / ``prior_sigma_k`` may be
@@ -1959,8 +1973,11 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
     Exactly one scale source:
 
     - ``board`` + ``board_points`` (rows, ``[C,F,K,2]`` corners, or videos ``{camera name: video
-      | [videos]}``, detected as in W1; ``options['n_frames']`` frames per video, the same indices
-      in every camera; also ``object=`` + ``object_points=`` for a
+      | [videos]}``, detected as in W1: synchronised videos read front to back together, every
+      ``options['skip']``-th frame (20) or ``options['n_frames']`` evenly spaced frames (the same
+      indices in every camera), stopping once ``options['max_frames']`` (200; None = no limit)
+      frames show the board in at least two cameras; ``report['detection']`` says what was read;
+      also ``object=`` + ``object_points=`` for a
       :class:`~aniposelib.boards.PointObject`): ``scale.from_board``;
     - ``lengths=dict(points=[C,N,J,2], pairs=[(a, b), ...], ref=[...], joints=None)``:
       ``scale.from_lengths`` (MSAC threshold 5 noise units, >= min(3, C) agreeing views); the bones
