@@ -400,12 +400,12 @@ def _kb_poly(th, d, terms=None):
     return thd, dthd
 
 
-def _kb(x, y, d, jac=False, eps=FISHEYE_EPS):
+def _kb(x, y, d, jac=False, eps=FISHEYE_EPS, terms=None):
     r2 = x * x + y * y
     r_ok = r2 >= eps * eps
     r = torch.sqrt(torch.where(r_ok, r2, torch.ones_like(r2)))
     th = torch.atan(r)
-    thd, dthd = _kb_poly(th, d)
+    thd, dthd = _kb_poly(th, d, terms=None if terms is None else terms[:4])
     s = torch.where(r_ok, thd / r, torch.ones_like(r))
     xd, yd = s * x, s * y
     if not jac:
@@ -420,19 +420,33 @@ def _kb(x, y, d, jac=False, eps=FISHEYE_EPS):
 
 
 def _models_present(P):
+    cached = getattr(P, '_static_models', None)      # see freeze_static
+    if cached is not None:
+        return cached
     m = P.model
     return bool((m == 0).any()), bool((m == 1).any())
+
+
+def freeze_static(P):
+    """Cache the host-side facts the kernels look up on every call (which lens models are
+    present, which distortion terms are nonzero) on ``P``, for loops that project with fixed,
+    detached cameras (no per-call host sync on a GPU). Returns ``P``."""
+    P._static_models = None
+    P._static_models = _models_present(P)
+    P._static_terms = _dist_terms(P.dist, 8)
+    return P
 
 
 def _distort_norm(P, x, y, jac=False):
     """Normalised [C,N] -> distorted normalised, per camera model."""
     has_b, has_k = _models_present(P)
+    terms = getattr(P, '_static_terms', None)
     if has_b and not has_k:
-        return _brown(x, y, P.dist, jac)
+        return _brown(x, y, P.dist, jac, terms=terms)
     if has_k and not has_b:
-        return _kb(x, y, P.dist, jac)
-    ob = _brown(x, y, P.dist, jac)
-    ok = _kb(x, y, P.dist, jac)
+        return _kb(x, y, P.dist, jac, terms=terms)
+    ob = _brown(x, y, P.dist, jac, terms=terms)
+    ok = _kb(x, y, P.dist, jac, terms=terms)
     is_k = _col(P.model == 1)
     if not jac:
         return tuple(torch.where(is_k, a, b) for a, b in zip(ok, ob))
