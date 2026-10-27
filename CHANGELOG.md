@@ -7,6 +7,21 @@
 - **`triangulation.triangulate_robust` / `triangulate_possible` do the lens-fold / ray-consistency check** (`check_invertible=True`, plan 04 decision 24), formerly only in the `CameraGroup` wrappers; function and method now agree. Results are unchanged where no lens folds; for strongly barrel-distorted lenses the function results change like the method's did in 1.0. `check_invertible=False` restores the 1.0 function behaviour.
 - `triangulate_robust(scores=...)`: confidences as soft weights (clipped to [0, 1]) in the MSAC hypothesis cost, the inlier refit and the Gauss-Newton refinement (and the IRLS / reject fits). New keyword; no default change.
 - **`optim_points(normalize=True)` default (plan 04 decision 24, plan 05 §6.3).** The optimisation runs in pixel-equivalent units (points parametrised as `center + u * q`, `u` = median z/f at the points), so its result no longer depends on the rig's units (mm vs m vs km give the same answer; before, the Adam step `max_lr` and the bone/smoothness weights were in world units). Bone targets are fixed at a robust per-bone median (frames where both joints are triangulated) instead of free parameters clipped across bones, and the bone term is a squared pixel-equivalent residual (`10 * scale_length`), so bone constraints now tighten bone lengths within a short budget (the 1.0 target `test_optim_points_tightens_bones` passes). Smoothness is `0.01 * scale_smooth / mean|diff|` on pixel-equivalent differences (a light default). `normalize=False` restores the 1.0 loss and parametrisation exactly.
+- **Calibration workflows (1.1, plan 05 W1-W4):** `aniposelib.calibrate_from_board` (boards and the new
+  `boards.PointObject`: known-3D-points objects, moving wands with per-view DLT intrinsics or static landmarks that
+  define the world frame), `calibrate_from_points`, `estimate_scale`, `evaluate_calibration`. Results carry a
+  noise-relative verdict (`'ok' | 'warn' | 'fail'`) with reasons and every derived threshold in `.settings`;
+  calibrations unpack as `cgroup, result = ...`. A disconnected board graph is a `'fail'` with per-component groups;
+  `bridge_points=` solves one 6-DoF pose per extra component.
+- **`utils.get_initial_extrinsics` / `CameraGroup.calibrate_rows` route through `init.board` (decision 22):**
+  connected graphs give exactly the 1.0 result (same spanning tree and per-edge estimate, `tree='classic'`), plus a
+  robust fallback for edges where the classic estimate raises or is non-finite (`method='classic'` disables it).
+  Disconnected graphs still raise `ValueError`, now listing the components; `disconnected='components'` opts in to
+  per-component gauges. `init.board.initial_extrinsics(tree=)` is new (default `'max'`, unchanged).
+- **`init.calibrate_from_points` is an alias of the workflow** (same signature and `(cgroup, RecipeReport)` return).
+  Changes: the robust refinement uses the noise-normalised threshold schedule (coarse round relative to the image
+  diagonal, then multiples of the noise floor; identical to the 1.0 schedule for 0.5 px noise), `rng=None` now means
+  seed 0, and `report.scale` is a `workflows.ScaleEstimate` (`.details['align']` as before).
 - **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
   (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
   (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite

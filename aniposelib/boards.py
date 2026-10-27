@@ -1192,3 +1192,230 @@ def solve_board_pnp(objp, imgp, K, D):
             pass
         return rvec, tvec
     return None, None
+
+
+
+# ------------------------------------------------------------------ generic 3D objects
+
+def _dlt_projection(objp, imgp):
+    """Normalised (Hartley) DLT: 3x4 ``P`` with ``imgp ~ P [objp; 1]`` from >= 6 points."""
+    X = np.asarray(objp, dtype='float64').reshape(-1, 3)
+    x = np.asarray(imgp, dtype='float64').reshape(-1, 2)
+    mx, mX = x.mean(0), X.mean(0)
+    sx = np.sqrt(2) / max(np.mean(np.linalg.norm(x - mx, axis=1)), 1e-12)
+    sX = np.sqrt(3) / max(np.mean(np.linalg.norm(X - mX, axis=1)), 1e-12)
+    Tx = np.array([[sx, 0, -sx * mx[0]], [0, sx, -sx * mx[1]], [0, 0, 1]])
+    TX = np.eye(4)
+    TX[:3, :3] *= sX
+    TX[:3, 3] = -sX * mX
+    xn = (x - mx) * sx
+    Xn = np.hstack([(X - mX) * sX, np.ones((len(X), 1))])
+    A = np.zeros((2 * len(X), 12))
+    A[0::2, 0:4] = Xn
+    A[0::2, 8:12] = -xn[:, :1] * Xn
+    A[1::2, 4:8] = Xn
+    A[1::2, 8:12] = -xn[:, 1:] * Xn
+    _, _, Vt = np.linalg.svd(A)
+    Pn = Vt[-1].reshape(3, 4)
+    return np.linalg.solve(Tx, Pn @ TX)
+
+
+def _coplanar(points, tol=1e-3):
+    """Are the points (nearly) coplanar? Smallest / largest singular value of the centred cloud."""
+    X = np.asarray(points, dtype='float64').reshape(-1, 3)
+    if len(X) < 4:
+        return True
+    s = np.linalg.svd(X - X.mean(0), compute_uv=False)
+    return bool(s[-1] <= tol * max(s[0], 1e-300))
+
+
+class PointObject(CalibrationObject):
+    """Any calibration object with **known 3D points** (plan 05 W1b): a non-planar wand or
+    fixture, a 3D-printed target, surveyed landmarks. There is no detector: the 2D points are
+    annotations (a dense ``C x F x K x 2`` array, NaN = not annotated; see
+    :meth:`annotations_from_dicts`), and :func:`aniposelib.workflows.calibrate_from_board`
+    takes them in place of board detections.
+
+    Parameters
+    ----------
+    points3d : (K, 3) array
+        Known coordinates of the object points, in ``units``.
+    names : list of K str, optional
+        Point names (for dict annotations).
+    static : bool
+        False: a rigid object moved around (one pose per frame, like a board). True: fixed
+        landmarks (one pose) that define the world frame and the metric scale.
+    units : str, optional
+        Unit of ``points3d`` (informational, written to ``cgroup.metadata['units']``).
+
+    ``get_object_points()`` is ``points3d``; ``estimate_pose_points(camera, corners, ids)`` is a
+    PnP (>= 4 points; IPPE for planar objects, SQPnP/EPnP + LM refinement otherwise).
+    ``planar`` says whether the points are coplanar (then the usual planar intrinsics
+    initialisation applies; otherwise :meth:`estimate_intrinsics` uses a per-view DLT).
+    """
+
+    def __init__(self, points3d, names=None, static=False, units=None):
+        P = np.asarray(points3d, dtype='float64')
+        if P.ndim != 2 or P.shape[1] != 3 or len(P) < 4:
+            raise ValueError('points3d must be K x 3 with K >= 4, got shape {}'.format(P.shape))
+        if not np.all(np.isfinite(P)):
+            raise ValueError('points3d must be finite')
+        self.points3d = P
+        self.n_points = len(P)
+        self.total_size = len(P)
+        if names is not None:
+            names = [str(n) for n in names]
+            if len(names) != len(P) or len(set(names)) != len(names):
+                raise ValueError('names must be {} unique strings'.format(len(P)))
+        self.names = names
+        self.static = bool(static)
+        self.units = units
+        self.planar = _coplanar(P)
+        self.ids = np.arange(len(P))
+        self.empty_detection = np.full((len(P), 1, 2), np.nan)
+
+    def __repr__(self):
+        return 'PointObject({} points, {}, static={}, units={!r})'.format(
+            self.n_points, 'planar' if self.planar else 'non-planar', self.static, self.units)
+
+    # ---------------------------------------------- CalibrationObject interface
+    def draw(self, size):
+        raise NotImplementedError('a PointObject cannot be drawn')
+
+    def detect_image(self, image):
+        raise NotImplementedError(
+            'PointObject has no detector: annotate the points and pass a C x F x K x 2 array '
+            '(see PointObject.annotations_from_dicts) to calibrate_from_board')
+
+    def get_object_points(self):
+        return self.points3d.copy()
+
+    def get_empty_detection(self):
+        return np.copy(self.empty_detection)
+
+    def get_size(self):
+        return (self.n_points,)
+
+    def fill_points(self, corners, ids):
+        out = self.get_empty_detection()
+        if corners is None or len(corners) == 0:
+            return out
+        corners = np.asarray(corners, dtype='float64').reshape(-1, 2)
+        if ids is None:
+            if len(corners) != self.n_points:
+                raise ValueError('corners without ids must have one row per object point')
+            return corners.reshape(-1, 1, 2)
+        ids = np.asarray(ids).astype('int64').ravel()
+        good = (ids >= 0) & (ids < self.n_points)
+        out[ids[good], 0] = corners[good]
+        return out
+
+    def estimate_pose_points(self, camera, corners, ids=None, min_points=4):
+        """Pose ``(rvec, tvec)`` of the object in camera coordinates by PnP, or ``(None, None)``."""
+        if corners is None:
+            return None, None
+        filled = self.fill_points(corners, ids).reshape(-1, 2)
+        good = np.all(np.isfinite(filled), axis=1)
+        if good.sum() < max(4, min_points):
+            return None, None
+        pts, K, D, _ = pnp_inputs(camera, filled[good].reshape(-1, 1, 2))
+        pts = np.asarray(pts, dtype='float64').reshape(-1, 1, 2)
+        objp = self.points3d[good]
+        ok = np.all(np.isfinite(pts), axis=(1, 2))
+        if ok.sum() < 4:
+            return None, None
+        pts, objp = pts[ok], objp[ok]
+        if self.planar or _coplanar(objp):
+            return solve_board_pnp(objp, pts, K, D)
+        objp = np.ascontiguousarray(objp.reshape(-1, 1, 3))
+        D = np.asarray(D, dtype='float64').ravel()
+        for flags in (cv2.SOLVEPNP_SQPNP, cv2.SOLVEPNP_EPNP, cv2.SOLVEPNP_ITERATIVE):
+            try:
+                ok, rvec, tvec = cv2.solvePnP(objp, pts, K, D, flags=flags)
+            except cv2.error:
+                continue
+            if not ok or not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
+                continue
+            try:
+                rvec, tvec = cv2.solvePnPRefineLM(objp, pts, K, D, rvec, tvec)
+            except cv2.error:
+                pass
+            R = cv2.Rodrigues(rvec)[0]
+            if np.median((objp.reshape(-1, 3) @ R.T + tvec.reshape(1, 3))[:, 2]) <= 0:
+                continue   # the object behind the camera
+            return rvec, tvec
+        return None, None
+
+    # ---------------------------------------------- annotations
+    def annotations_from_dicts(self, per_cam, cam_names=None, return_frames=False):
+        """``{cam: {frame: {name_or_index: (x, y)}}}`` -> ``C x F x K x 2`` (NaN = not
+        annotated). Cameras in ``cam_names`` order (default: the dict's order); frames are the
+        sorted union of all frame keys (``return_frames=True`` also returns them)."""
+        cams = list(per_cam) if cam_names is None else list(cam_names)
+        frames = sorted({f for c in cams for f in per_cam.get(c, {})}, key=lambda k: (str(type(k)), k))
+        index = {f: i for i, f in enumerate(frames)}
+        out = np.full((len(cams), len(frames), self.n_points, 2), np.nan)
+        for ci, c in enumerate(cams):
+            for f, pts in per_cam.get(c, {}).items():
+                for key, xy in pts.items():
+                    if isinstance(key, str):
+                        if self.names is None or key not in self.names:
+                            raise KeyError('unknown point name {!r}'.format(key))
+                        k = self.names.index(key)
+                    else:
+                        k = int(key)
+                        if not 0 <= k < self.n_points:
+                            raise KeyError('point index {} out of range'.format(k))
+                    if xy is not None:
+                        out[ci, index[f], k] = np.asarray(xy, dtype='float64').reshape(2)
+        return (out, frames) if return_frames else out
+
+    def rows_from_array(self, points):
+        """``C x F x K x 2`` annotations -> per-camera rows (``framenum``, ``corners``, ``ids``,
+        ``filled``), the format of board detections."""
+        arr = np.asarray(points, dtype='float64')
+        if arr.ndim != 4 or arr.shape[2] != self.n_points or arr.shape[3] != 2:
+            raise ValueError('annotations must be C x F x {} x 2, got {}'.format(self.n_points, arr.shape))
+        all_rows = []
+        for c in range(arr.shape[0]):
+            rows = []
+            for f in range(arr.shape[1]):
+                good = np.all(np.isfinite(arr[c, f]), axis=1)
+                if not good.any():
+                    continue
+                ids = np.nonzero(good)[0]
+                rows.append({'framenum': (0, f), 'corners': arr[c, f, ids].reshape(-1, 1, 2),
+                             'ids': ids.reshape(-1, 1).astype('int32'),
+                             'filled': self.fill_points(arr[c, f, ids], ids)})
+            all_rows.append(rows)
+        return all_rows
+
+    # ---------------------------------------------- intrinsics
+    def estimate_intrinsics(self, rows, size=None, min_points=6):
+        """Camera matrix from a per-view DLT (non-planar objects only): every view with >=
+        ``min_points`` non-coplanar annotated points gives ``P``, RQ-decomposed with
+        :func:`aniposelib.geometry.from_projection_matrix`; the median over views of fx, fy,
+        cx, cy seeds K (zero skew). Returns ``(K or None, info)``."""
+        from .geometry import decompose_projection
+        Ks = []
+        for r in rows:
+            filled = self.fill_points(r['corners'], r['ids']).reshape(-1, 2)
+            good = np.all(np.isfinite(filled), axis=1)
+            if good.sum() < max(6, min_points) or _coplanar(self.points3d[good]):
+                continue
+            try:
+                K, _, _ = decompose_projection(_dlt_projection(self.points3d[good], filled[good]))
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+            if np.all(np.isfinite(K)) and K[0, 0] > 0 and K[1, 1] > 0:
+                Ks.append(K)
+        info = dict(n_views=len(Ks), method='dlt')
+        if not Ks:
+            return None, info
+        Ks = np.array(Ks)
+        K = np.eye(3)
+        K[0, 0], K[1, 1] = np.median(Ks[:, 0, 0]), np.median(Ks[:, 1, 1])
+        K[0, 2], K[1, 2] = np.median(Ks[:, 0, 2]), np.median(Ks[:, 1, 2])
+        if size is not None:
+            info['focal_rel_spread'] = float(np.median(np.abs(Ks[:, 0, 0] / K[0, 0] - 1)))
+        return K, info

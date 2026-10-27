@@ -10,7 +10,8 @@ Sub-modules (import what you need; nothing heavy is imported here):
 - :mod:`aniposelib.init.vggt`: VGGT hypotheses (optional extra ``[vggt]``, imported lazily);
 - :mod:`aniposelib.init.select`: score candidate inits on the 2D data.
 
-:func:`calibrate_from_points` is a recipe composed of those parts.
+:func:`calibrate_from_points` is the 1.0 recipe API, an alias of the workflow
+:func:`aniposelib.workflows.calibrate_from_points` since 1.1.
 """
 
 from dataclasses import dataclass, field, fields
@@ -118,63 +119,6 @@ def _has_extrinsics(cg):
     return not np.allclose(Ms, np.eye(4)[None]) and np.all(np.isfinite(Ms))
 
 
-def _scale_from_reference(cg, ref, align, kw):
-    """Scale (and, if ``align``, the full similarity gauge) from a reference calibration of the
-    same cameras: ``scale.from_reference`` (flags, residuals), then ``scale.align_to``."""
-    from aniposelib import scale as S
-    res = S.from_reference(cg, ref, **kw)
-    if not align:
-        res.apply(cg)
-        return res
-    if res.scale is None or not res.accepted:
-        raise ValueError('scale estimate not accepted: {}'.format(res.reason))
-    al = S.align_to(cg, ref, trim=kw.get('trim', 2.5), min_keep=kw.get('min_keep', 3))
-    md = cg.metadata
-    md['scale_source'] = 'reference'
-    if res.units is not None:
-        md['units'] = str(res.units)
-    q = res.quality()
-    if q:
-        md['scale_quality'] = S._toml_clean(dict(q))
-    res.details['align'] = al.to_dict()
-    return res
-
-
-def _apply_scale(cg, scale, p2ds):
-    """``scale``: None, a float (multiply translations), a reference ``CameraGroup``
-    (``scale.from_reference``, then the gauge is aligned to the reference with
-    ``scale.align_to``: same scale, rotation and origin; ``dict(reference=ref, align=False)``
-    only rescales), ``dict(pairs=, lengths=)`` (``scale.from_lengths`` on
-    ``p2ds [C,N,J,2]``), ``dict(board=, rows=)`` (``scale.from_board``) or a callable
-    ``f(cgroup) -> s``."""
-    from aniposelib import scale as S
-    from aniposelib.cameras import CameraGroup
-    if scale is None:
-        return None
-    if callable(scale) and not isinstance(scale, CameraGroup):
-        s = float(scale(cg))
-        S.rescale(cg, s, source='manual')
-        return dict(s=s, source='callable')
-    if isinstance(scale, (int, float)):
-        S.rescale(cg, float(scale), source='manual')
-        return dict(s=float(scale), source='manual')
-    if isinstance(scale, dict) and 'reference' in scale:
-        kw = {k: v for k, v in scale.items() if k not in ('reference', 'align')}
-        return _scale_from_reference(cg, scale['reference'], scale.get('align', True), kw)
-    if isinstance(scale, CameraGroup):
-        return _scale_from_reference(cg, scale, True, {})
-    elif isinstance(scale, dict) and 'board' in scale:
-        res = S.from_board(cg, scale['rows'], scale['board'],
-                           **{k: v for k, v in scale.items() if k not in ('board', 'rows')})
-    elif isinstance(scale, dict) and 'pairs' in scale:
-        res = S.from_lengths(cg, scale.get('p2ds', p2ds), scale['pairs'], scale['lengths'],
-                             **{k: v for k, v in scale.items() if k not in ('pairs', 'lengths', 'p2ds')})
-    else:
-        raise ValueError('unsupported scale spec: {!r}'.format(type(scale)))
-    res.apply(cg)
-    return res
-
-
 def _refine(cg, p2ds, frame_id, method, rng, ba_kwargs):
     """Final refinement. 'auto' / 'robust': :func:`aniposelib.bundle.bundle_adjust_robust`
     (extrinsics only, MSAC inliers + LM + resection + structured rejection; reverted if the robust
@@ -220,99 +164,53 @@ def calibrate_from_points(p2ds, cam_names=None, sizes=None, intrinsics=None, ini
                           frames=None, groups=None, robust=True, scale=None, *, frame_id=None,
                           window_id=None, refine='auto', ba_kwargs=None, sfm_kwargs=None,
                           vggt_kwargs=None, select_kwargs=None, report=True, rng=None):
-    """Calibrate extrinsics from 2D points with known intrinsics: a recipe.
+    """Calibrate extrinsics from 2D points with known intrinsics (the 1.0 recipe API).
 
-    1. Intrinsics group from ``intrinsics`` (``CameraGroup`` | K | dict | None, see
-       :func:`make_intrinsics_group`) with ``cam_names`` / ``sizes``.
-    2. Candidate inits, by ``init``:
-       ``'reference'`` (the extrinsics of ``intrinsics``, e.g. a lab calibration),
-       ``'sfm'`` (:func:`sfm.from_correspondences`), ``'vggt'`` (needs ``frames``, the extra
-       ``[vggt]``: the aggregate and every template are candidates), a ``CameraGroup``, a list
-       of those, or ``'auto'`` = reference (if it has extrinsics) + sfm + vggt (if ``frames``).
-       Generators that fail are recorded in ``report.errors``.
-    3. :func:`select` (robust-inlier fraction, ``select_kwargs``) picks one; if SfM had to drop
-       cameras, only complete candidates compete unless none is complete.
-    4. Refinement (``refine``, see :func:`_refine`; ``robust=False`` turns ``'auto'`` into
-       ``'iter'``, the classic Adam BA).
-    5. Scale (``scale``: float | reference group (also aligns the gauge: rotation and origin
-       of the reference; ``dict(reference=ref, align=False)`` only rescales) |
-       ``dict(pairs=, lengths=)`` | ``dict(board=, rows=)`` | callable), via
-       :mod:`aniposelib.scale`.
-    6. ``aniposelib.quality.report(cgroup, p2ds, groups=groups)`` if ``report``.
+    Since 1.1 an alias of the workflow :func:`aniposelib.workflows.calibrate_from_points`
+    (candidate inits -> :func:`select` -> noise-normalised robust BA -> scale -> quality), with
+    the 1.0 signature and return value:
 
-    ``p2ds``: ``[C,N,2]`` or ``[C,N,J,2]`` in ``cam_names`` order (NaN = missing).
-    Returns ``(CameraGroup, RecipeReport)``. The group may lack cameras the init could not
-    place (see ``report.init_reports``)."""
-    from aniposelib.cameras import CameraGroup
-    rpt = RecipeReport()
+    - ``intrinsics`` / ``cam_names`` / ``sizes``: see :func:`make_intrinsics_group`;
+    - ``init``: ``'auto'`` | ``'reference'`` | ``'sfm'`` | ``'vggt'`` (needs ``frames``) | a
+      ``CameraGroup`` | a list; a single generator that fails raises, as in 1.0;
+    - ``frame_id`` / ``window_id``: SfM frames / windows (and structured rejection);
+      ``groups``: point labels for the ``quality.report`` per-group breakdown;
+    - ``refine``: ``'auto'`` / ``'robust'`` (workflow robust BA), ``'refine'``
+      (``sfm.refine_group``), ``'iter'`` (Adam BA, kept if better; ``robust=False`` turns
+      ``'auto'`` into it) or None;
+    - ``scale``: float | reference group (also aligns the gauge) | ``dict(reference=, align=False)``
+      | ``dict(pairs=, lengths=)`` | ``dict(board=, rows=)``.
+
+    Intrinsics are never refined here (``refine_intrinsics=False``). Returns
+    ``(CameraGroup, RecipeReport)``; ``report.scale`` is a
+    :class:`~aniposelib.workflows.ScaleEstimate`. For the verdict / full result use the workflow."""
+    from aniposelib.workflows.calibration import calibrate_from_points as _workflow
     base = make_intrinsics_group(cam_names, sizes, intrinsics)
-    names = base.get_names()
-    p = np.asarray(to_np(p2ds), dtype='float64')
-    if p.shape[0] != len(names):
-        raise ValueError('p2ds has {} cameras, expected {}'.format(p.shape[0], len(names)))
-    if init == 'auto':
-        specs = (['reference'] if _has_extrinsics(base) else []) + ['sfm'] + (['vggt'] if frames is not None else [])
-    elif isinstance(init, (list, tuple)):
-        specs = list(init)
-    else:
-        specs = [init]
-    cands = {}
-    priors = None
-    # vggt first: its pairwise rotations become SfM priors
-    for spec in sorted(specs, key=lambda s: 0 if s == 'vggt' else 1):
-        try:
-            if isinstance(spec, CameraGroup):
-                cands['given_{}'.format(len(cands))] = spec
-            elif spec == 'reference':
-                cands['reference'] = base
-            elif spec == 'vggt':
-                from . import vggt as V
-                pred = V.predict(frames, names=names, **(vggt_kwargs or {}))
-                agg = V.aggregate(pred)
-                cands['vggt'] = V.to_cameragroup(agg, template=base)
-                for t in range(pred.extrinsics.shape[0]):
-                    cands['vggt_t{}'.format(t)] = from_extrinsics(names, pred.extrinsics[t], template=base)
-                priors = V.pairwise_rotations(pred)
-                rpt.init_reports['vggt'] = dict(stats=agg.stats)
-            elif spec == 'sfm':
-                kw = dict(frame_id=frame_id, window_id=window_id, rotation_priors=priors, rng=rng)
-                kw.update(sfm_kwargs or {})
-                cg, ir = sfm.from_correspondences(base, p, **kw)
-                cands['sfm'] = cg
-                rpt.init_reports['sfm'] = ir
-            else:
-                raise ValueError('unknown init {!r}'.format(spec))
-        except Exception as exc:
-            if len(specs) == 1:
-                raise
-            rpt.errors[str(spec)] = '{}: {}'.format(type(exc).__name__, exc)
-    if not cands:
-        raise RuntimeError('calibrate_from_points: no initialisation succeeded: {}'.format(rpt.errors))
-    complete = {k: v for k, v in cands.items() if set(v.get_names()) == set(names)}
-    pool = complete if complete else cands
-    rpt.candidates = list(cands)
-    if len(pool) == 1:
-        key = next(iter(pool))
-        chosen = pool[key]
-    else:
-        common = [n for n in names if all(n in v.get_names() for v in pool.values())]
-        idx = [names.index(n) for n in common]
-        chosen, rpt.selection = select(pool, p[idx], cam_names=common, **(select_kwargs or {}))
-        key = rpt.selection.best
-        chosen = pool[key]
-    rpt.init = key
-    present = [n for n in names if n in chosen.get_names()]
-    if present != chosen.get_names():
-        chosen = chosen.subset_cameras_names(present)
-    pc = p[[names.index(n) for n in present]]
     method = refine if (robust or refine != 'auto') else 'iter'
-    cgroup, rpt.refine = _refine(chosen, pc, frame_id, method, rng, ba_kwargs)
-    if scale is not None:
-        rpt.scale = _apply_scale(cgroup, scale, pc)
-    if report:
-        try:
-            from aniposelib import quality
-            rpt.quality = quality.report(cgroup, pc, groups=groups)
-        except Exception as exc:  # quality is optional here
-            rpt.errors['quality'] = '{}: {}'.format(type(exc).__name__, exc)
-    return cgroup, rpt
+    if method == 'auto':
+        method = 'robust'
+    if method not in ('robust', 'refine', 'iter', None, False):
+        raise ValueError("refine must be 'auto', 'refine', 'robust', 'iter' or None")
+    grp = {k: v for k, v in (('frame', frame_id), ('window', window_id)) if v is not None}
+    if callable(scale) and not hasattr(scale, 'cameras'):
+        sc_fn, scale = scale, None
+    else:
+        sc_fn = None
+    res = _workflow(p2ds, base, init=init, frames=frames, groups=grp or None, refine_intrinsics=False,
+                    scale=scale, rng=0 if rng is None else rng,
+                    options=dict(refine=method or None, ba_kwargs=ba_kwargs, sfm_kwargs=sfm_kwargs,
+                                 vggt_kwargs=vggt_kwargs, select_kwargs=select_kwargs, quality=report,
+                                 quality_groups=groups))
+    rpt = res.init_report
+    single = not (isinstance(init, (list, tuple)) or init == 'auto')
+    if res.cgroup is None or (single and rpt.errors and not rpt.candidates):
+        raise RuntimeError('calibrate_from_points: no initialisation succeeded: {}'.format(rpt.errors))
+    if res.scale is not None and not res.scale.accepted:
+        raise ValueError('scale estimate not accepted: {}'.format(res.scale.report.get('reason')))
+    cg = res.cgroup
+    if sc_fn is not None:
+        from aniposelib import scale as S
+        s = float(sc_fn(cg))
+        S.rescale(cg, s, source='manual')
+        rpt.scale = dict(s=s, source='callable')
+    return cg, rpt

@@ -214,37 +214,36 @@ def compute_camera_matrices(rtvecs, pairs):
         extrinsics[b] = np.matmul(ext, extrinsics[a])
     return extrinsics
 
-def get_initial_extrinsics(rtvecs, cam_names=None, disconnected='raise'):
+def get_initial_extrinsics(rtvecs, cam_names=None, disconnected='raise', method='auto'):
     """Initial (rvecs, tvecs) [C,3] from per-camera board poses ``rtvecs [C,F,6]``.
 
-    ``disconnected='raise'`` (default, aniposelib <= 0.9): ValueError when some cameras never
-    share a board view with the others. ``'components'``: delegate to
-    :func:`aniposelib.init.board.initial_extrinsics` (one gauge per connected component, robust
-    fallback per edge; a warning lists the components). For the full report use that function."""
+    Since 1.1 this routes through :func:`aniposelib.init.board.initial_extrinsics` with
+    ``tree='classic'``: a connected graph gives exactly the result of aniposelib <= 1.0 (same
+    spanning tree, classic cluster + mean estimate per edge), plus a robust fallback for edges
+    where the classic estimate fails (``method='auto'``; ``'classic'`` disables the fallback).
+
+    ``disconnected='raise'`` (default): ValueError listing the connected components when some
+    cameras never share a board view with the others. ``'components'``: one gauge per
+    connected component (each anchored at its lowest camera; a warning lists the components).
+    Per-component gauges are unrelated frames: use them only as an initialisation that is
+    bridged later (keypoints / people, ``calibrate_from_board(bridge_points=...)``), never to
+    triangulate across components. For the full report use ``initial_extrinsics``."""
     if disconnected not in ('raise', 'components'):
         raise ValueError("disconnected must be 'raise' or 'components'")
-    if disconnected == 'components':
+    from aniposelib.init.board import initial_extrinsics
+    rtvecs = np.asarray(rtvecs, dtype='float64')
+    names = list(cam_names) if cam_names is not None else list(range(rtvecs.shape[0]))
+    res = initial_extrinsics(rtvecs, names, method=method, tree='classic')
+    if len(res.components) > 1:
+        msg = ('board graph has {} disconnected components {}: some cameras never see the '
+               'calibration board together with the others'.format(len(res.components), res.components))
+        if disconnected == 'raise':
+            raise ValueError('Could not build calibration graph. ' + msg +
+                             ". Record more board views shared between these groups, or pass "
+                             "disconnected='components' (one gauge per component).")
         import warnings
-        from aniposelib.init.board import initial_extrinsics
-        res = initial_extrinsics(rtvecs, cam_names)
-        if len(res.components) > 1:
-            warnings.warn('board graph has {} disconnected components {}; each has its own '
-                          'gauge'.format(len(res.components), res.components))
-        return np.asarray(res.rvecs), np.asarray(res.tvecs)
-    graph = get_calibration_graph(rtvecs, cam_names)
-    pairs = find_calibration_pairs(graph, source=0)
-    extrinsics = compute_camera_matrices(rtvecs, pairs)
-
-    n_cams = rtvecs.shape[0]
-    rvecs = []
-    tvecs = []
-    for cnum in range(n_cams):
-        rvec, tvec = get_rtvec(extrinsics[cnum])
-        rvecs.append(rvec)
-        tvecs.append(tvec)
-    rvecs = np.array(rvecs)
-    tvecs = np.array(tvecs)
-    return rvecs, tvecs
+        warnings.warn(msg + '; each has its own gauge')
+    return np.asarray(res.rvecs), np.asarray(res.tvecs)
 
 
 ## convenience function to load a set of DeepLabCut pose-2d files

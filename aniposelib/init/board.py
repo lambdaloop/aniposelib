@@ -167,7 +167,7 @@ class BoardInit:
 
 
 def initial_extrinsics(rtvecs, cam_names=None, method='auto', min_shared=1, anchor=None,
-                       trim=0.25, rot_tol_deg=8.0):
+                       trim=0.25, rot_tol_deg=8.0, tree='max'):
     """Initial extrinsics from board poses, one gauge per connected component.
 
     ``method``: ``'classic'`` (``utils.get_transform``: cluster + mean, as
@@ -175,7 +175,15 @@ def initial_extrinsics(rtvecs, cam_names=None, method='auto', min_shared=1, anch
     (classic, robust if it raises or is non-finite). ``anchor``: camera index (or name) that is
     the identity of its component (default: the lowest index of each component, i.e. camera 0
     for the main component as in ``get_initial_extrinsics``). Never raises on disconnected
-    graphs: inspect ``BoardInit.components`` / ``.connected``."""
+    graphs: inspect ``BoardInit.components`` / ``.connected``.
+
+    ``tree``: ``'max'`` (Prim's maximum spanning tree of the co-detection counts from the
+    anchor) or ``'classic'`` (for a connected graph, the spanning tree and traversal of
+    ``utils.get_calibration_graph`` / ``find_calibration_pairs``, so that the result is exactly
+    that of aniposelib <= 1.0 whenever the classic estimate succeeds; disconnected graphs use
+    ``'max'`` per component)."""
+    if tree not in ('max', 'classic'):
+        raise ValueError("tree must be 'max' or 'classic'")
     if method not in ('auto', 'classic', 'robust'):
         raise ValueError("method must be 'auto', 'classic' or 'robust'")
     rtvecs = np.asarray(rtvecs, dtype='float64')
@@ -192,7 +200,12 @@ def initial_extrinsics(rtvecs, cam_names=None, method='auto', min_shared=1, anch
         root = anchor if (anchor is not None and anchor in comp) else comp[0]
         anchors.append(names[root])
         comp_of[comp] = k
-        for a, b in _max_spanning_tree(W, comp, root):
+        if tree == 'classic' and len(comps) == 1 and len(comp) > 1:
+            from aniposelib.utils import get_calibration_graph, find_calibration_pairs
+            tree_edges = find_calibration_pairs(get_calibration_graph(rtvecs), source=root)
+        else:
+            tree_edges = _max_spanning_tree(W, comp, root)
+        for a, b in tree_edges:
             Mab, info = None, dict(n_shared=int(W[a, b]))
             if method in ('auto', 'classic'):
                 try:
