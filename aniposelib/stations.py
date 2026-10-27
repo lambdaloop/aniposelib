@@ -895,7 +895,8 @@ def _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support, max_n=5)
 def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=None, window_s=None,
                   tau=10.0, agree_px=None, gate_px=None, min_other=2, collapse_ratio=0.3, min_windows=3,
                   min_support=20, max_deg=15.0, grid_step_deg=2.5, max_instances=600, cameras=None,
-                  device=None, rng=0, persistent=True, min_step_deg=0.5, max_blocks=40):
+                  device=None, rng=0, persistent=True, min_step_deg=0.5, max_blocks=40,
+                  split_step_deg=1.0):
     """Re-place cameras that were bumped so hard that their LOO coverage collapses.
 
     A camera whose share of the points supported by the other cameras that it also sees and agrees
@@ -923,6 +924,11 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
     re-associated detections) for the next ones. A camera that still fits at its old pose (people
     data whose association dropped it), or whose recovered rotation is below ``min_step_deg``, is
     'not moved' (with ``detections`` it is still re-associated).
+
+    Inside a recovered interval the pose is refined per block of windows (at most ``max_blocks``);
+    a block more than ``split_step_deg`` (1 deg) from its segment's first block starts a new station
+    (a second bump). A camera that still fits at its old pose but whose locally refined rotation
+    (>= ``min_step_deg``) lowers the median residual by 30 % is a small re-aim and recovered too.
 
     A recovered camera gets a new station from ``t`` (an existing change point of ``moves`` within
     two windows is reused). It is accepted when its coverage after recovery is at least half its
@@ -1080,13 +1086,32 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             tgt = Da[torch.arange(len(inst), device=dev), ch].reshape(-1, 2)
             e = (uv - tgt).norm(dim=-1).reshape(len(inst), J).cpu().numpy()
             return float(((e < agree_px) & cells).sum() / n_sup), e
-        cov0, _ = coverage(eye3, zero3)
+        cov0, e0 = coverage(eye3, zero3)
         d['coverage_unmoved'] = cov0
+        small = None
         if cov0 >= 0.5 * before:
-            Rb, tb, moved_ = eye3, zero3, False
-            d.update(status='not moved: the camera still fits at its old pose (data lost, e.g. association)',
-                     step_deg=0.0)
-        else:
+            # still fits at its old pose: a small re-aim (within the agreement threshold) shows as a
+            # clearly lower residual after a local refinement
+            Xs, Ds = Xa[pick], pad(pick)
+            Rr, tr, _, _, _ = _refine_pose(P, c, Xs, Ds, eye3, zero3, gate, full=False)
+            cov_r, er = coverage(Rr, tr)
+            step_r = float(np.degrees(np.linalg.norm(_rotvec(Rr.cpu().numpy()))))
+            m0, mr = (e0 < gate) & cells, (er < gate) & cells
+            med0 = float(np.median(e0[m0])) if m0.any() else np.inf
+            medr = float(np.median(er[mr])) if mr.any() else np.inf
+            if step_r >= min_step_deg and medr < 0.7 * med0 and cov_r >= cov0:
+                small = (Rr, tr, cov_r, er, step_r, med0, medr)
+            else:
+                Rb, tb, moved_ = eye3, zero3, False
+                d.update(status='not moved: the camera still fits at its old pose (data lost, e.g. association)',
+                         step_deg=0.0)
+        if small is not None:
+            Rb, tb, after, e, step, med0, medr = small
+            d.update(coverage_after=after, step_deg=step, rotvec_deg=np.degrees(_rotvec(Rb.cpu().numpy())).tolist(),
+                     center_shift=0.0, translation=False, median_px=medr, median_px_unmoved=med0,
+                     n_inliers=int(((e < gate) & cells).sum()))
+            moved_ = True
+        elif cov0 < 0.5 * before:
             Xs, Ds = Xa[pick], pad(pick)
             f = float(P.K[c, 0, 0])
             coarse_gate = max(gate, 0.6 * np.radians(grid_step_deg) * f)
@@ -1144,7 +1169,7 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             groups = []
             for x in br:
                 if groups and np.degrees(np.linalg.norm(_rotvec((x[2] @ groups[-1][0][2].T).cpu().numpy()))) \
-                        < min_step_deg:
+                        < split_step_deg:
                     groups[-1].append(x)
                 else:
                     groups.append([x])

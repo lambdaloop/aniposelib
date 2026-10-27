@@ -248,3 +248,24 @@ def test_w4_recovery_splits_a_second_bump():
     assert len(cps) == 2, ev.report['recovered_moves']
     assert abs(cps[0]['time'] - 12.0) < 0.15 and abs(cps[1]['time'] - 22.0) <= 4.0
     np.testing.assert_allclose([cp['step_deg'] for cp in cps], [np.linalg.norm(r1), np.linalg.norm(r2)], atol=0.15)
+
+
+def test_w4_small_reaim_of_a_lost_camera_is_recovered():
+    rig = synth.load_rig('fisheye_5cam')
+    F, Pn, cb, tb = 300, 3, 2, 16.0
+    X = synth.crowd(rig, Pn, F, size=3.5, sep=1.5, seed=0)
+    t = np.arange(F) / 10.0
+    rot = [0.8, -1.0, 0.0]                           # 1.3 deg: within the agreement threshold
+    p = np.stack([synth.project(rig, X[i]) for i in range(Pn)], 2)
+    pb = np.stack([synth.project(_bumped(rig, cb, rot), X[i]) for i in range(Pn)], 2)
+    p[cb, t >= tb] = pb[cb, t >= tb]
+    p = synth.add_noise(p, 1.0, seed=1)
+    rng = np.random.default_rng(0)
+    det = [{f: p[c, f][rng.permutation(Pn)] for f in range(F)} for c in range(p.shape[0])]
+    assoc = p.copy()
+    assoc[cb, t >= tb] = np.nan
+    name = rig.get_names()[cb]
+    ev = W.evaluate_calibration(rig, assoc, times=t, options={'detections': det, 'tau_px': 30.0})
+    assert ev.moves.moved == [name], ev.report['recovered_moves']
+    (cp,) = ev.moves.change_points
+    assert abs(cp['step_deg'] - np.linalg.norm(rot)) < 0.1
