@@ -55,6 +55,7 @@ Conventions
 """
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -168,7 +169,9 @@ W1_DEFAULTS = dict(
     f_scale_diag=0.003,       # first-pass Cauchy scale, fraction of the image diagonal
     f_scale_noise=3.0,        # second-pass Cauchy scale, multiple of the noise floor
     max_points=None,          # subsample boards in BA
-    skip=20, frame_indices=None, n_workers=1, detector_kwargs=None,   # video detection
+    # video detection (frame-major, sequential reading): every `skip`-th frame, or `n_frames`
+    # evenly spaced, or `frame_indices`; stop once every camera has `max_boards` boards (None: no limit)
+    skip=20, n_frames=None, frame_indices=None, max_boards=200, n_workers='auto', detector_kwargs=None,
     prior_sigma_logf=0.05, prior_sigma_k=0.1,  # intrinsics=<CameraGroup> (float or {camera name: sigma})
     object_sigma=None,        # static PointObject: not supported yet (points held fixed)
     min_bridge_points=6,      # bridge: minimum points per extra component
@@ -263,6 +266,83 @@ def _deepcharuco_available(board):
         return bool(supports_board(board.squaresX, board.squaresY))
     except Exception:  # pragma: no cover
         return False
+
+
+def _resolve_detector(board, detector):
+    det = detector
+    if det == 'auto':
+        det = 'deepcharuco' if _deepcharuco_available(board) else 'opencv'
+    if not hasattr(board, 'detector_name'):
+        det = None
+    return det
+
+
+def _n_workers(n):
+    if n is None or n == 'auto':
+        try:
+            ncpu = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):  # pragma: no cover
+            ncpu = os.cpu_count() or 1
+        return max(1, min(8, ncpu))
+    return max(1, int(n))
+
+
+def _detect_videos(videos, board, det, opts, names, *, max_boards=None, max_frames=None, min_cameras=2):
+    """W1 / W3 board detection in videos: ``videos`` one list of paths per camera (video j of
+    every camera = one synchronised segment). Frame-major sequential sampling
+    (:func:`aniposelib.boards.detect_videos`): every ``skip``-th frame, or ``n_frames`` evenly
+    spaced frames of the segment's shortest video, or ``frame_indices`` (one int sequence, the
+    same in every camera); early exit at ``max_boards`` / ``max_frames``. A per-camera / per-video
+    ``frame_indices`` falls back to the per-video reader (``CameraGroup.get_rows_videos``).
+    Returns per-camera rows (``framenum = (segment, frame)``) and a summary dict."""
+    from ..boards import detect_videos
+    from ..cameras import _board_with_detector, _is_index_seq
+    dkw = opts.get('detector_kwargs')
+    if det == 'deepcharuco':
+        # input scale from the frame size unless given (scale 1 misses most boards in >= 1080p)
+        dkw = dict(getattr(board, 'detector_kwargs', None) or {}) if dkw is None else dict(dkw)
+        dkw.setdefault('scale', 'auto')
+    b = board if det is None else _board_with_detector(board, det, dkw)
+    nw = _n_workers(opts.get('n_workers'))
+    fi = opts.get('frame_indices')
+    C = len(videos)
+    t0 = time.time()
+    summary = dict(sampling='sequential', n_workers=nw, skip=int(opts.get('skip') or 1),
+                   n_frames=opts.get('n_frames'), max_boards=max_boards, max_frames=max_frames,
+                   segments=[])
+    if fi is not None and not _is_index_seq(fi):
+        from ..cameras import CameraGroup, Camera
+        cg = CameraGroup([Camera(name=n) for n in names])
+        rows = cg.get_rows_videos(videos, b, verbose=False, frame_indices=fi, n_workers=nw)
+        summary['sampling'] = 'per_video_indices'
+    else:
+        rows = [[] for _ in range(C)]
+        n_seg = max((len(v) for v in videos), default=0)
+        for j in range(n_seg):
+            seg = [v[j] if len(v) > j else None for v in videos]
+            idx = None
+            if fi is not None:
+                idx = [int(i) for i in fi]
+            elif opts.get('n_frames'):
+                from ..boards import _video_length
+                counts = [c for c in (_video_length(v) for v in seg if v is not None) if c > 0]
+                if counts:
+                    idx = [int(f) for f in np.unique(np.linspace(0, min(counts) - 1, int(opts['n_frames']))
+                                                     .round().astype(int))]
+            info = {}
+            for c, v in enumerate(seg):
+                if v is not None and not os.path.exists(str(v)):
+                    raise FileNotFoundError('missing video file "{}"'.format(v))
+            seg_rows = detect_videos(b, seg, frame_indices=idx, skip=opts.get('skip') or 1,
+                                     max_boards=max_boards, max_frames=max_frames,
+                                     min_cameras=min(min_cameras, C), n_workers=nw, prefix=j, info=info)
+            for c in range(C):
+                rows[c].extend(seg_rows[c])
+            info['frame_indices'] = idx
+            summary['segments'].append(info)
+    summary['n_rows'] = [len(r) for r in rows]
+    summary['seconds'] = round(time.time() - t0, 2)
+    return rows, summary
 
 
 def _base_group(C, cam_names, init, fisheye, sizes):
@@ -558,6 +638,15 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
       bridge observations that the final rig explains; warn below 0.5, fail below 0.2. With a
       bridge, the board rules use the board observations alone (re-triangulated), not the joint BA.
 
+    Video detection (``options``): the videos of all cameras are read together, front to back
+    (no seeking; video ``j`` of every camera is one synchronised segment), and the board is
+    detected in every ``skip``-th frame (20), in ``n_frames`` evenly spaced frames, or in
+    ``frame_indices`` (one int sequence, or the per-camera / per-video forms of
+    ``CameraGroup.get_rows_videos``, which use the per-video reader). Reading stops once every
+    camera has ``max_boards`` boards (200; None = read everything). ``n_workers``: decoding /
+    OpenCV-detection threads (``'auto'`` = up to 8). ``settings['detection']`` reports what was
+    read and why it stopped. A missing video raises ``FileNotFoundError``.
+
     ``options['focal_guess']`` (a float or ``{camera name: f}``, px) adds focal starts to the lens
     ladder (phones / unusual lenses); ``prior_sigma_logf`` / ``prior_sigma_k`` may be
     ``{camera name: sigma, 'default': sigma}``; ``noise_unit`` forces the bridge noise unit.
@@ -589,22 +678,18 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
                 cam_names = stems if len(set(stems)) == C else None
             cg = _base_group(C, cam_names, init, fisheye, opts['sizes'])
             cg.set_camera_sizes_videos(videos)
-            det = detector
-            if det == 'auto':
-                det = 'deepcharuco' if _deepcharuco_available(board) else 'opencv'
-            if not hasattr(board, 'detector_name'):
-                det = None
+            det = _resolve_detector(board, detector)
             settings['detector'] = det if isinstance(det, (str, type(None))) else type(det).__name__
-            kw = dict(verbose=False, frame_indices=opts['frame_indices'], n_workers=opts['n_workers'],
-                      skip=opts['skip'], detector_kwargs=opts['detector_kwargs'])
+            dkw = dict(max_boards=opts['max_boards'], min_cameras=2)
             try:
-                all_rows = cg.get_rows_videos(videos, board, detector=det, **kw)
+                all_rows, settings['detection'] = _detect_videos(videos, board, det, opts, cg.get_names(), **dkw)
             except Exception as exc:
-                if det != 'deepcharuco' or detector != 'auto':
+                if det != 'deepcharuco' or detector != 'auto' or isinstance(exc, FileNotFoundError):
                     raise
                 fallbacks.append('deepcharuco failed ({}: {}), using opencv'.format(type(exc).__name__, exc))
                 settings['detector'] = 'opencv'
-                all_rows = cg.get_rows_videos(videos, board, detector='opencv', **kw)
+                all_rows, settings['detection'] = _detect_videos(videos, board, 'opencv', opts, cg.get_names(),
+                                                                 **dkw)
         elif isinstance(videos_or_rows, np.ndarray) or torch.is_tensor(videos_or_rows):
             arr = np.asarray(to_numpy(videos_or_rows), dtype='float64')
             all_rows = _rows_from_dense(arr, board)
@@ -1020,7 +1105,7 @@ def _parse_groups(groups, pshape):
     return out
 
 
-def _candidates(base, p, init, frames, gr, opts, rng, rpt, names):
+def _candidates(base, p, init, frames, gr, opts, rng, rpt, names, dev=None):
     """Candidate inits (the 1.0 recipe of ``init.calibrate_from_points``)."""
     from ..cameras import CameraGroup
     from ..init import _has_extrinsics, from_extrinsics, sfm
@@ -1052,7 +1137,7 @@ def _candidates(base, p, init, frames, gr, opts, rng, rpt, names):
                 priors = V.pairwise_rotations(pred)
                 rpt.init_reports['vggt'] = dict(stats=agg.stats)
             elif spec == 'sfm':
-                kw = dict(frame_id=frame_id, window_id=window_id, rotation_priors=priors, rng=rng)
+                kw = dict(frame_id=frame_id, window_id=window_id, rotation_priors=priors, rng=rng, device=dev)
                 kw.update(opts['sfm_kwargs'] or {})
                 cg, ir = sfm.from_correspondences(base, p, **kw)
                 cands['sfm'] = cg
@@ -1460,7 +1545,7 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
                              'observations (worst camera {:.0%})'.format(ref_support['overall'],
                                                                          ref_support['min_camera']))
     with timer('init'):
-        cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names)
+        cands = _candidates(base, p, init_spec, frames, gr, opts, rng, rpt, names, dev=dev)
         if p.ndim == 5 and 'people' in cands:
             from ..init import people
             akw = dict(pk.get('association_kwargs') or {})
@@ -1885,8 +1970,9 @@ W3_DEFAULTS = dict(
     ground_points=None, up='z', origin='centroid',   # align='ground'
     noise_unit='auto',        # 'auto' (capped noise floor / 0.5 px) or a float (1 = absolute pixel defaults)
     lengths_check=0.03,       # lengths: re-measured bones (strict threshold) off by more than this -> warn
-    n_frames=None,            # board_points={cam: video(s)}: frames sampled per video (None: every `skip`-th)
-    skip=20, detector='auto', detector_kwargs=None, n_workers=1,     # ... board detection in the videos
+    # board_points={cam: video(s)}: frame-major sequential detection (as W1): `n_frames` evenly spaced
+    # frames per video (None: every `skip`-th); stop once `max_frames` frames show the board in >= 2 cameras
+    n_frames=None, skip=20, frame_indices=None, max_frames=200, detector='auto', detector_kwargs=None, n_workers='auto',
     verdict=None,
 )
 
@@ -1922,19 +2008,11 @@ def _scale_sigma(r):
     return None
 
 
-def _video_n_frames(path):
-    import cv2
-    cap = cv2.VideoCapture(str(path))
-    try:
-        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        cap.release()
-
-
 def _board_rows_from_videos(cgroup, videos, board, opts):
-    """``{camera name: video | [videos]}`` -> per-camera rows (W1's detection). With
-    ``options['n_frames']``, the same evenly spaced frame indices in every camera (synchronised
-    videos), sampled from the shortest video."""
+    """``{camera name: video | [videos]}`` -> per-camera rows (W1's frame-major detection: the
+    same frames in every camera, the videos are assumed synchronised). ``options['n_frames']``:
+    that many evenly spaced frames of the shortest video, else every ``skip``-th frame; reading
+    stops once ``max_frames`` sampled frames show the board in at least two cameras."""
     names = cgroup.get_names()
     unknown = [k for k in videos if str(k) not in names]
     if unknown:
@@ -1943,22 +2021,12 @@ def _board_rows_from_videos(cgroup, videos, board, opts):
     for n in names:
         v = videos.get(n, [])
         per.append([v] if isinstance(v, (str, os.PathLike)) else list(v))
-    det = opts['detector']
-    if det == 'auto':
-        det = 'deepcharuco' if _deepcharuco_available(board) else 'opencv'
-    if not hasattr(board, 'detector_name'):
-        det = None
-    kw = dict(verbose=False, n_workers=opts['n_workers'], skip=opts['skip'], detector_kwargs=opts['detector_kwargs'])
-    if opts['n_frames']:
-        counts = [_video_n_frames(v) for vs in per for v in vs]
-        counts = [c for c in counts if c > 0]
-        if counts:
-            kw['frame_indices'] = [int(f) for f in np.unique(np.linspace(0, min(counts) - 1, int(opts['n_frames']))
-                                                            .round().astype(int))]
-    rows = cgroup.get_rows_videos(per, board, detector=det, **kw)
-    return rows, dict(detector=det if isinstance(det, (str, type(None))) else type(det).__name__,
-                      n_videos=sum(len(v) for v in per), n_rows=[len(r) for r in rows],
-                      frame_indices=kw.get('frame_indices'))
+    det = _resolve_detector(board, opts['detector'])
+    rows, summary = _detect_videos(per, board, det, opts, names, max_frames=opts['max_frames'], min_cameras=2)
+    idx = [s.get('frame_indices') for s in summary['segments']]
+    summary.update(detector=det if isinstance(det, (str, type(None))) else type(det).__name__,
+                   n_videos=sum(len(v) for v in per), frame_indices=idx[0] if len(idx) == 1 else idx)
+    return rows, summary
 
 
 @thread_guard
@@ -1969,8 +2037,11 @@ def estimate_scale(cgroup, board=None, board_points=None, lengths=None, referenc
     Exactly one scale source:
 
     - ``board`` + ``board_points`` (rows, ``[C,F,K,2]`` corners, or videos ``{camera name: video
-      | [videos]}``, detected as in W1; ``options['n_frames']`` frames per video, the same indices
-      in every camera; also ``object=`` + ``object_points=`` for a
+      | [videos]}``, detected as in W1: synchronised videos read front to back together, every
+      ``options['skip']``-th frame (20) or ``options['n_frames']`` evenly spaced frames (the same
+      indices in every camera), stopping once ``options['max_frames']`` (200; None = no limit)
+      frames show the board in at least two cameras; ``report['detection']`` says what was read;
+      also ``object=`` + ``object_points=`` for a
       :class:`~aniposelib.boards.PointObject`): ``scale.from_board``;
     - ``lengths=dict(points=[C,N,J,2], pairs=[(a, b), ...], ref=[...], joints=None)``:
       ``scale.from_lengths`` (MSAC threshold 5 noise units, >= min(3, C) agreeing views); the bones

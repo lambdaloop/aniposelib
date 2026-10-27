@@ -1419,3 +1419,192 @@ class PointObject(CalibrationObject):
         if size is not None:
             info['focal_rel_spread'] = float(np.median(np.abs(Ks[:, 0, 0] / K[0, 0] - 1)))
         return K, info
+
+
+# ------------------------------------------------------------------ frame-major video detection
+
+def _video_length(path):
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    finally:
+        cap.release()
+
+
+class _SequentialReader:
+    """Reads a video front to back: ``grab()`` up to the wanted frame, decode it with ``retrieve()``.
+    No seeking (OpenCV seeks are slow on long-GOP videos and not always frame-exact)."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.cap = cv2.VideoCapture(self.path)
+        if not self.cap.isOpened():
+            raise FileNotFoundError('missing video file "{}"'.format(self.path))
+        self.pos = 0            # index of the next frame grab() returns
+        self.done = False
+
+    def read(self, target):
+        """Frame ``target`` (>= the last one read) or None at the end of the video."""
+        if self.done or target < self.pos:
+            return None
+        while self.pos < target:
+            if not self.cap.grab():
+                self.close()
+                return None
+            self.pos += 1
+        ok = self.cap.grab()
+        self.pos += 1
+        if not ok:
+            self.close()
+            return None
+        ok, frame = self.cap.retrieve()
+        return frame if ok else None
+
+    def close(self):
+        if not self.done:
+            self.cap.release()
+            self.done = True
+
+
+def detect_videos(board, videos, *, frame_indices=None, skip=20, max_boards=None, max_frames=None,
+                  min_cameras=2, n_workers=1, prefix=None, progress=False, info=None):
+    """Frame-major board detection in synchronised videos (one video per camera).
+
+    All videos are read sequentially, frame by frame (no seeking). Every ``skip``-th frame
+    (``frame_indices``: exactly those frames, in every video) is decoded in all cameras and the
+    board detected in it (batched across cameras and frames for batched detectors such as
+    DeepCharuco). Reading stops early once
+
+    - ``max_boards`` (int or None): every camera has at least this many detections (a camera
+      whose video has ended counts as done), or
+    - ``max_frames`` (int or None): this many sampled frames have the board in at least
+      ``min_cameras`` cameras,
+
+    whichever comes first (None = no limit; read to the end of the longest video).
+
+    videos : one path per camera (None = no video for that camera).
+    n_workers : threads used to decode (and, for OpenCV, detect in) the cameras' frames.
+    prefix : rows' ``framenum`` is ``(prefix, frame)``, or ``frame`` when None.
+    info : optional dict, filled with ``n_sampled`` (frames per camera looked at), ``last_frame``,
+      ``stopped`` ('max_boards' | 'max_frames' | 'end') and ``n_covisible``.
+
+    Returns one list of rows per camera (``framenum``, ``corners``, ``ids``, ``filled``), the
+    format of :meth:`CalibrationObject.detect_video`.
+    """
+    C = len(videos)
+    readers = [None if v is None or str(v) == '' else _SequentialReader(v) for v in videos]
+    batched = hasattr(board, 'detector') and hasattr(getattr(board, 'detector', None), 'detect_batch')
+    batch = max(1, int(getattr(board, 'batch_size', 1) or 1)) if batched else 1
+    if frame_indices is not None:
+        targets = iter(sorted(set(int(i) for i in frame_indices if int(i) >= 0)))
+        n_total = len(set(int(i) for i in frame_indices))
+    else:
+        skip = max(1, int(skip))
+        lengths = [_video_length(v) for v in videos if v is not None and str(v) != '']
+        n_total = (max(lengths) + skip - 1) // skip if lengths and max(lengths) > 0 else None
+
+        def _gen():
+            t = 0
+            while True:
+                yield t
+                t += skip
+        targets = _gen()
+    rows = [[] for _ in range(C)]
+    n_boards = np.zeros(C, dtype=int)
+    n_cov = 0
+    n_sampled = 0
+    last = -1
+    stopped = 'end'
+    pool = None
+    if n_workers is not None and int(n_workers) > 1 and C > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=int(n_workers))
+
+    def pmap(fn, items):
+        return list(pool.map(fn, items)) if pool is not None else [fn(x) for x in items]
+
+    def detect_one(fr):
+        return None if fr is None else board.detect_image(fr)
+
+    buf = []        # (t, [frames per camera])
+    pbar = None
+    if progress:
+        from tqdm import tqdm
+        pbar = tqdm(total=n_total, ncols=70)
+
+    def flush():
+        nonlocal n_cov
+        if not buf:
+            return
+        if batched:
+            flat = [(k, c, fr) for k, (_, frs) in enumerate(buf) for c, fr in enumerate(frs) if fr is not None]
+            res = board.detect_frames([fr for _, _, fr in flat]) if flat else []
+            dets = [[None] * C for _ in buf]
+            for (k, c, _), d in zip(flat, res):
+                dets[k][c] = d
+        else:
+            dets = [frs for _, frs in buf]       # detected while reading
+        for (t, _), dk in zip(buf, dets):
+            seen = []
+            for c, d in enumerate(dk):
+                if d is None:
+                    continue
+                corners, ids = d
+                if corners is not None and len(corners) > 0:
+                    key = t if prefix is None else (prefix, t)
+                    rows[c].append({'framenum': key, 'corners': corners, 'ids': ids})
+                    seen.append(c)
+            n_boards[seen] += 1
+            if len(seen) >= min_cameras:
+                n_cov += 1
+        buf.clear()
+
+    try:
+        for t in targets:
+            live = [c for c, r in enumerate(readers) if r is not None and not r.done]
+            if not live:
+                break
+            frs = [None] * C       # frames (batched detector) or detections
+            got = pmap((lambda c: readers[c].read(t)) if batched else
+                       (lambda c: detect_one(readers[c].read(t))), live)
+            for c, fr in zip(live, got):
+                frs[c] = fr
+            if all(r is None or r.done for r in readers) and all(fr is None for fr in frs):
+                break
+            if all(fr is None for fr in frs) and all(readers[c].done for c in live):
+                continue
+            n_sampled += 1
+            last = t
+            buf.append((t, frs))
+            if pbar is not None:
+                pbar.update(1)
+            if not batched or sum(fr is not None for _, f in buf for fr in f) >= batch:
+                flush()
+                done = np.array([readers[c] is None or readers[c].done for c in range(C)])
+                if max_boards is not None and np.all((n_boards >= max_boards) | done):
+                    stopped = 'max_boards'
+                    break
+                if max_frames is not None and n_cov >= max_frames:
+                    stopped = 'max_frames'
+                    break
+        flush()
+    finally:
+        for r in readers:
+            if r is not None:
+                r.close()
+        if pool is not None:
+            pool.shutdown()
+        if pbar is not None:
+            pbar.close()
+    if stopped == 'end':
+        if max_boards is not None and np.all(n_boards >= max_boards):
+            stopped = 'max_boards'
+        elif max_frames is not None and n_cov >= max_frames:
+            stopped = 'max_frames'
+    for c in range(C):
+        rows[c] = board.fill_points_rows(rows[c])
+        _warn_if_bad_layout(board, rows[c])
+    if info is not None:
+        info.update(n_sampled=n_sampled, last_frame=last, stopped=stopped, n_covisible=int(n_cov),
+                    n_boards=n_boards.tolist())
+    return rows

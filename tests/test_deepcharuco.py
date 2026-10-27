@@ -106,3 +106,20 @@ def test_board_with_deepcharuco_detector(scene, detector):
     assert all(len(i) == len(rows[0]['ids']) for _, i in frames)
     b2 = make_board(detector='deepcharuco', detector_kwargs=dict(device='cpu'))
     assert b2.detector.squaresX == GEOM[0]  # built lazily from the board
+
+
+
+@needs_weights
+def test_deepcharuco_pixel_budget_and_auto_scale(scene):
+    board, img, gt = scene
+    det = dc.DeepCharucoDetector(GEOM, device='cpu', batch_size=8, max_batch_pixels=1.0)   # one frame per call
+    calls = []
+    net = det.detector
+    det.detector = lambda x: calls.append(x.shape[0]) or net(x)
+    out = det.detect_batch([img, img, img])
+    assert calls == [1, 1, 1] and np.allclose(out[0][0], out[2][0])
+    auto = dc.DeepCharucoDetector(GEOM, device='cpu', scale='auto')
+    assert auto.scale_for((1080, 1440)) == pytest.approx(0.5) and auto.scale_for((480, 640)) == 1.0
+    assert np.allclose(auto.detect(img)[0], det.detect(img)[0])        # 800x600: never upscaled
+    with pytest.raises(ValueError):
+        dc.DeepCharucoDetector(GEOM, device='cpu', scale='big')
