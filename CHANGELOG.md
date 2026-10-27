@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
+  (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
+  (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite
+  differences). Stations (`stations=`) stay in `bundle_adjust_lm`.
+- **One LM core (1.1, plan 04 §3):** a shared Levenberg-Marquardt engine (`aniposelib._lm`: IRLS losses, Marquardt
+  damping with acceptance on the true cost, Schur complement over generic point-like blocks, dense Cholesky or PCG
+  reduced solve). `bundle_adjust_lm` (cost histories unchanged to ~1e-11 relative), `stba.SpatiotemporalBA`
+  (unchanged to ~1e-12, about 2x faster; it now uses the bundle projection kernel), `init.sfm.refine_extrinsics`
+  (now `bundle_adjust_lm` on ideal pinhole cameras; observations behind a camera are pruned) and
+  `intrinsics.lm_board_adjust` (analytic instead of numeric Jacobians; ladder fits agree to ~1e-6 px, more
+  iterations to reach `tol`) all run on it. `method='adam'` is unchanged.
+
 - Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av, pyyaml); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
 

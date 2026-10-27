@@ -416,11 +416,6 @@ def _auto_margin(margin, width, height, nx, ny, frac=0.5):
     return margin
 
 
-def _no_manual_verify(flag):
-    if flag:
-        raise ValueError('manually_verify was removed in aniposelib 1.1 (the cv2.imshow popup); '
-                         'inspect detections with board.draw_corners / your own viewer instead')
-
 class CalibrationObject(ABC):
     @abstractmethod
     def draw(self, size):
@@ -643,13 +638,11 @@ class Checkerboard(CalibrationObject):
                        cv2.TERM_CRITERIA_MAX_ITER,
                        30, 0.01)
 
-    def __init__(self, squaresX, squaresY, square_length=1, manually_verify=False, *, units=None):
+    def __init__(self, squaresX, squaresY, square_length=1, *, units=None):
         self.squaresX = squaresX
         self.squaresY = squaresY
         self.square_length = square_length
         self.units = units
-        _no_manual_verify(manually_verify)
-
         total_size = squaresX * squaresY
 
         objp = np.zeros((total_size, 3), np.float64)
@@ -849,8 +842,6 @@ class CharucoBoard(CalibrationObject):
         ``aruco_dict`` is given).
     aruco_dict : cv2.aruco.Dictionary, int or str, optional
         Any ArUco/AprilTag dictionary (see :func:`get_aruco_dictionary`).
-    manually_verify : bool
-        Removed in 1.1 (kept in the signature for positional compatibility; ``True`` raises).
     legacy_pattern : bool
         Use the checkerboard phase of OpenCV < 4.6 / calib.io boards. It only matters for an
         even number of rows (``squaresY``); with the wrong setting, few corners are found.
@@ -888,7 +879,6 @@ class CharucoBoard(CalibrationObject):
                  marker_bits=4,
                  dict_size=50,
                  aruco_dict=None,
-                 manually_verify=False,
                  *,
                  legacy_pattern=False,
                  detector='opencv',
@@ -902,7 +892,6 @@ class CharucoBoard(CalibrationObject):
         self.squaresY = int(squaresY)
         self.square_length = square_length
         self.marker_length = marker_length
-        _no_manual_verify(manually_verify)
         self.marker_bits = marker_bits
         self.dict_size = dict_size
         self.aruco_dict = aruco_dict
