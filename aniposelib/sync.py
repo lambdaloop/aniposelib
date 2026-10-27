@@ -29,10 +29,12 @@ inputs are accepted everywhere (converted to numpy). Audio file decoding (:func:
 ``[sync]`` extra (``soundfile``/``av``) or an ``ffmpeg`` executable.
 """
 
+import contextlib
 import dataclasses
 import math
 import shutil
 import subprocess
+import threading
 from typing import NamedTuple
 
 import numpy as np
@@ -493,6 +495,15 @@ def _xcorr_ncc(a, b):
     Returns ``lags`` (``b[n + lag] ~ a[n]``), ``ncc`` and the overlap count of valid samples per lag."""
     a = np.asarray(a, float)
     b = np.asarray(b, float)
+    if len(a) > 1 and len(b) > 1 and np.isfinite(a).all() and np.isfinite(b).all():
+        return _xcorr_ncc_full(_standardise(a), _standardise(b))
+    return _xcorr_ncc_masked(a, b)
+
+
+def _xcorr_ncc_masked(a, b):
+    """:func:`_xcorr_ncc` for signals with missing (NaN) samples: six FFT correlations."""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
     ma = np.isfinite(a).astype(float)
     mb = np.isfinite(b).astype(float)
     a0 = np.where(ma > 0, a, 0.0)
@@ -567,6 +578,219 @@ def _xcorr_ncc_rows(A, B, block=64):
             ncc = np.where(den > 1e-9 * n_safe, cov / den, np.nan)
         yield ncc, np.arange(-A.shape[1] + 1, B.shape[1]), np.round(n).astype(np.int64)
         k = e
+
+
+# Fast paths for finite signals. The overlap moments (count, sums, sums of squares) of every lag are
+# differences of prefix sums, so only the cross term needs an FFT (one correlation instead of six).
+# Same overlap-normalised Pearson score as _xcorr_ncc_masked, to float rounding.
+
+def _fft():
+    from scipy import fft as _sfft
+    return _sfft
+
+
+def _workers():
+    """scipy.fft threads: the workflow thread cap (``ANIPOSELIB_NUM_THREADS`` / ``OMP_NUM_THREADS``, 8),
+    or the share set by :func:`_fft_threads` (pairs running in parallel)."""
+    w = getattr(_FFT_LOCAL, 'workers', None)
+    if w:
+        return w
+    try:
+        from .workflows._common import max_threads
+    except ImportError:  # pragma: no cover - module loaded outside the package
+        return 1
+    return max_threads()
+
+
+_FFT_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def _fft_threads(n):
+    """Use ``n`` scipy.fft threads in this thread (restored afterwards)."""
+    before = getattr(_FFT_LOCAL, 'workers', None)
+    _FFT_LOCAL.workers = max(1, int(n))
+    try:
+        yield
+    finally:
+        _FFT_LOCAL.workers = before
+
+
+def _standardise(x):
+    x = np.asarray(x, float)
+    if len(x) > 1:
+        x = (x - x.mean()) / (x.std() + 1e-300)
+    return x
+
+
+def _prefix(x):
+    out = np.empty(len(x) + 1)
+    out[0] = 0.0
+    np.cumsum(x, out=out[1:])
+    return out
+
+
+def _ncc_from_moments(lags, sab, la, lb, ca, cb, caa, cbb):
+    """Pearson score per lag (``b[n + lag] ~ a[n]``) from the cross sums ``sab`` and prefix sums."""
+    lags = np.asarray(lags, np.int64)
+    n_lo = np.maximum(0, -lags)
+    n_hi = np.maximum(np.minimum(la, lb - lags), n_lo)
+    n = (n_hi - n_lo).astype(float)
+    sa = ca[..., n_hi] - ca[..., n_lo]
+    saa = caa[..., n_hi] - caa[..., n_lo]
+    sb = cb[..., n_hi + lags] - cb[..., n_lo + lags]
+    sbb = cbb[..., n_hi + lags] - cbb[..., n_lo + lags]
+    return _ncc_from_sums(sab, n, sa, sb, saa, sbb)
+
+
+def _ncc_from_sums(sab, n, sa, sb, saa, sbb):
+    """Overlap Pearson score from the overlap count, sums, sums of squares and cross sums."""
+    n_safe = np.maximum(n, 1.0)
+    cov = sab - sa * sb / n_safe
+    va = saa - sa * sa / n_safe
+    vb = sbb - sb * sb / n_safe
+    den = np.sqrt(np.maximum(va * vb, 0.0))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        ncc = np.where(den > 1e-9 * n_safe, cov / den, np.nan)
+    return ncc, n.astype(np.int64)
+
+
+def _moments(x):
+    return _prefix(x), _prefix(x * x)
+
+
+def _xcorr_ncc_full(a0, b0):
+    """:func:`_xcorr_ncc` of finite, standardised signals (all lags)."""
+    sfft, wk = _fft(), _workers()
+    la, lb = len(a0), len(b0)
+    nfft = sfft.next_fast_len(la + lb - 1, real=True)
+    sab = sfft.irfft(sfft.rfft(a0[::-1], nfft, workers=wk) * sfft.rfft(b0, nfft, workers=wk), nfft,
+                     workers=wk)[:la + lb - 1]
+    lags = np.arange(-la + 1, lb)
+    ca, caa = _moments(a0)
+    cb, cbb = _moments(b0)
+    ncc, n = _ncc_from_moments(lags, sab, la, lb, ca, cb, caa, cbb)
+    return lags, ncc, n
+
+
+def _prefix_at(x, idx):
+    """Prefix sums ``P[..., idx]`` (``P[..., i] = x[..., :i].sum(-1)``) of ``x`` and of ``x * x`` for
+    indices in a narrow range, without the full cumulative arrays."""
+    i0, i1 = int(idx.min()), int(idx.max())
+    seg = x[..., i0:i1]
+    p = np.zeros(x.shape[:-1] + (i1 - i0 + 1,))
+    pp = np.zeros_like(p)
+    head = x[..., :i0]
+    p[..., 0] = head.sum(-1)
+    pp[..., 0] = np.einsum('...i,...i->...', head, head)
+    np.cumsum(seg, axis=-1, out=p[..., 1:])
+    np.cumsum(seg * seg, axis=-1, out=pp[..., 1:])
+    p[..., 1:] += p[..., :1]
+    pp[..., 1:] += pp[..., :1]
+    return p[..., idx - i0], pp[..., idx - i0]
+
+
+def _cross_range(a0, b0, lo, hi, block=None):
+    """``sum_n a0[..., n] * b0[..., n + lag]`` (zero outside ``b0``) for ``lag`` in ``[lo, hi]``
+    (rows along leading axes): overlap-save over blocks of ``a0``, batched FFTs. Costs a few FFTs of
+    ``len(a0)`` whatever the lag range (the full correlation needs FFTs of ``len(a0) + len(b0)``), and
+    no padded copies of the signals."""
+    sfft, wk = _fft(), _workers()
+    a0, b0 = np.asarray(a0, float), np.asarray(b0, float)
+    lead = a0.shape[:-1]
+    a0 = a0.reshape(-1, a0.shape[-1])
+    b0 = b0.reshape(-1, b0.shape[-1])
+    rows, la, lb = a0.shape[0], a0.shape[1], b0.shape[1]
+    w = hi - lo + 1
+    m = int(block or max(16 * w, 1 << 13))
+    m = min(m, max(la, 1))
+    nfft = sfft.next_fast_len(m + w - 1, real=True)
+    nb = -(-la // m)
+    out = np.zeros((rows, w))
+    step = max(1, int(2 ** 23 // (nfft * rows)))     # blocks per batched FFT (~64 MB of float64)
+    for k0 in range(0, nb, step):
+        k1 = min(nb, k0 + step)
+        if k1 * m <= la:
+            A = a0[:, k0 * m:k1 * m].reshape(rows, k1 - k0, m)
+        else:
+            A = np.zeros((rows, (k1 - k0) * m))
+            A[:, :la - k0 * m] = a0[:, k0 * m:]
+            A = A.reshape(rows, k1 - k0, m)
+        idx = (np.arange(k0, k1) * m + lo)[:, None] + np.arange(m + w - 1)[None]
+        valid = (idx >= 0) & (idx < lb)
+        B = np.where(valid, b0[:, np.clip(idx, 0, lb - 1)], 0.0)
+        c = sfft.irfft(np.conj(sfft.rfft(A, nfft, axis=-1, workers=wk)) *
+                       sfft.rfft(B, nfft, axis=-1, workers=wk), nfft, axis=-1, workers=wk)
+        out += c[..., :w].sum(-2)
+    return out.reshape(lead + (w,))
+
+
+def _xcorr_ncc_range(a, b, lo, hi):
+    """:func:`_xcorr_ncc` restricted to the integer lags ``lo..hi`` (same scores; NaN-masked inputs fall
+    back to the full correlation). 2-D ``a``, ``b``: row by row (``ncc`` is ``[rows, lags]``)."""
+    lo, hi = int(lo), int(hi)
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    la, lb = a.shape[-1], b.shape[-1]
+    lo, hi = max(lo, -la + 1), min(hi, lb - 1)
+    if hi < lo:
+        return np.zeros(0, np.int64), np.zeros(a.shape[:-1] + (0,)), np.zeros(0, np.int64)
+    if not (np.isfinite(a).all() and np.isfinite(b).all()) or la < 2 or lb < 2:
+        if a.ndim > 1:
+            res = [_xcorr_ncc_range(x, y, lo, hi) for x, y in zip(a, b)]
+            return res[0][0], np.stack([r[1] for r in res]), res[0][2]
+        lags, ncc, n = _xcorr_ncc_masked(a, b)
+        k = (lags >= lo) & (lags <= hi)
+        return lags[k], ncc[k], n[k]
+    a0 = (a - a.mean(-1, keepdims=True)) / (a.std(-1, keepdims=True) + 1e-300)
+    b0 = (b - b.mean(-1, keepdims=True)) / (b.std(-1, keepdims=True) + 1e-300)
+    lags = np.arange(lo, hi + 1)
+    sab = _cross_range(a0, b0, lo, hi)
+    n_lo = np.maximum(0, -lags)
+    n_hi = np.maximum(np.minimum(la, lb - lags), n_lo)
+    alo, aalo = _prefix_at(a0, n_lo)
+    ahi, aahi = _prefix_at(a0, n_hi)
+    blo, bblo = _prefix_at(b0, n_lo + lags)
+    bhi, bbhi = _prefix_at(b0, n_hi + lags)
+    ncc, n = _ncc_from_sums(sab, (n_hi - n_lo).astype(float), ahi - alo, bhi - blo, aahi - aalo, bbhi - bblo)
+    return lags, ncc, n
+
+
+def _cached(cache, key, fn):
+    """``cache[key]`` (computed by ``fn()`` on first use); ``cache=None`` computes every time."""
+    if cache is None:
+        return fn()
+    if key not in cache:
+        cache[key] = fn()
+    return cache[key]
+
+
+def _spec_rows_score(Sa, Sb, block=8):
+    """Mean over rows of :func:`_xcorr_ncc` (NaN -> 0) of ``(Sa[i], Sb[i])`` and the overlap counts:
+    one batched FFT correlation per block of rows (moments from prefix sums)."""
+    sfft, wk = _fft(), _workers()
+    if not (np.isfinite(Sa).all() and np.isfinite(Sb).all()) or Sa.shape[1] < 2 or Sb.shape[1] < 2:
+        acc = None
+        for ncc_rows, lags, n in _xcorr_ncc_rows(Sa, Sb):
+            for ncc in ncc_rows:
+                ncc = np.nan_to_num(ncc)
+                acc = ncc if acc is None else acc + ncc
+        return lags, acc / len(Sa), n
+    la, lb = Sa.shape[1], Sb.shape[1]
+    nfft = sfft.next_fast_len(la + lb - 1, real=True)
+    lags = np.arange(-la + 1, lb)
+    acc = np.zeros(len(lags))
+    for k in range(0, len(Sa), block):
+        a0 = Sa[k:k + block].astype(float)
+        b0 = Sb[k:k + block].astype(float)
+        a0 = (a0 - a0.mean(1, keepdims=True)) / (a0.std(1, keepdims=True) + 1e-300)
+        b0 = (b0 - b0.mean(1, keepdims=True)) / (b0.std(1, keepdims=True) + 1e-300)
+        sab = sfft.irfft(sfft.rfft(a0[:, ::-1], nfft, axis=-1, workers=wk) *
+                         sfft.rfft(b0, nfft, axis=-1, workers=wk), nfft, axis=-1, workers=wk)[:, :la + lb - 1]
+        pre = lambda x: np.concatenate([np.zeros((len(x), 1)), np.cumsum(x, axis=1)], axis=1)
+        ncc, n = _ncc_from_moments(lags, sab, la, lb, pre(a0), pre(b0), pre(a0 * a0), pre(b0 * b0))
+        acc += np.nan_to_num(ncc).sum(0)
+    return lags, acc / len(Sa), n
 
 
 def _parabolic(x, y, i):
@@ -659,9 +883,9 @@ def _window_offsets(a, b, rate, lag0, n_windows, search, min_window=None):
         sb = b[w0 + n0 - r:w1 + n0 + r]
         if np.isfinite(sa).sum() < 8 or np.isfinite(sb).sum() < 8:
             continue
-        lags, ncc, n = _xcorr_ncc(sa, sb)
-        # lag of sb relative to sa, then shift back to the full-signal lag
-        keep = (lags >= 0) & (lags <= 2 * r) & (n >= 0.5 * (w1 - w0))
+        # lag of sb relative to sa (only 0..2r is searched), then shift back to the full-signal lag
+        lags, ncc, n = _xcorr_ncc_range(sa, sb, 0, 2 * r)
+        keep = n >= 0.5 * (w1 - w0)
         if not keep.any() or not np.isfinite(ncc[keep]).any():
             continue
         l, c = lags[keep], ncc[keep]
@@ -889,17 +1113,64 @@ def onset_envelope(x, sr, bin_hz=100, highpass=100.0):
     return flux - flux.mean()
 
 
-def _spectrogram_feature(x, sr, nperseg, freq_limit):
-    f, t, S = _signal.spectrogram(x, sr, nperseg=nperseg, noverlap=nperseg // 2)
-    S = np.log(S[f < freq_limit] + 1e-12)
+def _log_rows(P):
+    S = np.log(P + 1e-12)
     S = S - S.mean(axis=1, keepdims=True)
-    S = S / (S.std(axis=1, keepdims=True) + 1e-12)
-    return S, sr / (nperseg - nperseg // 2), t[0] if len(t) else 0.0
+    return S / (S.std(axis=1, keepdims=True) + 1e-12)
+
+
+def _spectrogram_cached(x, sr, nperseg, freq_limit, pool, cache, key):
+    """:func:`_spectrogram_features` through ``cache`` (short frames under ``key``, pooled ones under
+    ``key + ('pool', pool)``), so one spectrogram serves both scales."""
+    pkey = key + ('pool', pool)
+    if cache is None or key not in cache or (pool > 1 and pkey not in cache):
+        fine, pooled = _spectrogram_features(x, sr, nperseg, freq_limit, pool)
+        if cache is None:
+            return fine, pooled
+        cache.setdefault(key, fine)
+        if pool > 1:
+            cache[pkey] = pooled
+    return cache[key], (cache[pkey] if pool > 1 else None)
+
+
+def _spectrogram_feature(x, sr, nperseg, freq_limit):
+    return _spectrogram_features(x, sr, nperseg, freq_limit, 1)[0]
+
+
+def _spectrogram_features(x, sr, nperseg, freq_limit, pool=1):
+    """Standardised log-spectrogram rows ``(S, frame_rate, t0)`` and, for ``pool > 1``, the same
+    with the power averaged over ``pool`` consecutive frames (None when that leaves < 2 frames)."""
+    f, t, P = _signal.spectrogram(x, sr, nperseg=nperseg, noverlap=nperseg // 2)
+    P = P[f < freq_limit]
+    frate = sr / (nperseg - nperseg // 2)
+    fine = (_log_rows(P), frate, t[0] if len(t) else 0.0)
+    pooled = None
+    m = P.shape[1] // pool if pool > 1 else 0
+    if m >= 2:
+        Pp = P[:, :m * pool].reshape(P.shape[0], m, pool).mean(axis=2)
+        pooled = (_log_rows(Pp), frate / pool, t[0] if len(t) else 0.0)
+    return fine, pooled
+
+
+def _audio_prepare(x, sr, cache, band=(300.0, 8000.0), pool=None, spectrogram=True, onset=False, bin_hz=100):
+    """Fill ``cache`` with the features :func:`audio_offset` / :func:`audio_offset_windowed` compute
+    for signal ``x`` (same keys), so the pairs of a stream can then run in parallel without
+    filtering it twice."""
+    x = _np(x).ravel()
+    bkey = ('bandpass', float(sr), None if band is None else tuple(band))
+    _cached(cache, bkey, lambda: _bandpass(x, sr, band))
+    if spectrogram:
+        nperseg = int(2 ** np.round(np.log2(sr * 0.064)))
+        flim = band[1] if band and band[1] else 8000.0
+        _spectrogram_cached(x, sr, nperseg, flim, int(pool or 1), cache,
+                            ('spectrogram', float(sr), int(nperseg), float(flim)))
+    if onset:
+        _cached(cache, ('onset', float(sr), float(bin_hz)), lambda: onset_envelope(x, sr, bin_hz=bin_hz))
 
 
 def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(300.0, 8000.0), windows=6,
                  window_search=None, exclusion=None, min_confidence=0.05, min_distinctiveness=0.02,
-                 pair=None, nperseg=None, bin_hz=100):
+                 pair=None, nperseg=None, bin_hz=100, pool=None, _cache=None):
     """Offset between two audio signals: ``b[n + offset*sr] ~ a[n]`` (seconds; module convention).
 
     Methods:
@@ -920,6 +1191,12 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
         exclusion: second-peak exclusion radius in seconds (default 0.05 s, 0.5 s for 'onset').
         min_confidence, min_distinctiveness: identifiability thresholds on the peak score and on
             ``peak - second_peak``.
+        pool: ``'spectrogram'`` only: search every lag on frames ``pool`` times longer (power averaged
+            over ``pool`` frames), then the ~64 ms frames only near that peak (multiscale, much faster on
+            long clips; ambiguity is judged on the long frames). None/1 = every lag on the short frames.
+        _cache: internal, ``(dict, dict)`` per-signal caches of the filtered signals and features, reused
+            across the pairs of :func:`aniposelib.workflows.estimate_offsets` (each cache must belong
+            to its signal; None = compute everything).
 
     Returns:
         :class:`OffsetEstimate` (seconds).
@@ -928,8 +1205,14 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
     b = _np(b).ravel()
     if min(len(a), len(b)) < min_overlap * sr:
         raise ValueError('audio shorter than min_overlap')
+    ca, cb = _cache if _cache is not None else (None, None)
+    bkey = ('bandpass', float(sr), None if band is None else tuple(band))
+
+    def bandpassed():
+        return (_cached(ca, bkey, lambda: _bandpass(a, sr, band)),
+                _cached(cb, bkey, lambda: _bandpass(b, sr, band)))
     if method == 'gcc':
-        pa, pb = _bandpass(a, sr, band), _bandpass(b, sr, band)
+        pa, pb = bandpassed()
         lags, sc, n = _lag_curve(pa, pb, sr, max_lag, min_overlap)
         bw = (min(band[1] or sr / 2, sr * 0.45) - (band[0] or 0)) if band else sr / 2
         off, sig, conf, reasons, diag = _peak(lags, sc, sr, max_lag, exclusion or 0.05, min_confidence,
@@ -939,28 +1222,54 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
     if method == 'spectrogram':
         nperseg = nperseg or int(2 ** np.round(np.log2(sr * 0.064)))  # ~64 ms
         flim = band[1] if band and band[1] else 8000.0
-        Sa, frate, _ = _spectrogram_feature(a, sr, nperseg, flim)
-        Sb, _, _ = _spectrogram_feature(b, sr, nperseg, flim)
+        skey = ('spectrogram', float(sr), int(nperseg), float(flim))
+        q = int(pool or 1)
+        feats_a = _spectrogram_cached(a, sr, nperseg, flim, q, ca, skey)
+        feats_b = _spectrogram_cached(b, sr, nperseg, flim, q, cb, skey)
+        (Sa, frate, _), (Sb, _, _) = feats_a[0], feats_b[0]
         hop = nperseg - nperseg // 2
-        acc = None
-        for ncc_rows, lags, n in _xcorr_ncc_rows(Sa, Sb):
-            for ncc in ncc_rows:
-                ncc = np.nan_to_num(ncc)
-                acc = ncc if acc is None else acc + ncc
-        sc = acc / len(Sa)
-        keep = n >= max(int(round(min_overlap * frate)), 2)
+        min_n = max(int(round(min_overlap * frate)), 2)
+        if q > 1 and feats_a[1] is not None and feats_b[1] is not None:
+            # multiscale: every lag at q-times longer frames, then the ~64 ms frames within +-2q
+            # frames of that peak (identical scores there; Lili's legacy coarse-to-fine sync)
+            (Pa, prate, _), (Pb, _, _) = feats_a[1], feats_b[1]
+            plags, psc, pn = _spec_rows_score(Pa, Pb)
+            keep = pn >= max(int(round(min_overlap * prate)), 2)
+            if max_lag is not None:
+                keep &= np.abs(plags) <= int(round(max_lag * prate)) + 1
+            poff, _, _, preasons, pdiag = _peak(plags[keep], psc[keep], prate, max_lag,
+                                                max(exclusion or 4.0 / frate, 2.0 / prate),
+                                                min_confidence, min_distinctiveness)
+            c0 = poff * frate
+            lags, rows, n = _xcorr_ncc_range(Sa, Sb, int(np.floor(c0)) - 2 * q, int(np.ceil(c0)) + 2 * q)
+            sc = np.nan_to_num(rows).sum(0) / len(Sa)
+        else:
+            q, preasons, pdiag = 1, [], None
+            lags, sc, n = _spec_rows_score(Sa, Sb)
+        keep = n >= min_n
         if max_lag is not None:
             keep &= np.abs(lags) <= int(round(max_lag * frate)) + 1
         coarse_lags, coarse_sc = lags[keep], sc[keep]
         coff, _, cconf, creasons, cdiag = _peak(coarse_lags, coarse_sc, frate, max_lag,
                                                 exclusion or 4.0 / frate, min_confidence,
                                                 min_distinctiveness)
+        if q > 1:
+            # global ambiguity is judged on the long frames; the short-frame curve adds its peak
+            # score and a peak on the edge of its narrow range
+            creasons = list(preasons) + [r for r in creasons if r != 'ambiguous_second_peak'
+                                         and r not in preasons]
+            cdiag['pooled'] = pdiag
+            cdiag['pool'] = q
         # the spectrogram frames of a and b are both centred at the same in-segment time, so lags map directly
         coarse = coff
-        pa, pb = _bandpass(a, sr, band), _bandpass(b, sr, band)
+        pa, pb = bandpassed()
         r = 3.0 * hop / sr
-        lags, sc2, n2 = _lag_curve(pa, pb, sr, None, min_overlap)
-        m = np.abs(lags / sr - coarse) <= r
+        # gcc only within +-r of the coarse lag (the same lags and scores as the full curve, masked)
+        lags, sc2, n2 = _xcorr_ncc_range(pa, pb, int(np.floor((coarse - r) * sr)) - 1,
+                                         int(np.ceil((coarse + r) * sr)) + 1)
+        m = (np.abs(lags / sr - coarse) <= r) & (n2 >= max(int(round(min_overlap * sr)), 2))
+        if not m.any():
+            raise ValueError('no lag has enough overlap (min_overlap={} s)'.format(min_overlap))
         off, sig, conf, reasons, diag = _peak(lags[m], sc2[m], sr, None, exclusion or 0.05, -np.inf, -np.inf,
                                               overlap=n2[m], n_eff_per_s=sr)
         reasons = list(creasons)  # identifiability is decided at the coarse (global) scale
@@ -970,8 +1279,9 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
         return _finish(off, sig, cconf, reasons, diag, 'spectrogram', 's', pair, pa, pb, sr, windows,
                        window_search or 0.02)
     if method == 'onset':
-        ea = onset_envelope(a, sr, bin_hz=bin_hz)
-        eb = onset_envelope(b, sr, bin_hz=bin_hz)
+        okey = ('onset', float(sr), float(bin_hz))
+        ea = _cached(ca, okey, lambda: onset_envelope(a, sr, bin_hz=bin_hz))
+        eb = _cached(cb, okey, lambda: onset_envelope(b, sr, bin_hz=bin_hz))
         lags, sc, n = _lag_curve(ea, eb, bin_hz, max_lag, min_overlap)
         off, sig, conf, reasons, diag = _peak(lags, sc, bin_hz, max_lag, exclusion or 0.5, min_confidence,
                                               min_distinctiveness, overlap=n)
@@ -982,8 +1292,11 @@ def audio_offset(a, b, sr, max_lag=None, min_overlap=8.0, method='gcc', band=(30
 
 
 def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 8000.0), windows=24,
-                          min_window=20.0, search=None, min_score=0.01, pair=None):
-    """Offset of long recordings: a coarse lag from the whole clips (``method='spectrogram'``), then
+                          min_window=20.0, search=None, min_score=0.01, pair=None, coarse_pool=8,
+                          _cache=None):
+    """Offset of long recordings: a coarse lag from the whole clips (``method='spectrogram'``, multiscale
+    with ``pool=coarse_pool``: every lag on ~0.5 s frames, then the ~64 ms frames near that peak; 1 = every
+    lag on the ~64 ms frames, the 1.1 pre-release behaviour), then
     ``'gcc'`` in ``windows`` windows (at least ``min_window`` s each, searched +-``search`` s around the
     coarse lag; default 0.1 s or 100 ppm of the clip length) and a robust line through the window
     estimates (3 rounds, residuals > 4 MAD dropped). Full-length gcc loses coherence when the clocks
@@ -1000,7 +1313,7 @@ def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 
     a = _np(a).ravel()
     b = _np(b).ravel()
     co = audio_offset(a, b, sr, max_lag=max_lag, min_overlap=min_overlap, method='spectrogram', band=band,
-                      windows=0, pair=pair)
+                      windows=0, pair=pair, pool=coarse_pool, _cache=_cache)
     diag = {'coarse_offset': float(co.offset), 'coarse_identifiable': bool(co.identifiable),
             'coarse_reasons': list(co.reasons), 'sigma_method': 'windowed_gcc'}
     if not co.identifiable:
@@ -1009,7 +1322,10 @@ def audio_offset_windowed(a, b, sr, max_lag=None, min_overlap=8.0, band=(300.0, 
                               pair=pair, diagnostics=diag)
     dur = min(len(a), len(b)) / sr
     search = float(search) if search is not None else max(0.1, 1e-4 * dur)
-    pa, pb = _bandpass(a, sr, band), _bandpass(b, sr, band)
+    ca, cb = _cache if _cache is not None else (None, None)
+    bkey = ('bandpass', float(sr), None if band is None else tuple(band))
+    pa = _cached(ca, bkey, lambda: _bandpass(a, sr, band))
+    pb = _cached(cb, bkey, lambda: _bandpass(b, sr, band))
     nw = int(max(3, min(int(windows), max(3, int(dur // min_window)))))
     wt, wo, ws = _window_offsets(pa, pb, sr, co.offset, nw, search, min_window=min_window)
     good = ws > min_score

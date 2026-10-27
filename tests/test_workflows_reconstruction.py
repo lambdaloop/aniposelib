@@ -448,6 +448,32 @@ def test_offsets_windowed_audio_drift():
     assert res.sigmas['b'] > 1e-5
 
 
+def test_offsets_audio_threads_and_coarse_pool_equivalent():
+    """Audio pairs in threads (per-stream caches) and the multiscale coarse lag give the serial,
+    short-frame results."""
+    from test_sync import _delayed
+    sr = 2000
+    rng = np.random.default_rng(4)
+    a = _bursts(sr * 150, sr, rng, n_events=400)
+    st = {'a': {'audio': (a, sr)}, 'b': {'audio': (_delayed(a, sr, 1.3, rate=1e-4, rng=rng), sr)},
+          'c': {'audio': (_delayed(a, sr, -2.1, rate=-5e-5, rng=rng)[:sr * 140], sr)}}
+    base = {'audio_strategy': 'windowed', 'audio_window_s': 10.0}
+    ref = W.estimate_offsets(st, reference='a', options={**base, 'audio_threads': 1, 'audio_coarse_pool': 1})
+    for extra in ({'audio_threads': 3}, {'audio_threads': 1}):
+        res = W.estimate_offsets(st, reference='a', options={**base, **extra})
+        assert res.settings['audio_threads'] == extra['audio_threads']
+        for n in st:
+            assert res.offsets[n] == pytest.approx(ref.offsets[n], abs=1e-9)
+            assert res.rates[n] == pytest.approx(ref.rates[n], abs=1e-12)
+        assert [p['offset_raw'] for p in res.pairs] == pytest.approx([p['offset_raw'] for p in ref.pairs], abs=1e-9)
+    assert abs(res.offsets['b'] - 1.3) < 5e-3 and abs(res.offsets['c'] + 2.1) < 5e-3
+    g = W.estimate_offsets({k: {'audio': (v['audio'][0][:sr * 40], sr)} for k, v in st.items()}, reference='a',
+                           options={'audio_threads': 3})
+    g1 = W.estimate_offsets({k: {'audio': (v['audio'][0][:sr * 40], sr)} for k, v in st.items()}, reference='a',
+                            options={'audio_threads': 1})
+    assert g.pairs == g1.pairs
+
+
 def test_offsets_drift_unidentifiable_and_irregular_times(sync_scene):
     cg, streams, off, rate = sync_scene
     names = list(streams)
