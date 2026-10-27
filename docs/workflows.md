@@ -50,6 +50,12 @@ result = al.evaluate_calibration(cgroup, points2d,
                                  options={'verdict': {'loo_worst_px': (5, 15)}})   # warn above 5 px, fail above 15
 ```
 
+**Speed.** Functions with a `device=` argument (`calibrate_from_points`, `evaluate_calibration`,
+`estimate_offsets`, `reconstruct_3d`) run their heavy steps on the GPU when there is one (`device='auto'`; pass
+`device='cpu'` to stay on the CPU), and the results always come back as numpy. On the CPU each function uses at most 8 threads, because more
+threads make the many small steps slower, especially on a shared machine; set `ANIPOSELIB_NUM_THREADS` (or
+`OMP_NUM_THREADS`) to change that.
+
 **Saving.** Calibration functions accept `out='calibration.toml'`, which saves the calibration and a report next to it
 (`calibration.report.json`). Without `out`, nothing is written to disk.
 
