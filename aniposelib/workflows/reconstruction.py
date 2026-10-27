@@ -1623,7 +1623,7 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     if refine_windows is not None:
         refine = True
     # clip starts on the device clock (ties between the clips of one device)
-    starts, start_sig = {}, {}
+    starts, start_sig, clip_unknown = {}, {}, []
     cs = opts['clip_start']
     if isinstance(cs, str):
         if cs != 'container':
@@ -1636,7 +1636,8 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     elif cs is not None:
         for n, v in dict(cs).items():
             if str(n) not in data:
-                raise ValueError('clip_start: {!r} is not a stream'.format(n))
+                clip_unknown.append(str(n))      # e.g. a clip left out of this call
+                continue
             s0, sg = v if isinstance(v, (tuple, list)) else (v, None)
             if s0 is None:
                 continue
@@ -1685,6 +1686,8 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
     if tie_groups:
         settings['clip_start'] = {n: [starts[n], start_sig[n]] for g in tie_groups.values() for n in g}
     pairs, edges, windows, disagreements, fallbacks = [], [], {}, [], []
+    if clip_unknown:
+        fallbacks.append('clip_start: not streams of this call, ignored: {}'.format(clip_unknown))
     irregular = [n for n, d in data.items() if d['meta'].get('time_jitter', 0.0) > opts['max_time_jitter']]
     for n in irregular:
         fallbacks.append('stream {}: irregular frame times (jitter {:.2g}); frame rate from the mean '
@@ -1999,6 +2002,17 @@ def estimate_offsets(streams, cgroup=None, reference=None, drift=True, refine=Fa
                     timemaps[n] = _corrected(seedtm[n], gk, dlt + rc * (gk - tm_), fallbacks, n)
                 else:
                     timemaps[n] = S.TimeMap.from_offset(a0s[n], rate=rates_out[n])
+            # tied clips of one device without points here share their siblings' correction
+            for dv, g in tie_groups.items():
+                got = [n for n in g if n in refined['delta']]
+                for n in g:
+                    if n in got or n not in a0s or not got:
+                        continue
+                    dlt = float(np.mean([refined['delta'][m] for m in got]))
+                    refined.setdefault('delta_from_siblings', {})[n] = dlt
+                    a0s[n] = a0s[n] - dlt
+                    timemaps[n] = (_corrected(seedtm[n], [0.0], [dlt], fallbacks, n) if n in knotted
+                                   else S.TimeMap.from_offset(a0s[n], rate=rates_out[n]))
     elif refine:
         refined = _refine_windows(cgroup, data, names, ref, seedtm, sigmas, drift, opts, settings,
                                   fallbacks, timer, refine_windows, dev_of, tie_groups, stba_kw)

@@ -605,8 +605,8 @@ def test_offsets_shared_clock_clip_start():
     for n, s0 in (('b1', 0.0), ('b2', 80.0)):
         g = 100.0 if n == 'b2' else 30.0
         assert abs(res.timemaps[n].to_source(g) - (1.3 + (1 + 2e-4) * g - s0)) < 2e-3
-    with pytest.raises(ValueError):
-        W.estimate_offsets(st, options=dict(opts, clip_start={'zz': 0.0}))
+    r = W.estimate_offsets(st, reference='a', options=dict(opts, clip_start={'zz': 0.0}))
+    assert any('zz' in f for f in r.provenance['fallbacks'])
 
 
 def test_offsets_audio_delay_sigma(sync_scene):
@@ -645,3 +645,21 @@ def test_offsets_refine_windows_piecewise(sync_scene):
     r2 = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=res)
     assert r2.timemaps[names[1]].knots == tm.knots
     json.dumps(res.to_dict())
+
+
+def test_offsets_refine_tied_clip_without_points(sync_scene):
+    """A clip of the same device with known start and no points here gets its sibling's correction."""
+    from aniposelib import sync as S
+    cg, streams, off, rate = sync_scene
+    names = list(streams)
+    p, t = streams[names[1]]['points']
+    pts = {n: {'points': streams[n]['points']} for n in names[:2]}
+    pts['later'] = {'points': (np.full((3,) + p.shape[1:], np.nan), np.arange(3) / 30.0)}
+    seed = {names[0]: S.TimeMap.from_offset(0.0), names[1]: S.TimeMap.from_offset(off[names[1]] + 0.005),
+            'later': S.TimeMap.from_offset(off[names[1]] + 0.005 - 100.0)}
+    res = W.estimate_offsets(pts, cgroup=cg, reference=names[0], seed=seed, refine=True,
+                             options={'stream_camera': {'later': names[1]},
+                                      'clip_start': {names[1]: 0.0, 'later': 100.0}})
+    assert abs(res.offsets[names[1]] - off[names[1]]) < 2e-3
+    assert abs(res.offsets['later'] - (off[names[1]] - 100.0)) < 2e-3
+    assert 'later' in res.refined['delta_from_siblings']
