@@ -56,6 +56,7 @@ Conventions
 
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -176,6 +177,10 @@ W1_DEFAULTS = dict(
     object_sigma=None,        # static PointObject: not supported yet (points held fixed)
     min_bridge_points=6,      # bridge: minimum points per extra component
     focal_guess=None,         # lens ladder: extra focal starts (px), a float or {camera name: f} (e.g. phones)
+    focal_guess_tol=0.25,     # ... the ladder keeps a fit within this |log(f / guess)| (else a nominal lens at the guess)
+    focal_guess_sigma=0.1,    # ... and the board BA has a log-focal prior of this sigma around the guess
+    drag_check_ratio=3.0,     # verdict: when the worst camera's board error is > this x the median camera's, the BA is
+    drag_deg=(1.0, 3.0),      # ... re-run without it; others' relative rotations moving > warn / fail deg = it drags them
     runaway_ratio=10.0,       # verdict: camera centre farther than this x the median distance from the rig centre
     board_ratio=(3.0, 8.0),   # verdict: worst camera's board error / median camera's (warn, fail)
     noise_unit='auto',        # bridge MSAC threshold = 10 noise units; a float forces the unit
@@ -420,6 +425,14 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
             fg = opts['focal_guess']
             fg = fg.get(n) if isinstance(fg, dict) else fg
             lkw = dict(focal_inits=[float(v) for v in np.atleast_1d(fg)]) if fg is not None else {}
+            fgs = [float(v) for v in np.atleast_1d(fg)] if fg is not None else []
+            ftol = float(opts['focal_guess_tol'])
+
+            def near_guess(f):
+                fx = float(np.asarray(f.K)[0, 0])
+                return fx > 0 and min(abs(np.log(fx / g)) for g in fgs) <= ftol
+            if fgs:
+                lkw['plausible'] = near_guess
             try:
                 lr = I.calibrate_ladder_rows(r, board, size, min_corners=opts['min_corners'], models=models, **lkw)
                 if fish and not I.is_fisheye(lr.selected):
@@ -427,6 +440,22 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
                     sel = fits[0] if fits else None
                 else:
                     sel = lr.selected
+                if fgs and sel is not None and not near_guess(lr.fits[sel]):
+                    # focal_guess constrains the ladder: best held-out fit near the guess, else
+                    # a nominal lens at the guess (the board BA then refines it under the prior)
+                    ok = [m for m, f in lr.fits.items() if f.status != 'failed' and near_guess(f)
+                          and m != 'rational_8param' and (not fish or I.is_fisheye(m))
+                          and np.isfinite(f.heldout.get('p95', np.inf))]
+                    sel = min(ok, key=lambda m: lr.fits[m].heldout['p95']) if ok else None
+                    if sel is None:
+                        w, h = size
+                        _set_intrinsics(cam, [[fgs[0], 0, w / 2.0], [0, fgs[0], h / 2.0], [0, 0, 1]], None,
+                                        opts['min_n_dist'])
+                        lens[n] = dict(source='focal_guess', table=[list(t) for t in lr.table()],
+                                       reason='no ladder fit within {:.0%} of focal_guess {}'.format(
+                                           np.expm1(ftol), fgs))
+                        fallbacks.append('{}: ladder focal far from focal_guess, nominal lens at the guess'.format(n))
+                        continue
                 if sel is None or sel == 'rational_8param':
                     raise ValueError('no usable lens model for this camera type')
                 fit = lr.fits[sel]
@@ -465,6 +494,11 @@ def _fit_intrinsics(cg, rows, board, mode, init, opts, rng):
                 lens[n] = dict(source=None, reason='no view with >= 6 non-coplanar annotated points')
                 missing.append(n)
     return lens, missing, fallbacks
+
+
+def _rotmat(cam):
+    from scipy.spatial.transform import Rotation
+    return Rotation.from_rotvec(np.asarray(to_numpy(cam.get_rotation()), float).reshape(3)).as_matrix()
 
 
 def _board_ba(cg, imgp, extra, spec, diag, opts, rng, only_extrinsics=False, prune=None):
@@ -632,6 +666,10 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
     - ``lens_invalid``: cameras whose lens model is not invertible over the image (warn);
     - ``board_reproj_ratio``: worst camera's median board error / the median camera's; warn above 3,
       fail above 8 (``options['board_ratio']``): one camera with a wrong lens skews the others;
+    - ``camera_drag_deg``: when ``board_reproj_ratio`` is above ``drag_check_ratio`` (3), the board BA
+      is re-run without the worst camera; the largest change of the other cameras' relative
+      rotations, warn above 1 deg, fail above 3 deg (``options['drag_deg']``): that camera drags
+      the rig (wrong lens or focal);
     - ``runaway_cameras``: centres farther than ``options['runaway_ratio']`` (10) x the median
       distance from the rig centre (fail);
     - ``bridge_inlier_frac`` (with ``bridge_points``): smallest share of a bridged component's
@@ -648,7 +686,9 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
     read and why it stopped. A missing video raises ``FileNotFoundError``.
 
     ``options['focal_guess']`` (a float or ``{camera name: f}``, px) adds focal starts to the lens
-    ladder (phones / unusual lenses); ``prior_sigma_logf`` / ``prior_sigma_k`` may be
+    ladder (phones / unusual lenses), keeps the ladder fit within ``focal_guess_tol`` (25 %) of it
+    (else a nominal lens at the guess) and puts a log-focal prior (``focal_guess_sigma``, 0.1)
+    around it in the board BA; ``prior_sigma_logf`` / ``prior_sigma_k`` may be
     ``{camera name: sigma, 'default': sigma}``; ``noise_unit`` forces the bridge noise unit.
     """
     from .. import quality as Q
@@ -752,6 +792,25 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
         spec = ParamSpec(intrinsics=None, priors=IntrinsicsPrior(intrinsics,
                                                                  sigma_logf=_sigma_opt(opts['prior_sigma_logf'], 0.05),
                                                                  sigma_k=_sigma_opt(opts['prior_sigma_k'], 0.1)))
+    elif opts['focal_guess'] is not None:
+        # focal_guess: a log-focal prior around the guess in the board BA too (phones), so one
+        # camera with a weak board view set cannot drift to a wrong focal and drag the others
+        fgd = opts['focal_guess']
+        ref = []
+        for n, cam in zip(names, cg.cameras):
+            g = fgd.get(n) if isinstance(fgd, dict) else fgd
+            if g is None or n in missing:
+                continue
+            g = float(np.atleast_1d(g)[0])
+            rc = cam.copy() if hasattr(cam, 'copy') else None
+            if rc is None:
+                continue
+            K = to_numpy(cam.get_camera_matrix()).astype(float).copy()
+            K[0, 0] = K[1, 1] = g
+            rc.set_camera_matrix(K)
+            ref.append(rc)
+        spec = ParamSpec(intrinsics=None, priors=IntrinsicsPrior(ref, sigma_logf=float(opts['focal_guess_sigma'])))
+        settings['focal_guess_prior'] = dict(cameras=[c.get_name() for c in ref], sigma_logf=float(opts['focal_guess_sigma']))
     else:
         spec = ParamSpec(intrinsics=None)
     if static and opts['object_sigma'] is not None:
@@ -905,8 +964,41 @@ def calibrate_from_board(videos_or_rows, board, cam_names=None, fisheye=False, i
             if mm > 0:
                 w, ratio_cam = max(meds)
                 ratio = w / mm
+    # one camera far worse than the others: does it drag them? Re-run the board BA without its
+    # observations and measure how far the other cameras' relative rotations move (dancing: a phone
+    # with a wrong focal pulled the GoPros 8-15 deg while the board error ratio said only 'warn')
+    drag_deg, drag_cam = None, None
+    if (cgroup is not None and not static and bridge_rep is None and len(comps) <= 1 and ratio is not None
+            and opts['drag_check_ratio'] is not None and ratio > opts['drag_check_ratio'] and C >= 4):
+        with timer('drag_check'):
+            try:
+                wi = names.index(ratio_cam)
+                cg2 = cgroup.copy()
+                ip2 = np.array(imgp, float, copy=True)
+                ip2[wi] = np.nan
+                keep = np.isfinite(ip2).all(-1).sum(0) >= 2
+                ex2 = dict(objp=extra['objp'][keep], ids=extra['ids'][keep],
+                           rvecs=extra['rvecs'][:, keep], tvecs=extra['tvecs'][:, keep])
+                _board_ba(cg2, ip2[:, keep], ex2, spec, diag, opts, rng)
+                others = [i for i, n in enumerate(names) if i != wi and n not in uncovered and n not in missing]
+                Ra = [_rotmat(c) for c in cgroup.cameras]
+                Rb = [_rotmat(c) for c in cg2.cameras]
+                ref_i = others[0]
+                ang = []
+                for i in others[1:]:
+                    da = Ra[i] @ Ra[ref_i].T
+                    db = Rb[i] @ Rb[ref_i].T
+                    cosv = (np.trace(da @ db.T) - 1) / 2
+                    ang.append(float(np.degrees(np.arccos(np.clip(cosv, -1, 1)))))
+                drag_deg, drag_cam = (max(ang) if ang else None), ratio_cam
+                report['drag_check'] = dict(camera=ratio_cam, max_relative_rotation_deg=drag_deg)
+            except Exception as exc:  # pragma: no cover
+                reasons_extra.append('drag check failed: {}'.format(exc))
     rules = [
         Rule('board_reproj_px', worst_px, thr, 2 * thr, 'worst per-camera median board reprojection'),
+        Rule('camera_drag_deg', drag_deg, opts['drag_deg'][0], opts['drag_deg'][1],
+             'the other cameras\' relative rotations move this much when the worst camera ({}) is left '
+             'out of the board BA: it drags them (wrong lens / focal; try intrinsics= or focal_guess)'.format(drag_cam)),
         Rule('board_reproj_ratio', ratio, opts['board_ratio'][0], opts['board_ratio'][1],
              'worst camera ({}) board error / the median camera\'s'.format(ratio_cam)),
         Rule('runaway_cameras', len(runaway), None, 0,
@@ -1000,6 +1092,10 @@ W2_DEFAULTS = dict(
     intrinsics_sigma_logf=0.05, intrinsics_sigma_k=0.1,   # ... under priors around the given ones (or {name: sigma})
     heldout_every=5,          # refine_intrinsics='auto': every k-th window is held out
     intrinsics_gain=0.02,     # ... accepted if the held-out LOO median improves by this fraction
+    intrinsics_min_heldout_obs=100,     # ... and every camera has >= this many held-out LOO observations
+    intrinsics_min_heldout_windows=10,  # ... from >= this many held-out windows
+    intrinsics_alpha=0.05,    # ... and the gain is > 0 in >= 1 - alpha of a paired bootstrap over held-out windows
+    intrinsics_n_boot=200,    # ... bootstrap resamples
     intrinsics_share=None,    # refine_intrinsics: None | 'all' | groups of camera names/indices sharing f + k1
     min_inlier_frames=20,     # verdict: frames with inliers per camera
     runaway_ratio=5.0,        # verdict: camera centre farther than this x the median from the rig centre ...
@@ -1318,9 +1414,57 @@ def _heldout_mask(pc, gr, every):
     return (block % every) == (2 % every)
 
 
-def _loo_stats(cg, p, tau_tri, agree_px):
+def _heldout_windows(pc, gr):
+    """Window id of each flattened point column (as :func:`_heldout_mask` groups them)."""
+    N = pc.shape[1]
+    w = gr.get('window', gr.get('frame'))
+    w = np.arange(N) if w is None else np.asarray(w)
+    if w.ndim > 1:
+        w = w[:, 0]
+    w = np.unique(w, return_inverse=True)[1].reshape(-1)
+    J = int(np.prod(pc.shape[2:-1])) if pc.ndim > 3 else 1
+    return np.repeat(w, J)
+
+
+def _boot_gain(err0, err1, wcol, n_boot, rng, max_obs=50000):
+    """Paired bootstrap over windows of the relative gain of the median of per-camera LOO medians
+    (``err [C, M]``: NaN = not eligible, inf = miss; medians over the finite ones). Each resample
+    draws windows with replacement; a camera's median is then a weighted median of its
+    observations (weight = times its window was drawn). Returns the gains ``[n_boot]``."""
+    err0, err1 = np.asarray(err0, float), np.asarray(err1, float)
+    labs, inv = np.unique(wcol, return_inverse=True)
+    nW = len(labs)
+    if nW < 2 or n_boot <= 0:
+        return np.zeros(0)
+    gen = np.random.default_rng(rng if isinstance(rng, (int, np.integer)) else 0)
+    Wt = np.stack([np.bincount(gen.integers(0, nW, nW), minlength=nW) for _ in range(n_boot)], 1).astype(np.int32)  # [nW, B]
+
+    def wmed(err):
+        out = np.full((err.shape[0], n_boot), np.nan)
+        for c in range(err.shape[0]):
+            ix = np.flatnonzero(np.isfinite(err[c]))
+            if len(ix) > max_obs:
+                ix = np.sort(gen.choice(ix, max_obs, replace=False))
+            if not len(ix):
+                continue
+            o = np.argsort(err[c, ix])
+            e, w = err[c, ix][o], Wt[inv[ix][o]]             # [m], [m, B]
+            cw = np.cumsum(w, 0)
+            tot = cw[-1]
+            k = np.minimum((cw < 0.5 * tot[None]).sum(0), len(e) - 1)
+            out[c] = np.where(tot > 0, e[k], np.nan)
+        with np.errstate(all='ignore'), warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            return np.nanmedian(out, 0)
+    m0, m1 = wmed(err0), wmed(err1)
+    with np.errstate(all='ignore'):
+        g = (m0 - m1) / m0
+    return g[np.isfinite(g)]
+
+
+def _loo_stats(cg, p, tau_tri, agree_px, result=False):
     """Held-out LOO summary: ``(median of per-camera medians, mean agree@agree_px, mean coverage)``
-    (inf / 0 / 0 when nothing could be measured)."""
+    (inf / 0 / 0 when nothing could be measured); ``result=True`` appends the ``LOOResult``."""
     from .. import quality as Q
     r = Q.loo_reprojection(cg, p, tau_tri=tau_tri, min_others=min(3, max(len(cg.cameras) - 1, 1)),
                            thresholds=(agree_px,))
@@ -1328,8 +1472,9 @@ def _loo_stats(cg, p, tau_tri, agree_px):
     key = [k for k in next(iter(r.per_camera.values())) if k.startswith('agree@')][0]
     ag = [v[key] for v in r.per_camera.values() if v[key] is not None]
     cv = [v['coverage'] for v in r.per_camera.values() if v['coverage'] is not None]
-    return (float(np.nanmedian(m)) if np.isfinite(m).any() else np.inf,
-            float(np.mean(ag)) if ag else 0.0, float(np.mean(cv)) if cv else 0.0)
+    out = (float(np.nanmedian(m)) if np.isfinite(m).any() else np.inf,
+           float(np.mean(ag)) if ag else 0.0, float(np.mean(cv)) if cv else 0.0)
+    return out + (r,) if result else out
 
 
 def _loo_median(cg, p, tau_tri):
@@ -1408,7 +1553,8 @@ def _gate_intrinsics(cg, pc, gr, mode, nf, opts, rng):
     observed pixels, monotone radial map) is put back to the given one (that camera only, then an
     extrinsics re-fit). ``'auto'`` keeps the refinement
     only if, on held-out windows, the LOO median improves by ``intrinsics_gain`` and neither the
-    LOO agreement nor the LOO coverage gets worse. Never raises: a failed fit keeps the given
+    LOO agreement nor the LOO coverage gets worse, with enough held-out evidence (observations per
+    camera, windows) and a significant paired-bootstrap gain over the held-out windows. Never raises: a failed fit keeps the given
     intrinsics (``decision='kept'``, the error in ``reason``)."""
     try:
         return _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng)
@@ -1462,13 +1608,23 @@ def _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng):
     B.bundle_adjust_lm(base, _flat(train), only_extrinsics=True, loss='cauchy', f_scale=f_scale, n_iter=20, rng=rng)
     trial, bad = fit(base.copy(), train)
     agree_px = 8.0 * u
-    e0, a0, c0 = _loo_stats(base, test, 5.0 * u, agree_px)
-    e1, a1, c1 = _loo_stats(trial, test, 5.0 * u, agree_px)
+    e0, a0, c0, r0 = _loo_stats(base, test, 5.0 * u, agree_px, result=True)
+    e1, a1, c1, r1 = _loo_stats(trial, test, 5.0 * u, agree_px, result=True)
     gain = (e0 - e1) / e0 if np.isfinite(e0) and e0 > 0 else 0.0
+    # held-out evidence: supported LOO observations per camera, held-out windows, and a paired
+    # bootstrap over held-out windows of the gain (same resampled windows for both lenses)
+    wcol = _heldout_windows(pc, gr)
+    n_obs = np.isfinite(np.asarray(r0.errors, float)).sum(1)
+    hw = np.unique(wcol[np.isfinite(np.asarray(r0.errors, float)).any(0)])
+    gb = _boot_gain(r0.errors, r1.errors, wcol, int(opts['intrinsics_n_boot']), rng)
+    p_better = float(np.mean(gb > 0)) if len(gb) else 0.0
     info = dict(base_info, heldout_loo_fixed_px=e0, heldout_loo_refined_px=e1, gain=gain,
                 heldout_agree_fixed=a0, heldout_agree_refined=a1, heldout_coverage_fixed=c0,
                 heldout_coverage_refined=c1, agree_px=agree_px, min_gain=opts['intrinsics_gain'],
-                n_heldout_points=int(ho.sum()), invalid_in_trial=bad)
+                n_heldout_points=int(ho.sum()), invalid_in_trial=bad,
+                n_heldout_obs_min=int(n_obs.min()) if len(n_obs) else 0, n_heldout_windows=int(len(hw)),
+                gain_ci90=[float(np.quantile(gb, 0.05)), float(np.quantile(gb, 0.95))] if len(gb) else None,
+                p_better=p_better)
     if bad and len(bad) == C:
         info.update(decision='kept', reason='every refined lens was invalid')
         return cg, info
@@ -1479,6 +1635,15 @@ def _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng):
         why.append('LOO agree@{:.3g}px fell {:.3f} -> {:.3f}'.format(agree_px, a0, a1))
     if c1 < c0 - 0.005:
         why.append('LOO coverage fell {:.3f} -> {:.3f}'.format(c0, c1))
+    if len(n_obs) and n_obs.min() < opts['intrinsics_min_heldout_obs']:
+        why.append('too little held-out evidence: {} has {} held-out LOO observations < {}'.format(
+            names[int(np.argmin(n_obs))], int(n_obs.min()), opts['intrinsics_min_heldout_obs']))
+    if len(hw) < opts['intrinsics_min_heldout_windows']:
+        why.append('too little held-out evidence: {} held-out windows < {}'.format(
+            len(hw), opts['intrinsics_min_heldout_windows']))
+    if not why and p_better < 1.0 - opts['intrinsics_alpha']:
+        why.append('gain not significant over held-out windows (bootstrap P(gain > 0) = {:.2f} < {:.2f})'.format(
+            p_better, 1.0 - opts['intrinsics_alpha']))
     if not why:
         _, bad = fit(cg, pc)
         info.update(decision='refined', reason='held-out LOO improved by {:.1%} (agree {:.3f} -> {:.3f})'.format(
@@ -1532,7 +1697,11 @@ def calibrate_from_points(points, intrinsics, init='auto', frames=None, groups=N
     groups : ``dict(frame=, window=, keypoint=, time=)`` ids per point (or an array = frame
         ids): SfM frames/windows, structured rejection, held-out windows, station times.
     refine_intrinsics : ``'auto'`` (focal + k1 under priors, kept only if the held-out LOO
-        improves by ``intrinsics_gain``), True (always) or False.
+        improves by ``intrinsics_gain`` on enough held-out evidence: every camera has
+        ``intrinsics_min_heldout_obs`` (100) held-out LOO observations from
+        ``intrinsics_min_heldout_windows`` (10) windows, and a paired bootstrap over the held-out
+        windows finds a gain > 0 in at least ``1 - intrinsics_alpha`` (95 %) of the resamples;
+        ``result.intrinsics['reason']`` says why it was kept or refused), True (always) or False.
     scale : None, a float, a reference ``CameraGroup``, or keyword arguments of
         :func:`estimate_scale` (``dict(board=, board_points=)``, ``dict(lengths=dict(points=,
         pairs=, ref=))``, ``dict(reference=, align=)``; the 1.0 recipe's ``dict(board=, rows=)`` /
@@ -2362,7 +2531,7 @@ W4_DEFAULTS = dict(
     tau_px=None,              # robust triangulation threshold (default 10 noise units)
     tau_tri_px=None,          # LOO triangulation threshold (default 5 noise units)
     thresholds_px=None,       # LOO agreement thresholds (default (5, 8, 10) noise units)
-    loo_window_s='auto',      # time-blocked LOO with times=: window (s); 'auto' ~ 20 windows; None = off
+    loo_window_s='auto',      # time-blocked LOO with times=: window (s); 'auto' ~ 20 windows, at most 3600 s; None = off
     min_window_obs=200,       # ... windows with fewer eligible observations are not judged
     bad_window_ratio=0.5,     # ... a camera is bad in a window when its LOO coverage / agreement < this x its median
     min_bad_cameras=None,     # ... a window is bad when this many cameras are (None: max(2, 25 % of the cameras))
@@ -2379,6 +2548,10 @@ W4_DEFAULTS = dict(
     yardstick_tau_px=5.0,     # ... their LOO triangulation threshold (absolute px; the Emory / tailcyclenet yardstick)
     rank_by=8,                # ... compare_to ranks by agree@<rank_by>px (report['ranking'], 'better')
     rank_min_delta=0.01,      # ... rule compare_to_better: another calibration agrees >= this much more (CI > 0)
+    moves_before_ratio=0.5,   # a step is a move only if, just before it, the camera's LOO agreement was >= this x the others' (None: off)
+    moves_after_ratio=0.7,    # ... and, for a step of > 2 agreement thresholds in pixels, it drops below this x that after it
+    static_bad_ratio=0.5,     # a camera whose LOO agreement is below this x the others' from its first windows on is
+                              # a calibration error, not a move: left out of the move tests (None: off)
     verdict=None,
 )
 
@@ -2447,7 +2620,7 @@ def _paired_agree(e0, e1, eligible, clusters, thresholds, n_boot, seed=0):
     return out
 
 
-def _auto_window(times):
+def _auto_window(times, max_s=3600.0):
     t = np.asarray(times, float)
     t = t[np.isfinite(t)]
     if len(t) < 2:
@@ -2457,7 +2630,10 @@ def _auto_window(times):
         return None
     w = span / 20.0
     e = 10 ** np.floor(np.log10(w))       # a round number: 1, 2 or 5 x 10^k
-    return float(min((m * e for m in (1, 2, 5, 10)), key=lambda v: abs(np.log(v / w))))
+    w = float(min((m * e for m in (1, 2, 5, 10)), key=lambda v: abs(np.log(v / w))))
+    # long sessions: at most hourly windows, so an hour of broken data is a bad window (with
+    # 46 h, 20 windows of 20000 s hid it and a false move in it could not be demoted)
+    return min(w, float(max_s)) if max_s else w
 
 
 @thread_guard
@@ -2490,7 +2666,7 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     whatever the noise: LOO agreement at (5, 8, 10) px with an MSAC 5 px triangulation, Emory's
     agree@8; per camera ``loo_agree@8px``, means in ``report['summary']``; None = off),
     ``rank_by`` (8: ``compare_to`` ranks by ``agree@8px``), ``rank_min_delta``, ``loo_window_s`` (time-blocked LOO window with
-    ``times=``; 'auto' ~ 20 windows), ``compare_to={name: CameraGroup}`` with ``clusters=[N]``
+    ``times=``; 'auto' ~ 20 windows, at most 3600 s each), ``compare_to={name: CameraGroup}`` with ``clusters=[N]``
     (paired LOO agreement difference with a cluster bootstrap: ``report['compare_to'][name]``, with
     ``agree@T`` / ``agree@Tpx`` entries ``a`` (this), ``b`` (other), ``delta`` = b - a,
     ``this_minus_other`` = a - b (the sign of Emory's ``paired_compare``), ``ci95``, plus
@@ -2523,7 +2699,14 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
       (warn above 0.5);
     - ``moved_cameras``: cameras with a detected bump / re-aim (fail); a step whose shorter side has
       >= ``moves_bad_window_frac`` (0.8) of the camera's observations in bad time windows (see
-      ``bad_windows_frac``) is dropped (``report['moves_demoted']``);
+      ``bad_windows_frac``) is dropped (``report['moves_demoted']``), and so is a camera's first step when,
+      just before it, the camera's LOO agreement was below ``moves_before_ratio`` (0.5) x the other
+      cameras' (a camera whose position is wrong drifts away as the subject moves: a slow decline,
+      not a move), or when the step shifts its projections by more than 2 agreement thresholds but
+      its agreement after the step is still >= ``moves_after_ratio`` (0.7) x the one before. A camera whose LOO
+      agreement is below ``static_bad_ratio`` (0.5) x the others' from its first windows on is
+      wrong from the start: a calibration error for the LOO rules, not a move; it is left out of
+      the move tests (``report['static_bad_cameras']``);
     - ``bad_windows_frac``: share of time windows in which at least ``min_bad_cameras`` (default
       max(2, 25 % of the cameras)) cameras have a LOO coverage, or a LOO agreement among the
       supported points, below ``bad_window_ratio`` x their median window (desync / broken data;
@@ -2646,12 +2829,25 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
     report = dict(overall=qr.overall, coverage=cov, rules=None, cameras_missing=missing, cameras_dropped=dropped)
     moves = comparison = rec_points = None
     moved, center_frac, shape_rel = [], None, None
+    static_bad = []
     if times is not None:
         with timer('moves'):
             from ..stations import detect_moves
             kw = dict(tau=tau, huber_px=3.0 * u, z_thr=10.0)
             kw.update(opts['detect_moves_kwargs'] or {})
-            moves = detect_moves(cg, p, times, **kw)
+            # a camera that disagrees with the others from the first windows on has a wrong
+            # calibration (the LOO rules report it), not a move; its views are left out of the
+            # move tests so they cannot bias its neighbours' tests either
+            pm = p
+            if win is not None and qr.loo is not None and opts['static_bad_ratio'] and use_loo:
+                static_bad = _static_bad_cameras(qr.loo.errors, qr.loo.eligible, win, J, agree_t,
+                                                 max(10.0, opts['min_window_obs'] / C), opts['static_bad_ratio'])
+                if static_bad:
+                    pm = p.copy()
+                    pm[static_bad] = np.nan
+                    kw.setdefault('cameras', [c for c in range(C) if c not in static_bad])
+                    report['static_bad_cameras'] = [names[c] for c in static_bad]
+            moves = detect_moves(cg, pm, times, **kw)
             moved = list(moves.moved)
             settings['detect_moves'] = {k: v for k, v in kw.items() if isinstance(v, (int, float))}
             report['moves_info'] = {k: v for k, v in moves.info.items() if k in ('retest', 'low_support')}
@@ -2664,12 +2860,17 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                 det = opts['detections']
                 if det is not None and opts['cam_names'] is not None and not isinstance(det, dict):
                     det = {n: d for n, d in zip(opts['cam_names'], det)}
-                rec = recover_moves(cg, p, times, moves=moves, detections=det, frame_ids=frame_ids, **rk)
+                if static_bad:
+                    rk.setdefault('cameras', [c for c in range(C) if c not in static_bad])
+                rec = recover_moves(cg, pm, times, moves=moves, detections=det, frame_ids=frame_ids, **rk)
                 moves = rec.moves
                 moved = list(moves.moved)
                 report['recovered_moves'] = rec.cameras
                 if rec.points is not None:
-                    rec_points = rec.points if shape5 is None else rec.points.reshape(shape5)
+                    rp_ = np.array(rec.points, float)
+                    if static_bad:
+                        rp_[static_bad] = p[static_bad]
+                    rec_points = rp_ if shape5 is None else rp_.reshape(shape5)
             for n in names:
                 per[n]['moved'] = n in moved
     # time-blocked LOO: per window and camera, LOO agreement at the middle threshold
@@ -2757,6 +2958,90 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
             moves = _demote_moves(moves, demoted)
             moved = list(moves.moved)
             report['moves_demoted'] = _to_builtin(demoted)
+            for n in names:
+                per[n]['moved'] = n in moved
+    # a move needs a change point with good agreement before it: just before the step the camera
+    # agreed with the others about as well as they agree among themselves. A camera that was
+    # already drifting away (its position wrong for the whole trial: the error grows as the subject
+    # moves, Panoptic 00_15 50 mm off) shows a 'step' at the end of a slow decline, not a move.
+    # And a rotation by step_deg shifts every projection by ~ f x step: when that is well above the
+    # agreement threshold, the camera's agreement must drop after the step; if it agrees as well as
+    # before, the 'step' is an artefact of its neighbours (Panoptic 00_15 200 mm off: 00_24).
+    if moves is not None and moves.change_points and opts['moves_before_ratio'] and qr.loo is not None and use_loo:
+        tf_ = np.repeat(np.asarray(times, float).reshape(-1), J)
+        le_, el_ = np.asarray(qr.loo.errors, float), np.asarray(qr.loo.eligible, bool)
+        sup_ = el_ & np.isfinite(le_)
+        hit_ = sup_ & (le_ < agree_t)
+        L0 = float(moves.window_s)
+        min_n = opts['min_window_obs'] / C
+
+        def agree_ratio(ci, oth, t_cp, after, den, hit=hit_):
+            """camera / others' agreement just before (after) t_cp, over the shortest window (from
+            one detection window, doubling up to 16) with enough observations; (ratio, length)."""
+            L = L0
+            while L <= 16 * L0:
+                m = ((tf_ >= t_cp) & (tf_ < t_cp + L)) if after else ((tf_ < t_cp) & (tf_ >= t_cp - L))
+                nc, no = den[ci, m].sum(), den[oth][:, m].sum()
+                if nc >= min_n and no >= min_n:
+                    a_o = hit[oth][:, m].sum() / no
+                    return (float(hit[ci, m].sum() / nc / a_o) if a_o > 0 else None), L
+                L *= 2
+            return None, None
+        loo2 = {}
+
+        def loo_2views():
+            # the move tests' own LOO (>= 2 other views, the static-bad cameras left out): with few
+            # cameras the W4 LOO (>= 3 others) leaves too few eligible points around a step
+            if not loo2:
+                from .. import geometry as G
+                from ..stations import _loo_quality
+                P2 = G.pack(cg)
+                fl = _flat(pm)
+                e2 = np.zeros(fl.shape[:2], bool)
+                h2 = np.zeros(fl.shape[:2], bool)
+                for c in range(C):
+                    if c in static_bad:
+                        continue
+                    s_, h_ = _loo_quality(P2, fl, c, tau, 2, agree_t)
+                    e2[c] = s_ & np.isfinite(fl[c]).all(-1)
+                    h2[c] = h_ & e2[c]
+                loo2.update(el=e2, hit=h2)
+            return loo2['el'], loo2['hit']
+        first = {}
+        for cp in moves.change_points:
+            first[cp['camera']] = min(first.get(cp['camera'], np.inf), float(cp['time']))
+        demoted = []
+        for cp in list(moves.change_points):
+            if float(cp['time']) > first[cp['camera']]:
+                continue            # a later step of the same camera: before it, it had already moved
+            ci = names.index(cp['camera'])
+            oth = [c for c in range(C) if c != ci and c not in static_bad and names[c] not in moved]
+            if not oth:
+                continue
+            t_cp = float(cp['time'])
+            r, L = agree_ratio(ci, oth, t_cp, False, sup_)
+            cp['agree_before_ratio'] = r
+            if r is not None and r < opts['moves_before_ratio']:
+                demoted.append(dict(cp, reason='poor agreement already before the step (ratio {:.2f} over {:.3g} s)'.format(r, L)))
+                continue
+            fpx = float(to_numpy(cgroup.cameras[ci].get_camera_matrix())[0, 0])
+            shift_px = fpx * np.radians(float(cp.get('step_deg', 0.0)))
+            if not opts['moves_after_ratio'] or not shift_px > 2 * agree_t:
+                continue
+            rb, _ = agree_ratio(ci, oth, t_cp, False, el_)
+            ra, _ = agree_ratio(ci, oth, t_cp, True, el_)
+            if ra is None or rb is None:
+                e2, h2 = loo_2views()
+                rb, _ = agree_ratio(ci, oth, t_cp, False, e2, h2)
+                ra, _ = agree_ratio(ci, oth, t_cp, True, e2, h2)
+            cp['agree_after_ratio'] = ra
+            if ra is not None and rb is not None and ra >= opts['moves_after_ratio'] * rb:
+                demoted.append(dict(cp, reason='agreement unchanged across a {:.3g} px step (ratio {:.2f} -> {:.2f})'.format(
+                    shift_px, rb, ra)))
+        if demoted:
+            moves = _demote_moves(moves, demoted)
+            moved = list(moves.moved)
+            report['moves_demoted'] = report.get('moves_demoted', []) + _to_builtin(demoted)
             for n in names:
                 per[n]['moved'] = n in moved
     if reference is not None:
@@ -2857,6 +3142,40 @@ def evaluate_calibration(cgroup, points, times=None, reference=None, board=None,
                                  quality=qr, points=rec_points)
 
 
+def _static_bad_cameras(le, el, win, J, agree_t, min_cw, ratio, n_first=1):
+    """Cameras whose LOO agreement (share of their supported held-out points within ``agree_t``)
+    is below ``ratio`` x the other cameras' median both in their first jointly measured window
+    (median of the first ``n_first``) and overall: wrong from the start (a calibration error), so not a move."""
+    le, el = np.asarray(le, float), np.asarray(el, bool)
+    C = le.shape[0]
+    wf = np.repeat(np.asarray(win), J)
+    labs, inv = np.unique(wf, return_inverse=True)
+    nW = len(labs)
+    ag = np.full((C, nW), np.nan)
+    for c in range(C):
+        fin = el[c] & np.isfinite(le[c])
+        sup = np.bincount(inv, weights=fin, minlength=nW)
+        hit = np.bincount(inv, weights=fin & (le[c] < agree_t), minlength=nW)
+        m = sup >= min_cw
+        ag[c, m] = hit[m] / sup[m]
+    bad = []
+    for c in range(C):
+        others = [o for o in range(C) if o != c]
+        if len(others) < 2:
+            return []
+        with np.errstate(all='ignore'), warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            mo = np.nanmedian(ag[others], 0)
+        k = np.flatnonzero(np.isfinite(ag[c]) & np.isfinite(mo) & (mo > 0))
+        if len(k) < 2:
+            continue
+        r = ag[c, k] / mo[k]
+        if np.median(r[:n_first]) < ratio and np.median(r) < ratio:
+            bad.append(c)
+    # with most cameras 'bad' the data are broken, not the calibration of one camera
+    return bad if C - len(bad) >= 3 and len(bad) <= C // 3 else []
+
+
 def _demote_moves(moves, demoted):
     """A copy of ``moves`` without the change points ``demoted`` (cameras left without change
     points lose their stations)."""
@@ -2869,8 +3188,11 @@ def _demote_moves(moves, demoted):
         if cam not in keep:
             st._iv.pop(cam)
     rots = {k: v for k, v in moves.station_rotations.items() if k in keep}
+    extra = {}
+    if getattr(moves, 'station_poses', None):
+        extra['station_poses'] = {k: v for k, v in moves.station_poses.items() if k in keep}
     return _dc.replace(moves, change_points=cps, stations=st, station_rotations=rots,
-                       info=dict(moves.info, demoted=[d['camera'] for d in demoted]))
+                       info=dict(moves.info, demoted=[d['camera'] for d in demoted]), **extra)
 
 
 def _compare_to(cg, p, qr, opts, win, J, tau_tri, min_others, thr, device, ys=None):

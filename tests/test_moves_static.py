@@ -190,7 +190,8 @@ def test_w4_step_inside_bad_windows_is_demoted():
     assert ev.report['windows']['bad']
     assert name not in ev.moves.moved and name not in ev.moves.stations.moved
     assert [d['camera'] for d in ev.report['moves_demoted']] == [name]
-    old = W.evaluate_calibration(rig, p2, times=t, options=dict(opts, moves_bad_window_frac=None))
+    old = W.evaluate_calibration(rig, p2, times=t, options=dict(opts, moves_bad_window_frac=None,
+                                                                 static_bad_ratio=None, moves_before_ratio=None))
     assert name in old.moves.moved
 
 

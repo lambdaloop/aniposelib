@@ -621,7 +621,8 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             with fewer finite keypoints are dropped before triangulation), ``mask_out_of_bounds``
             (True: observations outside the image are not used; counted in ``out_of_image``),
             ``max_gap`` (10 frames; None = every interior gap) / ``max_gap_s`` (seconds, with
-            ``times``): longest gap filled, ``max_point_err_px`` (None: triangulated points whose
+            ``times``; default with ``times``: ``(max_gap + 1)`` x the median frame period, so
+            a long time hole is never bridged): longest gap filled, ``max_point_err_px`` (None: triangulated points whose
             ``point_error`` exceeds it are removed before filling), ``cam_names`` (camera order of
             ``points``; reindexed to the group, missing cameras are NaN), ``bone_weight``
             ('auto' or a float, the 1.1 fixed weight was 2.0), ``bone_max_reproj_rise`` (0.5
@@ -642,7 +643,7 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             ``OPTIM_GPU_MIN_CELLS`` frames x joints stay on the CPU, where they are faster),
             ``'cpu'``, ``'cuda'``.
         times: optional ``[N]`` frame times (s): gaps are interpolated on time and
-            ``max_gap_s`` applies.
+            ``max_gap_s`` applies (default ``(max_gap + 1)`` median frame periods).
         segments: optional ``[N]`` segment ids (clips, windows, trials); a new segment starts
             wherever the id changes. Filling, smoothing, bones and chunks never cross a segment.
         extrinsics: optional per-frame world-to-camera matrices (moving cameras): ``[C,N,4,4]``
@@ -701,6 +702,13 @@ def reconstruct_3d(cgroup, points, scores=None, bones=None, smooth=None, fill='i
             raise ValueError('times must have one value per frame ({}), got {}'.format(N, len(tms)))
     if opts['max_gap_s'] is not None and tms is None:
         raise ValueError("options['max_gap_s'] needs times=")
+    if opts['max_gap_s'] is None and tms is not None and opts['max_gap'] is not None:
+        # with times=, never bridge a time gap longer than max_gap median frame periods
+        # (a 1-index hole may span minutes on sparse / compact timepoints)
+        dt = np.diff(tms[np.isfinite(tms)])
+        dt = dt[dt > 0]
+        if len(dt):
+            opts['max_gap_s'] = float((int(opts['max_gap']) + 1) * np.median(dt))
     runs = _segment_runs(N, segments)
     E = _parse_extrinsics(extrinsics, C, N)
     n_low_score = 0
