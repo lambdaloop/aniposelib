@@ -19,8 +19,9 @@ Models (square pixels, ``fx = fy = f``):
 ``fisheye``           f, cx, cy, k1..k4
 ====================  =====================================================
 
-Distortion vectors use OpenCV order. The solver is a small Levenberg-Marquardt with a Schur
-complement on the per-view pose blocks (numpy, numeric Jacobians), fast for a few hundred views.
+Distortion vectors use OpenCV order. The solver (:func:`lm_board_adjust`) is the shared
+Levenberg-Marquardt engine (:mod:`aniposelib._lm`) with a Schur complement on the per-view pose
+blocks and analytic Jacobians, fast for a few hundred views.
 """
 
 from dataclasses import dataclass, field
@@ -83,58 +84,37 @@ def pack_intrinsics(model, K, dist=None):
     return np.array(head + [full[i] for i in _BROWN_FREE[model]])
 
 
-def _project_cam(model, intr, P):
-    z = P[:, 2]
-    z = np.where(np.abs(z) < 1e-9, 1e-9, z)
-    x, y = P[:, 0] / z, P[:, 1] / z
-    f, cx, cy = intr[:3]
-    if is_fisheye(model):
-        d4 = np.zeros(4)
-        d4[_FISHEYE_FREE[model]] = intr[3:]
-        k1, k2, k3, k4 = d4
-        r = np.sqrt(x * x + y * y)
-        th = np.arctan(r)
-        t2 = th * th
-        thd = th * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
-        s = np.where(r > 1e-12, thd / np.where(r > 1e-12, r, 1.0), 1.0)
-        xd, yd = x * s, y * s
-    else:
-        d = np.zeros(8)
-        d[_BROWN_FREE[model]] = intr[3:]
-        k1, k2, p1, p2, k3, k4, k5, k6 = d
-        r2 = x * x + y * y
-        radial = (1 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1 + r2 * (k4 + r2 * (k5 + r2 * k6)))
-        xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
-        yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
-    return np.stack([f * xd + cx, f * yd + cy], axis=1)
+def _kernel(model, intr, poses, obj, view, jac=False):
+    """Board corners ``obj [m,3]`` of views ``view [m]`` (poses ``[V,6]``, intrinsics vector
+    ``intr`` of ``model``) -> pixels ``[m,2]`` (torch), with the :mod:`aniposelib.bundle` kernel;
+    with ``jac`` also the Jacobians on the pose ``[m,2,6]`` and on ``intr`` ``[m,2,len(intr)]``."""
+    import torch
+    from . import bundle as B
+    m, fish = obj.shape[0], is_fisheye(model)
+    free = [11 + j for j in (_FISHEYE_FREE[model] if fish else _BROWN_FREE[model])]
+    L = torch.zeros(m, B.N_LOCAL, dtype=torch.float64)
+    L[:, :6] = poses[view]
+    L[:, 6] = L[:, 7] = intr[0]                    # square pixels: f moves fx and fy
+    L[:, 8], L[:, 9] = intr[1], intr[2]
+    L[:, free] = intr[3:]
+    args = (torch.zeros(m, dtype=torch.float64), torch.zeros(m, 2, dtype=torch.float64),
+            torch.full((m,), fish), not fish, fish)
+    if not jac:
+        return B._project_local(L, obj, *args)[0]
+    uv, _, dL, _ = B._project_local_jac(L, obj, *args)
+    Ji = torch.stack([dL[:, :, 6] + dL[:, :, 7], dL[:, :, 8], dL[:, :, 9]] + [dL[:, :, s] for s in free], -1)
+    return uv, dL[:, :, :6], Ji
 
 
-def _rotations(rvecs):
-    rvecs = np.asarray(rvecs, dtype=np.float64).reshape(-1, 3)
-    th = np.linalg.norm(rvecs, axis=1)
-    small = th < 1e-12
-    k = rvecs / np.where(small, 1.0, th)[:, None]
-    kx = np.zeros((len(rvecs), 3, 3))
-    kx[:, 0, 1], kx[:, 0, 2] = -k[:, 2], k[:, 1]
-    kx[:, 1, 0], kx[:, 1, 2] = k[:, 2], -k[:, 0]
-    kx[:, 2, 0], kx[:, 2, 1] = -k[:, 1], k[:, 0]
-    s = np.sin(th)[:, None, None]
-    c = np.cos(th)[:, None, None]
-    R = np.eye(3)[None] + s * kx + (1.0 - c) * (kx @ kx)
-    if small.any():
-        r = rvecs[small]
-        rx = np.zeros((len(r), 3, 3))
-        rx[:, 0, 1], rx[:, 0, 2] = -r[:, 2], r[:, 1]
-        rx[:, 1, 0], rx[:, 1, 2] = r[:, 2], -r[:, 0]
-        rx[:, 2, 0], rx[:, 2, 1] = -r[:, 1], r[:, 0]
-        R[small] = np.eye(3)[None] + rx
-    return R
+def _tt(a):
+    import torch
+    return torch.as_tensor(np.ascontiguousarray(a, dtype=np.float64))
 
 
 def _project_views(model, intr, poses, obj, view):
-    R = _rotations(poses[:, :3])
-    P = np.einsum('mij,mj->mi', R[view], obj) + poses[view, 3:]
-    return _project_cam(model, intr, P)
+    import torch
+    return _kernel(model, _tt(intr), _tt(poses), _tt(np.asarray(obj).reshape(-1, 3)),
+                   torch.as_tensor(np.asarray(view))).numpy()
 
 
 def _stack(objpoints, imgpoints, indices):
@@ -167,96 +147,42 @@ def _init_pose(model, intr, obj, img):
     raise ValueError('PnP failed on a view')
 
 
-def _jacobians(model, intr, poses, obj, view, fix_intr):
-    pred = _project_views(model, intr, poses, obj, view)
-    m = len(view)
-    j_pose = np.zeros((m, 2, 6))
-    tscale = max(1.0, float(np.median(np.abs(poses[:, 3:]))))
-    for c in range(6):
-        h = 1e-6 if c < 3 else 1e-6 * tscale
-        pp, pm = poses.copy(), poses.copy()
-        pp[:, c] += h
-        pm[:, c] -= h
-        j_pose[:, :, c] = (_project_views(model, intr, pp, obj, view)
-                           - _project_views(model, intr, pm, obj, view)) / (2 * h)
-    j_intr = None
-    if not fix_intr:
-        j_intr = np.zeros((m, 2, len(intr)))
-        for c in range(len(intr)):
-            h = 1e-4 * max(1.0, abs(intr[c])) if c < 3 else 1e-7
-            ip, im = intr.copy(), intr.copy()
-            ip[c] += h
-            im[c] -= h
-            j_intr[:, :, c] = (_project_views(model, ip, poses, obj, view)
-                               - _project_views(model, im, poses, obj, view)) / (2 * h)
-    return pred, j_pose, j_intr
-
-
 def lm_board_adjust(model, intr0, poses0, obj, img, view, fix_intr=False, max_iter=100, tol=1e-10):
-    """Levenberg-Marquardt over intrinsics + per-view board poses (Schur on the pose blocks).
+    """Levenberg-Marquardt over intrinsics + per-view board poses (Schur on the pose blocks), on
+    the shared engine (:mod:`aniposelib._lm`) with the analytic projection Jacobians of
+    :mod:`aniposelib.bundle` (linear loss).
 
     ``view`` must be contiguous, 0..n_views-1. Returns ``(intr, poses, info)``."""
-    intr = np.asarray(intr0, dtype=np.float64).copy()
-    poses = np.asarray(poses0, dtype=np.float64).copy()
+    import torch
+    from . import _lm
+    poses = np.asarray(poses0, dtype=np.float64)
     n_views = len(poses)
-    n_i = 0 if fix_intr else len(intr)
-    lam = 1e-3
     view = np.asarray(view)
     if np.any(np.diff(view) < 0) or len(np.unique(view)) != n_views:
         raise ValueError('points must be grouped by view (0..n_views-1, contiguous)')
-    starts = np.flatnonzero(np.r_[True, np.diff(view) != 0])
-    cost = float(np.sum((_project_views(model, intr, poses, obj, view) - img) ** 2))
-    it, status, rel = 0, 'max_iter', np.inf
-    eye6 = np.eye(6)
-    for it in range(1, max_iter + 1):
-        pred, jp, ji = _jacobians(model, intr, poses, obj, view, fix_intr)
-        r = pred - img
-        V = np.add.reduceat(np.einsum('mki,mkj->mij', jp, jp), starts, axis=0)
-        gv = np.add.reduceat(np.einsum('mki,mk->mi', jp, r), starts, axis=0)
-        if n_i:
-            U = np.einsum('mki,mkj->ij', ji, ji)
-            gi = np.einsum('mki,mk->i', ji, r)
-            Wb = np.add.reduceat(np.einsum('mki,mkj->mij', ji, jp), starts, axis=0)
-        improved = False
-        for _ in range(12):
-            Vd = V + lam * (np.einsum('nii->ni', V)[:, :, None] * eye6 + 1e-12 * eye6)
-            try:
-                Vinv = np.linalg.inv(Vd)
-            except np.linalg.LinAlgError:
-                lam *= 10
-                continue
-            if n_i:
-                Ud = U + lam * np.diag(np.diag(U) + 1e-12)
-                WV = np.einsum('nij,njk->nik', Wb, Vinv)
-                S = Ud - np.einsum('nij,nkj->ik', WV, Wb)
-                rhs = -gi + np.einsum('nij,nj->i', WV, gv)
-                try:
-                    di = np.linalg.solve(S, rhs)
-                except np.linalg.LinAlgError:
-                    lam *= 10
-                    continue
-                dv = -np.einsum('nij,nj->ni', Vinv, gv + np.einsum('nji,j->ni', Wb, di))
-            else:
-                di = np.zeros(0)
-                dv = -np.einsum('nij,nj->ni', Vinv, gv)
-            intr_new = intr + di if n_i else intr
-            poses_new = poses + dv
-            cost_new = float(np.sum((_project_views(model, intr_new, poses_new, obj, view) - img) ** 2))
-            if np.isfinite(cost_new) and cost_new < cost:
-                rel = (cost - cost_new) / max(cost, 1e-300)
-                intr, poses, cost = intr_new, poses_new, cost_new
-                lam = max(lam / 3.0, 1e-9)
-                improved = True
-                break
-            lam *= 10.0
-        if not improved:
-            status = 'converged_no_decrease'
-            break
-        if rel < tol:
-            status = 'converged'
-            break
-    return intr, poses, {'status': status, 'iterations': it, 'cost': cost,
-                         'rms_px': float(np.sqrt(cost / max(len(view), 1)))}
+    obj_t, img_t, view_t = _tt(np.asarray(obj).reshape(-1, 3)), _tt(np.asarray(img).reshape(-1, 2)), torch.as_tensor(view)
+    m = len(view)
+    n_i = 0 if fix_intr else len(intr0)
+
+    class _P:
+        NC = n_i
+
+        def cost(self, st):
+            return float(((_kernel(model, st[0], st[1], obj_t, view_t) - img_t) ** 2).sum())
+
+        def linearize(self, st):
+            uv, Jp, Ji = _kernel(model, st[0], st[1], obj_t, view_t, jac=True)
+            return [_lm.Blocks(r=uv - img_t, w=torch.ones(m, dtype=torch.float64), Js=Jp, sidx=view_t, n=n_views,
+                               D=6, Jc=Ji if n_i else None, cols=torch.arange(n_i).expand(m, n_i) if n_i else None)]
+
+        def apply(self, st, dth, dv):
+            return (st[0] + dth if n_i else st[0], st[1] + dv[0])
+
+    res = _lm.levenberg_marquardt(_P(), (_tt(intr0), _tt(poses)), n_iter=max_iter, tol=tol, lam_up=10.0, max_tries=12)
+    intr, poses = (s.numpy() for s in res.state)
+    status = {'no_decrease': 'converged_no_decrease', 'tol': 'converged'}.get(res.reason, 'max_iter')
+    return intr, poses, {'status': status, 'iterations': len(res.history) - 1, 'cost': res.cost,
+                         'rms_px': float(np.sqrt(res.cost / max(len(view), 1)))}
 
 
 def _initial_pinhole(objpoints, imgpoints, image_size):

@@ -181,25 +181,6 @@ def test_not_inplace_returns_copy(outdoor):
     assert synth.center_error(rep.cgroup, true).max() < 4e-3
 
 
-def test_time_offsets_recovered():
-    """F3: per-camera time offsets from a smooth trajectory (first order, prior anchored)."""
-    true = synth.load_rig('outdoor_9cam')
-    cen, s = synth.scene_center(true), synth.rig_scale(true)
-    t = np.arange(400) / 30.0
-    X = lambda tt: cen + 0.2 * s * np.stack([np.sin(1.3 * tt), np.cos(0.9 * tt), 0.3 * np.sin(2.1 * tt)], -1)
-    delta = np.zeros(9)
-    delta[[2, 5]] = [0.01, -0.02]
-    p2d = np.stack([synth.project(true, X(t + delta[c]))[c] for c in range(9)])
-    p2d = synth.add_noise(p2d, 0.3, seed=1)
-    obs = Observations.from_dense(p2d, time=t)
-    cg = deepcopy(true)
-    rep = bundle_adjust_lm(cg, obs, spec=ParamSpec.extrinsics_only(time_offset=0.05), return_report=True,
-                           loss='linear')
-    est = np.array([rep.time_offsets[n] for n in true.get_names()])
-    assert np.abs(est - delta).max() < 2e-3
-    assert synth.center_error(cg, true).max() < 1e-3
-
-
 def test_stations_give_a_moved_camera_its_own_extrinsics():
     """F5: a camera bumped half way gets a second station; intrinsics stay shared."""
     from aniposelib.stations import Stations
@@ -330,3 +311,50 @@ def test_lm_is_scale_invariant(outdoor, scale):
     rep = bundle_adjust_lm(cg, p2d, only_extrinsics=True, return_report=True)
     assert synth.center_error(cg, t).max() < 4e-3
     assert rep.error < 0.5 and rep.n_iter < 15
+
+
+def test_lm_engine_solves_a_linear_block_problem():
+    """aniposelib._lm: Schur LM on a linear block problem reaches the least-squares optimum, the
+    dense and PCG reduced solves agree, and per-block reduced gradients sum to the reduced gradient."""
+    from aniposelib import _lm
+    g = torch.Generator().manual_seed(0)
+    m, n, D, NC, q = 200, 20, 3, 5, 2
+    sidx = torch.arange(m) % n
+    cols = torch.randint(0, NC, (m, q), generator=g)
+    Js = torch.randn(m, 2, D, dtype=torch.float64, generator=g)
+    Jc = torch.randn(m, 2, q, dtype=torch.float64, generator=g)
+    y = torch.randn(m, 2, dtype=torch.float64, generator=g)
+
+    class P:
+        def __init__(self):
+            self.NC = NC
+
+        def resid(self, st):
+            th, X = st
+            return (Js @ X[sidx][..., None])[..., 0] + (Jc @ th[cols][..., None])[..., 0] - y
+
+        def cost(self, st):
+            return float((self.resid(st) ** 2).sum())
+
+        def linearize(self, st):
+            return [_lm.Blocks(r=self.resid(st), w=torch.ones(m, dtype=torch.float64), Js=Js, sidx=sidx, n=n, D=D,
+                               Jc=Jc, cols=cols)]
+
+        def apply(self, st, dth, dv):
+            return st[0] + dth, st[1] + dv[0]
+
+    st0 = (torch.zeros(NC, dtype=torch.float64), torch.zeros(n, D, dtype=torch.float64))
+    res = _lm.levenberg_marquardt(P(), st0, n_iter=50, tol=1e-14, lam=1e-6)
+    A = torch.zeros(m, 2, NC + n * D, dtype=torch.float64)
+    for i in range(m):
+        for k in range(q):
+            A[i, :, cols[i, k]] += Jc[i, :, k]
+        A[i, :, NC + 3 * sidx[i]:NC + 3 * sidx[i] + 3] = Js[i]
+    best = torch.linalg.lstsq(A.reshape(-1, NC + n * D), y.reshape(-1, 1)).solution[:, 0]
+    assert res.converged and abs(res.cost - float(((A.reshape(-1, NC + n * D) @ best - y.reshape(-1)) ** 2).sum())) < 1e-8
+    assert torch.allclose(res.state[0], best[:NC], atol=1e-6)
+    sysm = _lm.System(P().linearize(st0), NC)
+    d1, d2 = sysm.step(1e-3, solver='dense'), sysm.step(1e-3, solver='pcg')
+    assert torch.allclose(d1[0], d2[0], atol=1e-8) and torch.allclose(d1[1][0], d2[1][0], atol=1e-8)
+    S, b, gq = sysm.reduced(per_block=True)
+    assert torch.allclose(gq[0].sum(0), b, atol=1e-10)

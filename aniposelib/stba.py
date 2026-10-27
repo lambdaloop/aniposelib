@@ -33,9 +33,10 @@ Model
 
 Solver
 ------
-Robust (Cauchy/Huber IRLS) Levenberg-Marquardt with an exact Schur complement: the dense
-per-trajectory control-point blocks (3M x 3M) are eliminated with batched Cholesky (GPU-ready,
-float64), leaving a small reduced system in the free camera/time parameters. Jacobians are
+Robust (Cauchy/Huber IRLS) Levenberg-Marquardt with an exact Schur complement, on the shared
+engine :mod:`aniposelib._lm`: the dense per-trajectory control-point blocks (3M x 3M) are the
+point-like blocks, eliminated with batched Cholesky (GPU-ready, float64), leaving a small reduced
+system in the free camera/time parameters. The projection kernel is that of :mod:`aniposelib.bundle`. Jacobians are
 analytic (projection, distortion, rotation via the SO(3) left Jacobian); the time derivative is
 closed form, ``dr/dt = (d pi / d X) X'(t)``. After every parameter step the control points get a
 few per-trajectory LM iterations (variable-projection flavour). Uncertainty: the reduced normal
@@ -61,6 +62,8 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from . import _lm
+from . import bundle as B
 from . import geometry as G
 from . import triangulation as T
 
@@ -310,87 +313,21 @@ class STBAResult:
 
 # ------------------------------------------------------------------ analytic projection
 
-def _skew3(v):
-    o = torch.zeros_like(v[..., 0])
-    return torch.stack([torch.stack([o, -v[..., 2], v[..., 1]], -1),
-                        torch.stack([v[..., 2], o, -v[..., 0]], -1),
-                        torch.stack([-v[..., 1], v[..., 0], o], -1)], -2)
-
-
-def _left_jacobian(r):
-    th2 = (r * r).sum()
-    K = _skew3(r)
-    eye = torch.eye(3, dtype=r.dtype, device=r.device)
-    if float(th2) < 1e-10:
-        return eye + K / 2 + K @ K / 6
-    th = torch.sqrt(th2)
-    return eye + (1 - torch.cos(th)) / th2 * K + (th - torch.sin(th)) / (th2 * th) * (K @ K)
+_skew3 = B._skew
 
 
 def _project_cam(p, X, model, k10, off, jac=False):
     """One camera, parameter vector ``p [19]`` (see ``CAM_PARAMS``), points ``X [n,3]`` ->
-    ``uv [n,2]`` and, with ``jac``, ``JX [n,2,3]`` and ``Jp [n,2,19]`` (analytic)."""
-    r, t = p[0:3], p[3:6]
-    R = G.rodrigues(r)
-    Xr = X @ R.T
-    pc = Xr + t
-    z = pc[:, 2]
-    eps = G.FISHEYE_EPS
-    zs = torch.where(torch.abs(z) >= eps, z, torch.full_like(z, eps))
-    x, y = pc[:, 0] / zs, pc[:, 1] / zs
-    d = p[11:19][None]
-    fn = G._kb if model == 1 else G._brown
-    out = fn(x[None], y[None], d, jac=jac)
-    xd, yd = out[0][0], out[1][0]
-    fx, fy, cx, cy, sk = p[6], p[7], p[8], p[9], p[10]
-    u = fx * xd + sk * yd + cx - off[0]
-    v = k10 * xd + fy * yd + cy - off[1]
-    uv = torch.stack([u, v], -1)
-    if not jac:
-        return uv, z
-    jxx, jxy, jyx, jyy = [a[0] for a in out[2]]
-    m00 = fx * jxx + sk * jyx; m01 = fx * jxy + sk * jyy
-    m10 = k10 * jxx + fy * jyx; m11 = k10 * jxy + fy * jyy
-    iz = 1 / zs
-    g0 = torch.stack([m00 * iz, m01 * iz, -(m00 * x + m01 * y) * iz], -1)
-    g1 = torch.stack([m10 * iz, m11 * iz, -(m10 * x + m11 * y) * iz], -1)
-    g = torch.stack([g0, g1], -2)                                   # [n,2,3] d uv / d pc
-    JX = g @ R
-    Jr = -(g @ _skew3(Xr)) @ _left_jacobian(r)
+    ``uv [n,2]``, depth ``z [n]`` and, with ``jac``, ``JX [n,2,3]`` and ``Jp [n,2,19]`` (the
+    analytic kernel of :mod:`aniposelib.bundle`)."""
     n = X.shape[0]
-    o, one = torch.zeros_like(x), torch.ones_like(x)
-    Jk = torch.stack([torch.stack([xd, o], -1), torch.stack([o, yd], -1), torch.stack([one, o], -1),
-                      torch.stack([o, one], -1), torch.stack([yd, o], -1)], -1)   # [n,2,5]
-    # distortion: d(xd, yd) / d dist [n,2,8]
-    dd = p[11:19]
-    if model == 1:
-        r2 = x * x + y * y
-        r_ok = r2 >= eps * eps
-        rr = torch.sqrt(torch.where(r_ok, r2, torch.ones_like(r2)))
-        th = torch.atan(rr)
-        cols = []
-        for i in range(4):
-            dthd = th ** (2 * i + 3)
-            fac = torch.where(r_ok, dthd / rr, torch.zeros_like(rr))
-            cols.append(torch.stack([x * fac, y * fac], -1))
-        cols += [torch.zeros(n, 2, dtype=X.dtype, device=X.device)] * 4
-        Jd = torch.stack(cols, -1)
-    else:
-        k1, k2, p1, p2, k3, k4, k5, k6 = [dd[i] for i in range(8)]
-        r2 = x * x + y * y
-        num = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
-        den = 1 + r2 * (k4 + r2 * (k5 + r2 * k6))
-        def rad_col(dr):
-            return torch.stack([x * dr, y * dr], -1)
-        r4, r6 = r2 * r2, r2 * r2 * r2
-        Jd = torch.stack([rad_col(r2 / den), rad_col(r4 / den),
-                          torch.stack([2 * x * y, r2 + 2 * y * y], -1),
-                          torch.stack([r2 + 2 * x * x, 2 * x * y], -1),
-                          rad_col(r6 / den), rad_col(-num * r2 / den ** 2), rad_col(-num * r4 / den ** 2),
-                          rad_col(-num * r6 / den ** 2)], -1)
-    A = torch.stack([torch.stack([fx, sk]), torch.stack([k10 + 0 * fx, fy])])  # [2,2]
-    Jdist = torch.einsum('ij,njk->nik', A, Jd)
-    Jp = torch.cat([Jr, g, Jk, Jdist], -1)
+    L = p[None].expand(n, NPC)
+    k10 = torch.as_tensor(k10, dtype=X.dtype, device=X.device).expand(n)
+    off = torch.as_tensor(off, dtype=X.dtype, device=X.device).expand(n, 2)
+    kb = torch.full((n,), model == 1, dtype=torch.bool, device=X.device)
+    if not jac:
+        return B._project_local(L, X, k10, off, kb, model != 1, model == 1)
+    uv, z, Jp, JX = B._project_local_jac(L, X, k10, off, kb, model != 1, model == 1)
     return uv, z, JX, Jp
 
 
@@ -476,6 +413,8 @@ class SpatiotemporalBA:
         self.models = [int(m) for m in self.P0.model.tolist()]
         self.k10 = self.P0.K[:, 1, 0]
         self.off = self.P0.offset
+        self.is_kb = self.P0.model == 1
+        self.has_b, self.has_k = bool((~self.is_kb).any()), bool(self.is_kb.any())
         self._build_obs(TimedObservations.coerce(obs), free_offsets, clip_names, ref_camera, min_obs, min_cams)
         self._build_theta(free_offsets, offset0, offset_prior_sigma, free_rate, rate_prior_sigma,
                           rolling_shutter, rs_prior_sigma, extrinsics, fix_cameras, gauge, baseline_sigma,
@@ -810,31 +749,20 @@ class SpatiotemporalBA:
         the = torch.cat([theta, theta.new_zeros(1)])
         sl = slice(a, b)
         cam = self.cam_t[sl]
-        dtime = (the[self.tcols_t[sl]] * self.tlev_t[sl]).sum(-1)
-        tau = self.tau[sl] + dtime
+        tau = self.tau[sl] + (the[self.tcols_t[sl]] * self.tlev_t[sl]).sum(-1)
         i, u = _spline_index(tau, self.h, self.M)
         bw, db = bspline_weights(u)
         qq = self.q_t[sl] - q0
         idx = i[:, None] + torch.arange(4, device=self.dev)
         Cl = C[qq[:, None], idx]
         X = (bw[..., None] * Cl).sum(-2)
-        n = X.shape[0]
-        pc = theta[:self.nc * NPC].reshape(self.nc, NPC)
-        uv = torch.empty(n, 2, dtype=self.dt, device=self.dev)
-        z = torch.empty(n, dtype=self.dt, device=self.dev)
-        if jac:
-            JX = torch.empty(n, 2, 3, dtype=self.dt, device=self.dev)
-            Jp = torch.empty(n, 2, NPC, dtype=self.dt, device=self.dev)
-        cam_np = self.obs_cam[a:b]
-        for c in np.unique(cam_np):
-            m = torch.as_tensor(np.flatnonzero(cam_np == c), device=self.dev)
-            out = _project_cam(pc[c], X[m], self.models[c], self.k10[c], self.off[c], jac=jac)
-            uv[m] = out[0]; z[m] = out[1]
-            if jac:
-                JX[m] = out[2]; Jp[m] = out[3]
-        uv = torch.where((z > 0)[:, None], uv, torch.full_like(uv, float('nan')))
+        L = theta[:self.nc * NPC].reshape(self.nc, NPC)[cam]
+        args = (self.k10[cam], self.off[cam], self.is_kb[cam], self.has_b, self.has_k)
         if not jac:
-            return uv, None
+            uv, z = B._project_local(L, X, *args)
+            return torch.where((z > 0)[:, None], uv, torch.full_like(uv, float('nan'))), None
+        uv, z, Jp, JX = B._project_local_jac(L, X, *args)
+        uv = torch.where((z > 0)[:, None], uv, torch.full_like(uv, float('nan')))
         Xdot = (db[..., None] * Cl).sum(-2) / self.h
         Jt = (JX @ Xdot[..., None])[..., 0]
         Jth = torch.cat([Jp, Jt[..., None] * self.tlev_t[sl][:, None, :]], -1)
@@ -842,15 +770,8 @@ class SpatiotemporalBA:
 
     def _robust_w(self, r, w):
         s = (r * r).sum(-1) / self.sigma_px ** 2
-        if self.robust == 'cauchy':
-            c2 = self.robust_c ** 2
-            return w * c2 * torch.log1p(s / c2), w / (1 + s / c2)
-        if self.robust == 'huber':
-            c = self.robust_c
-            e = torch.sqrt(s)
-            cost = torch.where(e <= c, s, 2 * c * e - c * c)
-            return w * cost, w * torch.where(e <= c, torch.ones_like(e), c / e.clamp(min=1e-12))
-        return w * s, w.clone()
+        cost, wt = _lm.robust(s, self.robust or 'linear', self.robust_c)
+        return w * cost, w * wt
 
     def _theta_cost(self, theta):
         cost = theta.new_zeros(())
@@ -863,6 +784,28 @@ class SpatiotemporalBA:
         for fx in self.extra:
             cost = cost + (fx(theta) ** 2).sum()
         return cost
+
+    def _theta_normal(self, theta):
+        """Gauss-Newton ``(H, g)`` of the parameter priors over the free parameters."""
+        nf = len(self.free_idx)
+        H = torch.zeros(nf, nf, dtype=self.dt, device=self.dev)
+        g = torch.zeros(nf, dtype=self.dt, device=self.dev)
+        fi = self._T(self.free_idx, torch.long)
+        fin = np.isfinite(self.prior_sigma) & self.free
+        if fin.any():
+            j = self._T(self.g2f[np.flatnonzero(fin)], torch.long)
+            sg = self._T(self.prior_sigma[fin])
+            H[j, j] += 1 / sg ** 2
+            g[j] += (theta[self._T(np.flatnonzero(fin), torch.long)] - self._T(self.prior_mu[fin])) / sg ** 2
+        if self.lin_A is not None:
+            Af = self.lin_A[:, fi]
+            H += Af.T @ Af
+            g += Af.T @ (self.lin_A @ theta - self.lin_b)
+        for fx in self.extra:
+            Jf = torch.autograd.functional.jacobian(fx, theta)[:, fi]
+            H += Jf.T @ Jf
+            g += Jf.T @ fx(theta)
+        return H, g
 
     def _batches(self):
         q0 = 0
@@ -890,142 +833,65 @@ class SpatiotemporalBA:
             return tot
         return tot.sum() + self._theta_cost(theta)
 
-    # ---------------------------------------------------------------- normal equations
-    def _batch_system(self, theta, q0, q1, a, b, fit_theta, mu_c, per_traj_grad=False):
-        M = self.M; nq = q1 - q0; n3 = 3 * M
-        C = self.C[q0:q1]
-        H = self.Kprior.expand(nq, n3, n3).clone()
-        g = torch.einsum('ij,qj->qi', self.Kprior, C.reshape(nq, -1)).contiguous()
-        out = dict(H=H, g=g)
-        if b <= a:
-            self._damp(H, q0, q1, mu_c)
-            return out
-        uvh, J = self._obs_model(theta, a, b, C, q0, True)
-        r = uvh - self.uv[a:b]
-        bad = ~torch.isfinite(r).all(-1) | ~torch.isfinite(J['Jth']).all(-1).all(-1) | ~torch.isfinite(J['JX']).all(-1).all(-1)
-        r = torch.where(bad[:, None], torch.zeros_like(r), r)
-        _, om = self._robust_w(r, self.w[a:b])
-        om = torch.where(bad, torch.zeros_like(om), om) / self.sigma_px ** 2
-        JX = torch.nan_to_num(J['JX']); bw = J['b']; idx = J['idx']; qq = J['qq']
-        Aobs = torch.einsum('nki,n,nkj->nij', JX, om, JX)
-        gx = torch.einsum('nki,n,nk->ni', JX, om, r)
-        N = r.shape[0]
+    # ---------------------------------------------------------------- LM (aniposelib._lm)
+    def _blocks(self, theta, C, fit_theta):
+        """One :class:`aniposelib._lm.Blocks` per trajectory batch: spline segments are the
+        point-like blocks (``3 M`` control coordinates), the free parameters the reduced system."""
+        out = []
+        n3, nf = 3 * self.M, len(self.free_idx)
         ar3 = torch.arange(3, device=self.dev)
-        rows = idx[:, :, None] * 3 + ar3
-        base = qq * (n3 * n3)
-        val = (bw[:, :, None, None, None] * bw[:, None, :, None, None]) * Aobs[:, None, None]
-        flat = base[:, None, None, None, None] + rows[:, :, None, :, None] * n3 + rows[:, None, :, None, :]
-        H.view(-1).index_add_(0, flat.reshape(-1), val.reshape(-1))
-        gv = bw[:, :, None] * gx[:, None, :]
-        g.view(-1).index_add_(0, (qq[:, None, None] * n3 + rows).reshape(-1), gv.reshape(-1))
-        if fit_theta:
-            Jth = torch.nan_to_num(J['Jth'])
-            fcols = self.g2f_t[self.gcols[a:b]]
-            used = torch.unique(fcols[fcols >= 0])
-            nl = int(used.numel())
-            out['used'] = used
-            if nl:
-                loc = -torch.ones(len(self.free_idx) + 1, dtype=torch.long, device=self.dev)
-                loc[used] = torch.arange(nl, device=self.dev)
-                lcols = torch.where(fcols >= 0, loc[fcols.clamp(min=0)], torch.full_like(fcols, nl))
-                Jl = torch.zeros(N, 2, nl + 1, dtype=self.dt, device=self.dev)
-                Jl.scatter_add_(2, lcols[:, None, :].expand(N, 2, -1), Jth)
-                Jl = Jl[..., :nl]
-                out['Htt'] = torch.einsum('nki,n,nkj->ij', Jl, om, Jl)
-                gobs = torch.einsum('nki,n,nk->ni', Jl, om, r)
-                out['gt'] = gobs.sum(0)
-                HXt = torch.einsum('nki,n,nkj->nij', JX, om, Jl)
-                HCt = torch.zeros(nq * n3, nl, dtype=self.dt, device=self.dev)
-                v = bw[:, :, None, None] * HXt[:, None]
-                HCt.index_add_(0, (qq[:, None, None] * n3 + rows).reshape(-1), v.reshape(-1, nl))
-                out['HCt'] = HCt.reshape(nq, n3, nl)
-                if per_traj_grad:
-                    out['gq'] = torch.zeros(nq, nl, dtype=self.dt, device=self.dev).index_add_(0, qq, gobs)
-        self._damp(out['H'], q0, q1, mu_c)
+        for q0, q1, a, b in self._batches():
+            Cb = C[q0:q1]
+            uvh, J = self._obs_model(theta, a, b, Cb, q0, True)
+            r = uvh - self.uv[a:b]
+            bad = ~torch.isfinite(r).all(-1) | ~torch.isfinite(J['Jth']).all(-1).all(-1) | ~torch.isfinite(J['JX']).all(-1).all(-1)
+            r = torch.where(bad[:, None], torch.zeros_like(r), r)
+            _, om = self._robust_w(r, self.w[a:b])
+            om = torch.where(bad, torch.zeros_like(om), om) / self.sigma_px ** 2
+            N = r.shape[0]
+            Js = (J['b'][:, None, :, None] * torch.nan_to_num(J['JX'])[:, :, None, :]).reshape(N, 2, 12)
+            scols = (J['idx'][:, :, None] * 3 + ar3).reshape(N, 12)
+            Jc = cols = None
+            if fit_theta:
+                Jc = torch.nan_to_num(J['Jth'])
+                cols = self.g2f_t[self.gcols[a:b]]
+                cols = torch.where(cols >= 0, cols, torch.full_like(cols, nf))
+            out.append(_lm.Blocks(r=r, w=om, Js=Js, sidx=J['qq'], n=q1 - q0, D=n3, scols=scols, Jc=Jc, cols=cols,
+                                  Hp=self.Kprior, gp=torch.einsum('ij,qj->qi', self.Kprior, Cb.reshape(q1 - q0, -1))))
         return out
 
-    def _damp(self, H, q0, q1, mu_c):
-        dg = H.diagonal(dim1=1, dim2=2)
-        dg.mul_(1 + self.mu_q[q0:q1, None]).add_(mu_c)
+    def _damp_fixed(self, mu):
+        mu_c = self.mu_c
 
-    def _chol(self, H):
-        L, info = torch.linalg.cholesky_ex(H)
-        if bool((info > 0).any()):
-            bad = info > 0
-            H2 = H.clone()
-            eye = torch.eye(H.shape[-1], dtype=self.dt, device=self.dev)
-            H2[bad] = H2[bad] + 1e-3 * eye * H[bad].diagonal(dim1=-2, dim2=-1).mean(-1)[:, None, None]
-            L, info = torch.linalg.cholesky_ex(H2)
-        return L
+        def damp(V, lam):
+            out = V.clone()
+            out.diagonal(dim1=-2, dim2=-1).mul_(1 + mu).add_(mu_c)
+            return out
+        return damp
+
+    def _split(self, C):
+        return [C[q0:q1] for q0, q1, _, _ in self._batches()]
+
+    def _solve_C(self, theta, C, iters):
+        """Per-trajectory LM on the control points (per-trajectory damping and acceptance)."""
+        ba = self
+
+        class _P:
+            def block_linearize(self, vals):
+                return ba._blocks(theta, torch.cat(vals), False)
+
+            def block_costs(self, vals):
+                return ba._split(ba.cost(theta, torch.cat(vals), per_traj=True))
+
+        mus = self._split(self.mu_q)
+        vals, cur = _lm.block_lm(_P(), self._split(C), mus, iters=iters, mu_c=self.mu_c,
+                                 const=float(self._theta_cost(theta)))
+        return torch.cat(vals), cur
 
     def solve_C(self, iters=8):
         """Levenberg-Marquardt on the control points only (per-trajectory damping/acceptance)."""
-        theta = self._theta_t()
-        c_old = self.cost(theta, self.C, per_traj=True)
-        prev = float(c_old.sum() + self._theta_cost(theta))
-        for it in range(iters):
-            Cnew = self.C.clone()
-            for q0, q1, a, b in self._batches():
-                sysd = self._batch_system(theta, q0, q1, a, b, False, self.mu_c)
-                L = self._chol(sysd['H'])
-                dx = torch.cholesky_solve(-sysd['g'][..., None], L)[..., 0]
-                Cnew[q0:q1] = self.C[q0:q1] + dx.reshape(q1 - q0, self.M, 3)
-            c_new = self.cost(theta, Cnew, per_traj=True)
-            acc = (c_new <= c_old) & torch.isfinite(c_new)
-            self.C = torch.where(acc[:, None, None], Cnew, self.C)
-            c_old = torch.where(acc, c_new, c_old)
-            self.mu_q = torch.where(acc, (self.mu_q / 3).clamp(min=1e-7), (self.mu_q * 5).clamp(max=1e6))
-            cur = float(c_old.sum() + self._theta_cost(theta))
-            if abs(prev - cur) < 1e-9 * max(1.0, abs(prev)):
-                prev = cur
-                break
-            prev = cur
-        return prev
-
-    def reduced_system(self, theta, mu_c, clusters=None):
-        """Schur-reduced system over the free parameters: ``S, b`` (+ caches, cluster scores)."""
-        nf = len(self.free_idx)
-        S = torch.zeros(nf, nf, dtype=self.dt, device=self.dev)
-        bvec = torch.zeros(nf, dtype=self.dt, device=self.dev)
-        caches, scores = [], {}
-        for q0, q1, a, b in self._batches():
-            sysd = self._batch_system(theta, q0, q1, a, b, True, mu_c, per_traj_grad=clusters is not None)
-            L = self._chol(sysd['H'])
-            y = torch.cholesky_solve(sysd['g'][..., None], L)[..., 0]
-            cache = dict(q0=q0, q1=q1, y=y, used=None)
-            if 'HCt' in sysd:
-                HCt, used = sysd['HCt'], sysd['used']
-                Y = torch.cholesky_solve(HCt, L)
-                S[used[:, None], used[None, :]] += sysd['Htt'] - torch.einsum('qin,qim->nm', HCt, Y)
-                bvec[used] += sysd['gt'] - torch.einsum('qin,qi->n', HCt, y)
-                cache.update(used=used, Y=Y)
-                if clusters is not None:
-                    gq = sysd['gq'] - torch.einsum('qin,qi->qn', HCt, y)
-                    ck = clusters[q0:q1]
-                    for kk in np.unique(ck):
-                        m = torch.as_tensor(ck == kk, device=self.dev)
-                        vfull = torch.zeros(nf, dtype=self.dt, device=self.dev)
-                        vfull[used] = gq[m].sum(0)
-                        scores[kk] = scores.get(kk, 0) + vfull
-            caches.append(cache)
-        fi = self._T(self.free_idx, torch.long)
-        fin = np.isfinite(self.prior_sigma) & self.free
-        if fin.any():
-            j = self._T(self.g2f[np.flatnonzero(fin)], torch.long)
-            sg = self._T(self.prior_sigma[fin])
-            S[j, j] += 1 / sg ** 2
-            bvec[j] += (theta[self._T(np.flatnonzero(fin), torch.long)] - self._T(self.prior_mu[fin])) / sg ** 2
-        if self.lin_A is not None:
-            Af = self.lin_A[:, fi]
-            S += Af.T @ Af
-            bvec += Af.T @ (self.lin_A @ theta - self.lin_b)
-        for fx in self.extra:
-            Jx = torch.autograd.functional.jacobian(fx, theta)
-            rx = fx(theta)
-            Jf = Jx[:, fi]
-            S += Jf.T @ Jf
-            bvec += Jf.T @ rx
-        return S, bvec, caches, scores
+        self.C, cur = self._solve_C(self._theta_t(), self.C, iters)
+        return cur
 
     def _warp_monotone(self, theta):
         th = _np(theta)
@@ -1039,76 +905,63 @@ class SpatiotemporalBA:
         return True
 
     def solve(self, iters=None, c_iters=3, c_refine=2, mu_joint=1e-4, step_tol=2e-7):
-        """Joint LM on (parameters, control points) via the Schur complement."""
+        """Joint LM on (parameters, control points) via the Schur complement: after each
+        parameter step the control points get ``c_refine`` per-trajectory LM iterations before the
+        step is judged (variable projection), and ``c_iters`` more after an accepted step."""
         iters = self.max_iter if iters is None else iters
-        lam = self.lm_lambda0
         theta = self._theta_t()
         cur = float(self.cost(theta))
-        fi = self._T(self.free_idx, torch.long)
-        n_small = 0
         if len(self.free_idx) == 0:
             return cur
-        for it in range(iters):
-            mu_save = self.mu_q.clone()
-            self.mu_q = torch.full_like(self.mu_q, mu_joint)
-            S, bvec, caches, _ = self.reduced_system(theta, self.mu_c)
-            self.mu_q = mu_save
-            accepted = False
-            C_old = self.C
-            rel = 0.0
-            dth = torch.zeros(len(self.free_idx), dtype=self.dt, device=self.dev)
-            for _try in range(8):
-                Sd = S + lam * torch.diag(torch.diagonal(S).clamp(min=1e-12))
-                try:
-                    dth = -torch.linalg.solve(Sd, bvec)
-                except RuntimeError:
-                    lam *= 10
-                    continue
-                th_new = theta.clone(); th_new[fi] += dth
-                if self.warp_slice and not self._warp_monotone(th_new):
-                    lam *= 5
-                    continue
-                C_new = C_old.clone()
-                for cch in caches:
-                    q0, q1 = cch['q0'], cch['q1']
-                    rhs = cch['y']
-                    if cch['used'] is not None and cch['used'].numel():
-                        rhs = rhs + (cch['Y'] @ dth[cch['used']][:, None])[..., 0]
-                    C_new[q0:q1] = C_old[q0:q1] - rhs.reshape(q1 - q0, self.M, 3)
-                c_a = self.cost(th_new, C_new, per_traj=True)
-                c_b = self.cost(th_new, C_old, per_traj=True)
-                self.C = torch.where((c_a <= c_b)[:, None, None], C_new, C_old)
-                self.theta = _np(th_new).copy()
-                new = self.solve_C(c_refine) if c_refine else float(self.cost(th_new))
-                if np.isfinite(new) and new < cur:
-                    rel = (cur - new) / max(cur, 1.0)
-                    theta = th_new
-                    cur = new
-                    lam = max(lam / 3, 1e-9)
-                    accepted = True
-                    break
-                self.C = C_old
-                self.theta = _np(theta).copy()
-                lam *= 5
-            self.history.append(dict(it=it, cost=cur, lam=lam, accepted=accepted,
-                                     step_max=float(dth.abs().max()) if accepted else 0.0))
-            if self.verbose:
-                print('[STBA] it {} cost {:.8g} lam {:.2g} acc {}'.format(it, cur, lam, accepted), flush=True)
-            small = accepted and float(dth.abs().max()) < step_tol
-            n_small = n_small + 1 if small else 0
-            if not accepted or rel < self.tol_rel or n_small >= 3:
-                break
-            if c_iters:
-                cur = self.solve_C(c_iters)
-        return cur
+        ba = self
+        fi = self._T(self.free_idx, torch.long)
+
+        class _P:
+            NC = len(self.free_idx)
+
+            def linearize(self, state):
+                return ba._blocks(state[0], state[1], True)
+
+            def prior(self, state):
+                return ba._theta_normal(state[0])
+
+            def trial(self, state, dth, dvals):
+                theta, C_old = state
+                th_new = theta.clone()
+                th_new[fi] += dth
+                if ba.warp_slice and not ba._warp_monotone(th_new):
+                    return None
+                C_new = C_old + torch.cat(dvals).reshape(C_old.shape)
+                c_a = ba.cost(th_new, C_new, per_traj=True)
+                c_b = ba.cost(th_new, C_old, per_traj=True)
+                C = torch.where((c_a <= c_b)[:, None, None], C_new, C_old)
+                if not c_refine:
+                    return (th_new, C), float(ba.cost(th_new, C))
+                C, new = ba._solve_C(th_new, C, c_refine)
+                return (th_new, C), new
+
+            def after_step(self, state, cost):
+                if not c_iters:
+                    return state, cost
+                C, cost = ba._solve_C(state[0], state[1], c_iters)
+                return (state[0], C), cost
+
+        res = _lm.levenberg_marquardt(
+            _P(), (theta, self.C), n_iter=iters, lam=self.lm_lambda0, tol=self.tol_rel, damp_on='reduced',
+            damp_blocks=self._damp_fixed(mu_joint), lam_max=np.inf, max_tries=8, rel_floor=1.0, step_tol=step_tol,
+            cost=cur, verbose=self.verbose, label='[STBA]')
+        self.theta = _np(res.state[0]).copy()
+        self.C = res.state[1]
+        self.history += [dict(it=h['iter'] - 1, cost=h['cost'], lam=h['lam'], accepted=h['accepted'],
+                              step_max=h['step_max']) for h in res.history[1:]]
+        return res.cost
 
     def covariance(self, clusters=None):
         """Covariance of the free parameters: ``normal = s2 S^-1`` and the cluster-robust sandwich."""
         theta = self._theta_t()
-        mu_save = self.mu_q.clone()
-        self.mu_q = torch.full_like(self.mu_q, 1e-9)
-        S, _, _, scores = self.reduced_system(theta, self.mu_c, clusters=clusters)
-        self.mu_q = mu_save
+        sysm = _lm.System(self._blocks(theta, self.C, True), len(self.free_idx), *self._theta_normal(theta),
+                          damp_blocks=self._damp_fixed(1e-9))
+        S, _, gq = sysm.reduced(per_block=True)
         S = 0.5 * (S + S.T)
         dsq = torch.sqrt(torch.diagonal(S).clamp(min=1e-30))
         Sn = S / dsq[:, None] / dsq[None, :]
@@ -1119,10 +972,13 @@ class SpatiotemporalBA:
         dof = max(n_obs - len(self.free_idx), 1)
         s2 = float(self.cost(theta)) / dof
         out = dict(normal=_np(Sinv * s2), s2=s2, free_names=[self.theta_names[i] for i in self.free_idx])
-        if scores and len(scores) >= 2:
-            Gm = torch.stack(list(scores.values()))
-            out['sandwich'] = _np(Sinv @ (Gm.T @ Gm) @ Sinv)
-            out['n_clusters'] = len(scores)
+        if clusters is not None:
+            uc, ci = np.unique(np.asarray(clusters), return_inverse=True)
+            if len(uc) >= 2:
+                Gm = torch.zeros(len(uc), S.shape[0], dtype=self.dt, device=self.dev).index_add_(
+                    0, self._T(ci.ravel(), torch.long), torch.cat(gq))
+                out['sandwich'] = _np(Sinv @ (Gm.T @ Gm) @ Sinv)
+                out['n_clusters'] = len(uc)
         return out
 
     def residuals(self, theta=None, C=None):

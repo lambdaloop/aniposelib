@@ -5,6 +5,18 @@
 - **`triangulation.triangulate_robust` / `triangulate_possible` do the lens-fold / ray-consistency check** (`check_invertible=True`, plan 04 decision 24), formerly only in the `CameraGroup` wrappers; function and method now agree. Results are unchanged where no lens folds; for strongly barrel-distorted lenses the function results change like the method's did in 1.0. `check_invertible=False` restores the 1.0 function behaviour.
 - `triangulate_robust(scores=...)`: confidences as soft weights (clipped to [0, 1]) in the MSAC hypothesis cost, the inlier refit and the Gauss-Newton refinement (and the IRLS / reject fits). New keyword; no default change.
 - **`optim_points(normalize=True)` default (plan 04 decision 24, plan 05 §6.3).** The optimisation runs in pixel-equivalent units (points parametrised as `center + u * q`, `u` = median z/f at the points), so its result no longer depends on the rig's units (mm vs m vs km give the same answer; before, the Adam step `max_lr` and the bone/smoothness weights were in world units). Bone targets are fixed at a robust per-bone median (frames where both joints are triangulated) instead of free parameters clipped across bones, and the bone term is a squared pixel-equivalent residual (`10 * scale_length`), so bone constraints now tighten bone lengths within a short budget (the 1.0 target `test_optim_points_tightens_bones` passes). Smoothness is `0.01 * scale_smooth / mean|diff|` on pixel-equivalent differences (a light default). `normalize=False` restores the 1.0 loss and parametrisation exactly.
+- **Removed (1.1, plan 04 decision 15):** the first-order per-camera time offset in `bundle_adjust_lm`
+  (`ParamSpec(time_offset=...)`, `BAReport.time_offsets`). Time offsets live only in `stba.SpatiotemporalBA`
+  (`free_offsets='per_camera'` gives the same per-camera deltas, with a spline motion model instead of finite
+  differences). Stations (`stations=`) stay in `bundle_adjust_lm`.
+- **One LM core (1.1, plan 04 §3):** a shared Levenberg-Marquardt engine (`aniposelib._lm`: IRLS losses, Marquardt
+  damping with acceptance on the true cost, Schur complement over generic point-like blocks, dense Cholesky or PCG
+  reduced solve). `bundle_adjust_lm` (cost histories unchanged to ~1e-11 relative), `stba.SpatiotemporalBA`
+  (unchanged to ~1e-12, about 2x faster; it now uses the bundle projection kernel), `init.sfm.refine_extrinsics`
+  (now `bundle_adjust_lm` on ideal pinhole cameras; observations behind a camera are pruned) and
+  `intrinsics.lm_board_adjust` (analytic instead of numeric Jacobians; ladder fits agree to ~1e-6 px, more
+  iterations to reach `tol`) all run on it. `method='adam'` is unchanged.
+
 - Dev env: the default pixi env now includes all optional extras (vggt @ a288dd0, torchvision cu128, huggingface_hub, safetensors, pillow, onnxruntime, onnx, soundfile, av, pyyaml); the real VGGT-1B smoke test (`-m slow`) now runs when the weights are in the local HF cache.
 - `CharucoBoard.draw` / `Checkerboard.draw` default to `margin='auto'` (half a square of white border), so rendered boards are directly detectable (edge-to-edge renders lost most edge corners: 6/20 on a 6x5 board). `margin=0` restores the old edge-to-edge output.
 
