@@ -147,7 +147,7 @@ def test_w2_invalid_lens_is_reverted(mo, monkeypatch):
     true, _, _, p2 = mo
     ref = synth.perturb_extrinsics(true, 0.5, 0.01, seed=4)
     bad_name = true.get_names()[1]
-    monkeypatch.setattr(WC, '_invalid_lenses', lambda g: [bad_name])
+    monkeypatch.setattr(WC, '_invalid_lenses', lambda g, p=None: [bad_name])
     k0 = synth.to_np(ref.cameras[1].get_camera_matrix()).copy()
     cg, res = calibrate_from_points(p2, ref, init='reference', refine_intrinsics=True,
                                     options={'quality': False})
@@ -421,3 +421,17 @@ def test_detect_moves_drops_windows_a_rotation_cannot_explain():
     assert len(mv.info['bad_fit'].get(rig.get_names()[2], [])) >= 2
     mv0 = ST.detect_moves(rig, p2, t, tau=5.0, z_thr=10.0, max_resid_ratio=None)
     assert np.isfinite(mv0.delta_deg[2, -2]).all() and not np.isfinite(mv.delta_deg[2, -2]).all()
+
+
+
+def test_lens_check_on_the_data_region():
+    from aniposelib.cameras import Camera
+    cam = Camera(name='a', size=(1000, 800))
+    cam.set_camera_matrix(np.array([[600.0, 0, 500], [0, 600, 400], [0, 0, 1]]))
+    cam.set_distortions(np.array([-1.0, 0, 0, 0, 0]))       # folds at r ~ 0.58 (normalised)
+    centre = np.random.default_rng(0).uniform([400, 300], [600, 500], (200, 2))
+    corners = np.random.default_rng(1).uniform([0, 0], [120, 100], (200, 2))
+    assert WC._lens_ok_on(cam, centre)
+    assert not WC._lens_ok_on(cam, np.concatenate([centre, corners]))
+    cam.set_distortions(np.zeros(5))
+    assert WC._lens_ok_on(cam, corners)

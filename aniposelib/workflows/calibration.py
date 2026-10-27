@@ -1152,14 +1152,48 @@ def _loo_median(cg, p, tau_tri):
     return _loo_stats(cg, p, tau_tri, 8.0 * tau_tri / 5.0)[0]
 
 
-def _invalid_lenses(cg):
-    """Names of the cameras whose lens model is not invertible over the image."""
+def _lens_ok_on(cam, uv, max_roundtrip_px=0.5, min_slope=0.05, n_max=4000):
+    """Is the lens model invertible where the camera has data? Its observed pixels ``uv [M,2]``
+    are undistorted and re-distorted (99th percentile round trip below ``max_roundtrip_px``) and
+    the radial map must be monotone up to their largest radius."""
+    from .. import geometry as G
+    from ..quality import _radial_slope
+    uv = np.asarray(uv, float).reshape(-1, 2)
+    uv = uv[np.isfinite(uv).all(1)]
+    if len(uv) == 0:
+        return True
+    if len(uv) > n_max:
+        uv = uv[np.random.default_rng(0).choice(len(uv), n_max, replace=False)]
+    P = G.pack([cam])
+    t = torch.as_tensor(uv[None], dtype=P.dtype, device=P.device)
+    with torch.no_grad():
+        xy = G._undistort_flat(P, t)
+        back = G.distort(P, xy)
+    xy, back = to_numpy(xy)[0], to_numpy(back)[0]
+    err = np.linalg.norm(back - uv, axis=-1)
+    if not np.isfinite(err).mean() >= 0.99:
+        return False
+    if np.nanpercentile(err, 99) > max_roundtrip_px:
+        return False
+    rmax = float(np.nanmax(np.hypot(xy[:, 0], xy[:, 1])))
+    slope = _radial_slope(P, rmax) if rmax > 0 else 1.0
+    return bool(np.isfinite(slope) and slope > min_slope)
+
+
+def _invalid_lenses(cg, points=None):
+    """Names of the cameras whose lens model is not invertible over the image -- or, with
+    ``points [C,...,2]``, over the region where the camera has observations (a fisheye model is
+    often not invertible in image corners nothing is seen in, even for a correct lens)."""
     from .. import quality as Q
     bad = []
-    for cam in cg.cameras:
+    flat = None if points is None else _flat(points)
+    for c, cam in enumerate(cg.cameras):
         try:
-            lv = Q.lens_validity(cam, max_nonfinite_frac=0.05 if getattr(cam, 'fisheye', False) else 0.0)
-            if not lv['valid']:
+            if flat is not None:
+                ok = _lens_ok_on(cam, flat[c])
+            else:
+                ok = Q.lens_validity(cam, max_nonfinite_frac=0.05 if getattr(cam, 'fisheye', False) else 0.0)['valid']
+            if not ok:
                 bad.append(cam.get_name())
         except Exception:  # pragma: no cover
             pass
@@ -1186,8 +1220,9 @@ def _share_spec(share, names):
 def _gate_intrinsics(cg, pc, gr, mode, nf, opts, rng):
     """Evidence-gated focal + k1 refinement. Returns ``(cgroup, info)``.
 
-    A refined lens that is not invertible over the image (``quality.lens_validity``) is put back
-    to the given one (that camera only, then an extrinsics re-fit). ``'auto'`` keeps the refinement
+    A refined lens that is not invertible where the camera has observations (round trip of its
+    observed pixels, monotone radial map) is put back to the given one (that camera only, then an
+    extrinsics re-fit). ``'auto'`` keeps the refinement
     only if, on held-out windows, the LOO median improves by ``intrinsics_gain`` and neither the
     LOO agreement nor the LOO coverage gets worse. Never raises: a failed fit keeps the given
     intrinsics (``decision='kept'``, the error in ``reason``)."""
@@ -1219,7 +1254,7 @@ def _gate_intrinsics_(cg, pc, gr, mode, nf, opts, rng):
         keep = inl & (inl.sum(0) >= min_views)[None]
         q = np.where(keep[..., None], flat, np.nan)
         B.bundle_adjust_lm(group, q, spec=spec, loss='cauchy', f_scale=f_scale, n_iter=30, rng=rng)
-        bad = _invalid_lenses(group)
+        bad = _invalid_lenses(group, p)
         if bad:      # revert those lenses, re-settle the extrinsics
             for cam, cb in zip(group.cameras, before.cameras):
                 if cam.get_name() in bad:
