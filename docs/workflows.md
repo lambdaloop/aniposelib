@@ -86,6 +86,10 @@ cgroup, result = al.calibrate_from_board(
 What it does:
 
 1. Finds the board in the videos. If the learned DeepCharuco detector is installed it uses that, otherwise OpenCV.
+   The videos of all cameras are read together from start to end, and the board is looked for in every 20th frame
+   (`options={'skip': 20}`). It stops once every camera has seen the board 200 times (`'max_boards'`; `None` reads
+   everything). For a quick look at a long video, `options={'n_frames': 300}` uses 300 frames spread evenly over the
+   whole video instead. `result.settings['detection']` says how much was read and why it stopped.
 2. Works out each camera's lens (focal length and distortion). It tries a few lens models, from simple to complex,
    and keeps the simplest one that predicts board views it hasn't seen.
 3. Works out where the cameras are relative to each other, from frames where two cameras see the board at once.
@@ -226,8 +230,10 @@ result = al.estimate_scale(cgroup, lengths=dict(points=points2d, pairs=bones, re
                            reference=lab_calibration, align='reference')
 ```
 
-The board can also be found directly in the videos: `board_points={'cam1': 'cam1.mp4', 'cam2': 'cam2.mp4', ...}`, with
-`options={'n_frames': 60}` to look at only 60 evenly spaced frames. The frames are the same in every camera.
+The board can also be found directly in the videos: `board_points={'cam1': 'cam1.mp4', 'cam2': 'cam2.mp4', ...}`. The
+videos must be in sync (frame 100 in one camera is frame 100 in all of them). As in `calibrate_from_board`, every 20th
+frame is checked, and it stops once 200 frames show the board in at least two cameras (`options={'max_frames': 200}`).
+`options={'n_frames': 60}` looks at only 60 evenly spaced frames instead.
 
 ## Checking a calibration: `evaluate_calibration`
 

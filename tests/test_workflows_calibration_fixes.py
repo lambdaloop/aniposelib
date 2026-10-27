@@ -103,26 +103,39 @@ def test_w3_lengths_tau_check_and_reference_frame(mo):
         estimate_scale(moved, lengths=dict(points=p2, pairs=bones, ref=L), reference=ref)   # align not given
 
 
-def test_w3_board_points_from_videos(monkeypatch):
+def test_w3_board_points_from_videos(monkeypatch, tmp_path):
+    import aniposelib.boards as B
     from aniposelib.boards import CharucoBoard
-    from aniposelib.cameras import CameraGroup
     true = synth.load_rig('allen_7cam')
     board = CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, units='mm')
     rows = synth.board_rows(true, board, n_frames=25, seed=1)
     seen = {}
 
-    def fake_rows(self, videos, board_, verbose=True, **kw):
-        seen.update(kw, videos=videos)
+    def fake_detect(board_, videos, **kw):
+        seen.update(kw, videos=videos, kwargs=board_.detector_kwargs, name=board_.detector_name)
+        kw['info'].update(stopped='end')
         return rows
-    monkeypatch.setattr(CameraGroup, 'get_rows_videos', fake_rows)
-    monkeypatch.setattr(WC, '_video_n_frames', lambda path: 500)
-    vids = {n: '{}.mp4'.format(n) for n in true.get_names()}
+    monkeypatch.setattr(B, 'detect_videos', fake_detect)
+    monkeypatch.setattr(B, '_video_length', lambda path: 500)
+    vids = {n: str(tmp_path / '{}.mp4'.format(n)) for n in true.get_names()}
+    for v in vids.values():
+        open(v, 'w').close()
     res = estimate_scale(true, board=board, board_points=vids, options={'n_frames': 11, 'detector': 'opencv'})
     assert res.accepted and abs(res.scale - 1) < 1e-3
     assert seen['frame_indices'] == list(np.linspace(0, 499, 11).round().astype(int))
-    assert seen['videos'][0] == ['{}.mp4'.format(true.get_names()[0])]
+    assert seen['videos'][0] == vids[true.get_names()[0]] and seen['max_frames'] == 200
+    assert seen['min_cameras'] == 2 and seen['prefix'] == 0
+    det = res.report['detection']
+    assert det['sampling'] == 'sequential' and det['frame_indices'] == seen['frame_indices']
+    estimate_scale(true, board=board, board_points=vids, options={'detector': 'deepcharuco'})
+    assert seen['name'] == 'deepcharuco' and seen['kwargs'] == {'scale': 'auto'}     # frame-size input scale
+    estimate_scale(true, board=board, board_points=vids,
+                   options={'detector': 'deepcharuco', 'detector_kwargs': {'scale': 0.3}})
+    assert seen['kwargs'] == {'scale': 0.3}
     with pytest.raises(ValueError):
         estimate_scale(true, board=board, board_points={'nope': 'x.mp4'})
+    with pytest.raises(FileNotFoundError):
+        estimate_scale(true, board=board, board_points={true.get_names()[0]: str(tmp_path / 'missing.mp4')})
 
 
 # ------------------------------------------------------------------ W2
@@ -437,3 +450,43 @@ def test_lens_check_on_the_data_region():
     assert not WC._lens_ok_on(cam, np.concatenate([centre, corners]))
     cam.set_distortions(np.zeros(5))
     assert WC._lens_ok_on(cam, corners)
+
+
+def test_w1_videos_end_to_end(tmp_path):
+    """W1 on rendered videos (2 cameras): frame-major sequential detection, early exit, metric rig."""
+    import cv2
+    from board_render import render_board
+    from aniposelib.boards import CharucoBoard
+    from aniposelib.workflows import calibrate_from_board
+    board = CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, units='mm')
+    K = np.array([[600.0, 0, 320], [0, 600, 240], [0, 0, 1]])
+    size = (640, 480)
+    R1 = cv2.Rodrigues(np.array([0.0, -0.3, 0.0]))[0]
+    t1 = np.array([-150.0, 0, 20.0])
+    rng = np.random.default_rng(0)
+    c = board.get_object_points().mean(0)
+    writers = [cv2.VideoWriter(str(tmp_path / '{}.avi'.format(n)), cv2.VideoWriter_fourcc(*'MJPG'), 10, size)
+               for n in 'ab']
+    if not writers[0].isOpened():
+        pytest.skip('no MJPG video writer')
+    for f in range(40):
+        rb = rng.normal(0, 0.35, 3)
+        Rb = cv2.Rodrigues(rb)[0]
+        tb = np.array([rng.uniform(-60, 60), rng.uniform(-40, 40), rng.uniform(380, 520)]) - Rb @ c
+        for cam, (R, t) in enumerate([(np.eye(3), np.zeros(3)), (R1, t1)]):
+            img = render_board(board, K, cv2.Rodrigues(R @ Rb)[0], R @ tb + t, size) if f % 4 else \
+                np.full(size[::-1], 128, np.uint8)
+            writers[cam].write(cv2.cvtColor(cv2.GaussianBlur(img, (0, 0), 0.7), cv2.COLOR_GRAY2BGR))
+    for w in writers:
+        w.release()
+    vids = [[str(tmp_path / 'a.avi')], [str(tmp_path / 'b.avi')]]
+    from aniposelib.cameras import Camera, CameraGroup
+    init = CameraGroup([Camera(matrix=K, dist=np.zeros(5), size=size, name=n) for n in 'ab'])
+    cg, res = calibrate_from_board(vids, board, detector='opencv', init=init, intrinsics='fixed',
+                                   options={'skip': 1, 'max_boards': 12, 'n_workers': 2})
+    det = res.settings['detection']
+    assert det['sampling'] == 'sequential' and det['segments'][0]['stopped'] == 'max_boards'
+    assert det['n_rows'][1] == 12 and det['segments'][0]['last_frame'] < 39
+    assert cg is not None and cg.get_names() == ['a', 'b']
+    C = synth.camera_centers(cg)
+    assert abs(np.linalg.norm(C[1] - C[0]) - np.linalg.norm(R1.T @ t1)) < 3.0       # mm (render bias ~1 %)

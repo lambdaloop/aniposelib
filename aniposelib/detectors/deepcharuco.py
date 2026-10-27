@@ -405,11 +405,17 @@ class DeepCharucoDetector:
     backend : 'torch' or 'onnx'
     batch_size : int
         Frames per network call in :meth:`detect_batch`.
+    max_batch_pixels : float
+        Cap on the (scaled) pixels per network call (default 4e6: two 1440x1080 frames at
+        ``scale=1``, 16 frames at 640x360); on a CUDA out-of-memory error the batch is halved.
     refine : bool
         Run RefineNet (1/8-pixel corners).
-    scale : float
+    scale : float or 'auto'
         Isotropic input scale (the board should look like it did in training: covering
         ~25-90% of a 320x240 frame). E.g. 0.25-0.5 for 1080p footage of a nearby board.
+        ``'auto'``: longest image side scaled to 720 px (never up); the workflows' default.
+        On 1440x1080 calibration videos, scale 1 found 112 boards in 840 frames, 0.5 found
+        249 (OpenCV 312), 4x faster.
     min_score : float
         Drop corners whose id probability is below this.
     subpix : bool
@@ -422,7 +428,7 @@ class DeepCharucoDetector:
 
     def __init__(self, board, *, weights_dir=None, repo=HF_REPO, revision=None,
                  device='auto', backend='torch', batch_size=16, refine=True, scale=1.0,
-                 min_score=0.0, subpix=False, color_order='bgr', download=True):
+                 min_score=0.0, subpix=False, color_order='bgr', download=True, max_batch_pixels=4e6):
         if isinstance(board, (tuple, list)):
             squaresX, squaresY = int(board[0]), int(board[1])
             legacy = None
@@ -445,7 +451,10 @@ class DeepCharucoDetector:
         self.device = _resolve_device(device)
         self.backend = backend
         self.batch_size = max(1, int(batch_size))
-        self.scale = float(scale)
+        self.max_batch_pixels = float(max_batch_pixels)
+        if isinstance(scale, str) and scale != 'auto':
+            raise ValueError("scale must be a float or 'auto'")
+        self.scale = scale if scale == 'auto' else float(scale)
         self.min_score = float(min_score)
         self.subpix = bool(subpix)
         self.color_order = color_order
@@ -481,6 +490,15 @@ class DeepCharucoDetector:
         return 'DeepCharucoDetector(squaresX={}, squaresY={}, device={!r}, backend={!r})'.format(
             self.squaresX, self.squaresY, self.device, self.backend)
 
+    AUTO_LONG_SIDE = 720
+
+    def scale_for(self, shape):
+        """Input scale for an image of ``shape`` (h, w): ``scale``, or with ``scale='auto'``
+        ``min(1, 720 / longest side)`` (0.5 for 1440x1080)."""
+        if self.scale == 'auto':
+            return min(1.0, self.AUTO_LONG_SIDE / float(max(shape[:2])))
+        return self.scale
+
     def detect(self, image):
         return self.detect_batch([image])[0]
 
@@ -488,17 +506,30 @@ class DeepCharucoDetector:
     def detect_batch(self, images, return_scores=False):
         """Detect corners in a list of images (any mix of sizes; same-size frames are batched)."""
         grays = [_to_gray(im, self.color_order) for im in images]
-        prepped = [preprocess(g, self.scale) for g in grays]
+        prepped = [preprocess(g, self.scale_for(g.shape)) for g in grays]
         results = [None] * len(images)
         groups = {}
         for n, (x, _) in enumerate(prepped):
             groups.setdefault(x.shape, []).append(n)
         for shape, idxs in groups.items():
-            for start in range(0, len(idxs), self.batch_size):
-                chunk = idxs[start:start + self.batch_size]
+            # frames per network call: batch_size, capped by the pixel budget (full-HD frames at
+            # batch 16 need ~18 GB of activations)
+            per = max(1, min(self.batch_size, int(self.max_batch_pixels // max(1, shape[0] * shape[1]))))
+            start = 0
+            while start < len(idxs):
+                chunk = idxs[start:start + per]
                 batch = torch.from_numpy(np.stack([prepped[n][0] for n in chunk]))[:, None]
                 batch = batch.to(self.device)
-                loc, ids = self.detector(batch)
+                try:
+                    loc, ids = self.detector(batch)
+                except torch.OutOfMemoryError:
+                    if per == 1:
+                        raise
+                    del batch
+                    torch.cuda.empty_cache()
+                    per = max(1, per // 2)
+                    continue
+                start += len(chunk)
                 decoded = [decode(loc[b], ids[b], self.n_ids) for b in range(len(chunk))]
                 if self.min_score > 0:
                     decoded = [(xy[s >= self.min_score], i[s >= self.min_score], s[s >= self.min_score])
