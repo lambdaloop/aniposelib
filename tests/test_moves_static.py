@@ -188,3 +188,18 @@ def test_w4_step_inside_bad_windows_is_demoted():
     assert [d['camera'] for d in ev.report['moves_demoted']] == [name]
     old = W.evaluate_calibration(rig, p2, times=t, options=dict(opts, moves_bad_window_frac=None))
     assert name in old.moves.moved
+
+
+def test_w4_camera_lost_from_the_start_is_placed_per_window(lost_camera):
+    """The association never had the bumped camera (tracklets crossing the bump were dropped):
+    each window is placed on its own; before the bump it fits its old pose, after it a station."""
+    rig, rigb, cb, tb, t, p, assoc, det = lost_camera
+    a2 = assoc.copy()
+    a2[cb] = np.nan
+    name = rig.get_names()[cb]
+    ev = W.evaluate_calibration(rig, a2, times=t, options={'detections': det})
+    assert ev.moves.moved == [name]
+    (cp,) = ev.moves.change_points
+    assert abs(cp['time'] - tb) <= 4.0 + 1e-9 and abs(cp['step_deg'] - np.linalg.norm([3.0, -4.5, 2.0])) < 0.15
+    assert ev.moves.stations.lookup_name(name, [1.0])[0] == name
+    assert np.isfinite(ev.points[cb, t < tb - 4]).mean() > 0.9

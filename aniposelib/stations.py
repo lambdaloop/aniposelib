@@ -895,7 +895,7 @@ def _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support, max_n=5)
 def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=None, window_s=None,
                   tau=10.0, agree_px=None, gate_px=None, min_other=2, collapse_ratio=0.3, min_windows=3,
                   min_support=20, max_deg=15.0, grid_step_deg=2.5, max_instances=600, cameras=None,
-                  device=None, rng=0, persistent=True, min_step_deg=0.5):
+                  device=None, rng=0, persistent=True, min_step_deg=0.5, max_blocks=40):
     """Re-place cameras that were bumped so hard that their LOO coverage collapses.
 
     A camera whose share of the points supported by the other cameras that it also sees and agrees
@@ -964,6 +964,7 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
         lc = None
     # phase 1: collapsed runs per camera
     jobs = []
+    overall = {}
     for c in cams:
         sup, hit = _loo_quality(P, flat, c, tau, min_other, agree_px,
                                 cache=None if lc is None else lc['cams'].get(c))
@@ -978,6 +979,7 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             continue
         q = np.where(judged, nh / np.maximum(ns, 1), np.nan)
         jw = np.flatnonzero(judged)
+        overall[c] = (float(nh[judged].sum() / max(ns[judged].sum(), 1)), jw, q)
         for cand, end, before in _collapses(q, ns, nh, jw, collapse_ratio, min_windows, min_support):
             k0 = jw[cand]
             good_t = t[hit.reshape(N, J).any(1) & (win < k0)]
@@ -992,6 +994,22 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
                 d['status'] = 'skipped: coverage came back at {:.6g} s (not a lasting move)'.format(t_end)
                 continue
             jobs.append((k0, lost / max(before, 1e-9), c, t_cp, t_end, before, d))
+    # cameras the association lost from the start (people data with detections): every window is
+    # re-placed on its own (or found unmoved), equal neighbours share a station
+    if detections is not None and len(overall) >= 3:
+        for c, (qc, jw, q) in overall.items():
+            ref = float(np.median([v[0] for o, v in overall.items() if o != c]))
+            if any(j[2] == c for j in jobs) or not qc < collapse_ratio * ref:
+                continue
+            info.setdefault(names[c], [])
+            blocks = np.array_split(jw, min(len(jw), max_blocks))
+            for b in blocks:
+                t_a = t0 + b[0] * ws if b is not blocks[0] else -INF
+                t_b = t0 + (b[-1] + 1) * ws if b is not blocks[-1] else INF
+                d = dict(time=float(t0 + b[0] * ws), t_end=t_b, coverage_before=ref,
+                         coverage_lost=float(np.nanmedian(q[b])), status='failed', lost_camera=True)
+                info[names[c]].append(d)
+                jobs.append((b[0], 0.0, c, t_a, t_b, ref, d))
     # phase 2: earliest first, then the most collapsed; each recovered camera's pose and data are
     # used when the next cameras are re-placed
     work = p2d.copy()
@@ -1095,7 +1113,12 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             if not after >= 0.5 * before:
                 d['status'] = 'failed: coverage after recovery {:.3g} < half of {:.3g}'.format(after, before)
                 continue
-            if step < min_step_deg and not full:
+            if after - cov0 < 0.25 * before:
+                d['status'] = 'not moved: the recovered pose explains little more than the old one ({:.3g} vs {:.3g})'.format(
+                    after, cov0)
+                Rb, tb = eye3, zero3
+                moved_ = False
+            elif step < min_step_deg and not full:
                 d['status'] = 'not moved: recovered rotation {:.2g} deg < min_step_deg'.format(step)
                 Rb, tb, moved_ = eye3, zero3, False
             else:
@@ -1109,7 +1132,13 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
             E1n = E1.cpu().numpy()
             overrides[c] = (t_cp, t_end, E1)
             exist = [cp for cp in cps if cp['camera'] == name and abs(cp['time'] - t_cp) <= 2 * ws]
-            if exist:
+            same = [k_ for k_, E_ in poses.get(name, {}).items()
+                    if np.degrees(np.linalg.norm(_rotvec(np.asarray(E_)[:3, :3] @ E1n[:3, :3].T))) < min_step_deg
+                    and np.linalg.norm(np.asarray(E_)[:3, 3] - E1n[:3, 3]) < 0.01 * float(np.linalg.norm(E1n[:3, 3]) + 1e-9)]
+            if same:
+                sn = same[0]
+                exist = []
+            elif exist:
                 t_cp = float(exist[0]['time'])
                 sn = str(st.lookup_name(name, [t_cp + 1e-9])[0])
                 if sn == SKIP:
@@ -1121,15 +1150,18 @@ def recover_moves(cgroup, data, times, moves=None, detections=None, frame_ids=No
                 while sn in st.names(name):
                     k += 1
                     sn = '{}@s{}'.format(name, k)
+            prev = str(st.lookup_name(name, [t_cp - 1e-6])[0]) if np.isfinite(t_cp) else None
             st = st.paint(name, t_cp, t_end, sn)
             rots.setdefault(name, {name: np.zeros(3)})
             rots[name][sn] = _rotvec(E1n[:3, :3] @ E0[:3, :3].T.cpu().numpy())
             poses.setdefault(name, {})[sn] = E1n
-            cps.append(dict(camera=name, time=float(t_cp), window=int(k0), step_deg=d['step_deg'], z=None,
-                            recovered=True, center_shift=d['center_shift'], left_deg=[0.0, 0.0, 0.0],
-                            right_deg=d['rotvec_deg']))
+            if prev != sn:
+                cps.append(dict(camera=name, time=float(t_cp) if np.isfinite(t_cp) else float(t0), window=int(k0),
+                                step_deg=d['step_deg'], z=None, recovered=True, center_shift=d['center_shift'],
+                                left_deg=[0.0, 0.0, 0.0], right_deg=d['rotvec_deg']))
             d['station'] = sn
-            d['time'] = float(t_cp)
+            if np.isfinite(t_cp):
+                d['time'] = float(t_cp)
         # re-association of the camera's detections after the move (or after the data loss)
         if detections is not None:
             if new_pts is None:

@@ -192,7 +192,11 @@ Tested on the reference projects' data (`dev/scratch/realdata`). Every new defau
   `options['detections']` (the `associate_views` input) and `options['frame_ids']` (or `C x F x P x J x 2` points,
   now accepted) the camera's detections are re-associated after the move and returned in `res.points` (same shape as
   the input); a camera that only lost its association but still fits its old pose is re-associated and reported as
-  'not moved'. Without detections only a camera's agreement where it sees the point counts. Why: the dancing G4 6.2
+  'not moved'. A camera the association lost from the start (tracklets crossing an 8 deg re-aim were all dropped) is
+  placed window by window, equal neighbours sharing a station (Panoptic 00_15 8 deg: found at 20.0 s, 8.0 deg; before:
+  missed, and a 0.6 deg false station on 00_05). A recovered pose must explain clearly more than the old one
+  (coverage gain >= 25 % of the level before). Without detections only a camera's agreement where it sees the point
+  counts. Why: the dancing G4 6.2
   deg bump was invisible to the whole chain because W7 with the old rig could not associate G4 any more.
   Old behaviour: `options={'recover_moves': False}`.
 - **`detect_moves(retest=True)` is now an explain-away test** (`suspect_frac=0.5`): cameras with a step of z >= 0.5 x
