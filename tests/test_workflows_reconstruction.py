@@ -464,6 +464,7 @@ def test_offsets_drift_unidentifiable_and_irregular_times(sync_scene):
     assert any('irregular_times' in r for r in res.reasons)
 
 
+@pytest.mark.slow
 def test_offsets_self_F_seed_and_refine_rate(sync_scene):
     cg, streams, off, rate = sync_scene
     names = list(streams)
@@ -550,6 +551,7 @@ def test_associate_sparse_ids_ghosts_n_identities(crowd):
     assert r.settings['link_max_gap_frames'] == 30
 
 
+@pytest.mark.slow
 def test_associate_tracklet_switch_split_stitch(crowd):
     """A tracker swaps two people in one camera: the tracklets are cut at the switch and the pieces
     associated again. A person whose tracklets all restart (new ids) is stitched over time."""
@@ -620,6 +622,7 @@ def test_offsets_audio_delay_sigma(sync_scene):
         assert abs(r1.offsets[n] - r0.offsets[n]) < 1e-4
 
 
+@pytest.mark.slow
 def test_offsets_refine_windows_piecewise(sync_scene):
     """A seed with a wrong clock rate (1 ms/s): per-window STBA gives a piecewise map that follows it."""
     from aniposelib import sync as S

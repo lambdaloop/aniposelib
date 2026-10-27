@@ -116,6 +116,7 @@ def test_bundle_adjust_freezes_exactly(n_dist, method):
         assert moved > 1e-3, "free coefficients did not move, test proves nothing"
 
 
+@pytest.mark.slow
 def test_bundle_adjust_iter_freezes_exactly():
     """bundle_adjust_iter restores state dicts between passes, which is where a
     naive freeze could resurrect a different value."""

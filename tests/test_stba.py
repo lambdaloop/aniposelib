@@ -130,6 +130,7 @@ def test_stba_rolling_shutter_and_rate(rig):
     assert np.all(res.rs_sigma < 2e-3)
 
 
+@pytest.mark.slow
 def test_stba_time_warp_from_soft_dtw(rig):
     # camera 1's clock jumps by 20 ms at t = 2 s (dropped frames): one offset cannot fit it
     corr = lambda t: np.where(t < 2, 0.010, 0.030)
@@ -239,6 +240,7 @@ def test_detect_moves_finds_bumped_camera(rig):
     assert abs(rep2.change_points[0]['time'] - tb) < 1 / 30 + 1e-6
 
 
+@pytest.mark.slow
 def test_stba_rate_groups_and_clip_ties(rig):
     # cameras 1 and 2 are clips of one device: one clock rate
     rates = np.array([0, 2e-3, 2e-3, -1e-3, 0])

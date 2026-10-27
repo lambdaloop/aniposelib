@@ -220,6 +220,7 @@ def test_w1b_bad_inputs():
 
 # ------------------------------------------------------------------ W2 points
 
+@pytest.mark.slow
 def test_w2_outdoor_trajectory_false_detections():
     """Boardless arena: one blob per frame with 5 % false detections; SfM init from the given
     intrinsics, noise-normalised robust BA, held-out gate keeps the (correct) intrinsics."""
@@ -243,6 +244,7 @@ def motobs():
     return true, p3, bones, p2
 
 
+@pytest.mark.slow
 def test_w2_keypoints_with_decoy(motobs):
     """One camera locks onto a decoy for 60 % of frames: the calibration is still right, and
     the verdict warns about that camera (few inliers) instead of failing on its LOO."""
@@ -321,6 +323,7 @@ def _bumped(cg, cam, rot_deg):
     return cgb
 
 
+@pytest.mark.slow
 def test_w4_moved_camera_and_decoy():
     rig = synth.load_rig('motobs_7cam')
     fn = synth.smooth_tracks(rig, n_points=6, amp=0.1, seed=1)

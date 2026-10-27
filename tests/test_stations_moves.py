@@ -96,6 +96,7 @@ def test_retest_clears_cameras_flagged_because_of_the_moved_one():
     assert rep.change_points[0]['z'] > 6 and abs(rep.change_points[0]['time'] - 13.2) < 0.2
 
 
+@pytest.mark.slow
 def test_retest_keeps_a_second_true_move():
     rig = synth.load_rig('motobs_7cam').subset_cameras([1, 2, 3, 5, 6])
     names = rig.get_names()

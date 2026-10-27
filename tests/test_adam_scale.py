@@ -28,6 +28,7 @@ def run(scale, **kw):
 
 
 @pytest.mark.parametrize('scale', [1e-3, 1.0, 1e3])
+@pytest.mark.slow
 def test_adam_converges_at_any_rig_scale(scale):
     before, after = run(scale)
     assert after < before / 3

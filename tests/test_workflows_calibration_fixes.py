@@ -279,6 +279,7 @@ def test_w4_cam_names_and_affine(mo):
         evaluate_calibration(aff, np.zeros((3, 4, 2)))
 
 
+@pytest.mark.slow
 def test_w4_time_windows_compare_to_and_moves(mo):
     rig = synth.load_rig('motobs_7cam')
     fn = synth.smooth_tracks(rig, n_points=6, amp=0.1, seed=1)
@@ -320,6 +321,7 @@ def _board():
     return CharucoBoard(6, 5, 24, 18, marker_bits=4, dict_size=50, units='mm')
 
 
+@pytest.mark.slow
 def test_w1_bridge_rules_and_board_floor():
     from aniposelib.workflows import calibrate_from_board
     true = synth.load_rig('allen_7cam')
@@ -452,6 +454,7 @@ def test_lens_check_on_the_data_region():
     assert WC._lens_ok_on(cam, corners)
 
 
+@pytest.mark.slow
 def test_w1_videos_end_to_end(tmp_path):
     """W1 on rendered videos (2 cameras): frame-major sequential detection, early exit, metric rig."""
     import cv2

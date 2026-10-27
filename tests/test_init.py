@@ -108,6 +108,7 @@ def blank(cg):
     return cg
 
 
+@pytest.mark.slow
 def test_sfm_mouse_with_decoy_recovers_rig(mouse_scene):
     """From intrinsics only, a mouse seen by 7 cameras, one locked onto a decoy for 60 % of
     the frames: every camera placed within 0.5 % of rig scale (similarity aligned)."""
@@ -202,6 +203,7 @@ def test_pairwise_poses_usac_vs_ransac():
         sfm.pairwise_poses(u, f, pairs=prs, method='lmeds')
 
 
+@pytest.mark.slow
 def test_sfm_deterministic_threads_and_device(mouse_scene):
     """Same rng -> same rig, whatever the number of threads; device= runs the robust
     re-triangulations there (CUDA when available) with the same result to rounding."""
@@ -217,6 +219,7 @@ def test_sfm_deterministic_threads_and_device(mouse_scene):
         assert np.allclose(get_extrinsics(c), get_extrinsics(a), atol=1e-6)
 
 
+@pytest.mark.slow
 def test_people_bootstrap():
     """Two people, detection slots shuffled per camera: identities are recovered from
     epipolar geometry, then SfM recovers the rig."""
@@ -258,6 +261,7 @@ def test_refine_group_pulls_in_perturbed_rig(mouse_scene):
     assert st['median_px'] < 1.0
 
 
+@pytest.mark.slow
 def test_calibrate_from_points_recipe():
     """Blank extrinsics + intrinsics -> SfM -> refinement -> metric scale from a reference
     -> quality report."""

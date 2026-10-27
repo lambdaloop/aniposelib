@@ -93,6 +93,7 @@ def lost_camera():
     return rig, rigb, cb, tb, t, p, assoc, det
 
 
+@pytest.mark.slow
 def test_w4_recovers_lost_camera_and_reassociates(lost_camera):
     rig, rigb, cb, tb, t, p, assoc, det = lost_camera
     name = rig.get_names()[cb]
@@ -120,6 +121,7 @@ def test_w4_recovers_lost_camera_and_reassociates(lost_camera):
     assert ev0.moves.moved == [] and ev0.points is None
 
 
+@pytest.mark.slow
 def test_recover_without_detections_and_station_ba(lost_camera):
     """A 12 deg re-aim with translation, the camera's own (associated) points: the rotation fit of
     detect_moves cannot follow, recovery re-places it and the station BA starts from it."""
@@ -152,6 +154,7 @@ def test_recover_without_detections_and_station_ba(lost_camera):
     assert rep.error < 1.0 and sn in rep.stations['names']
 
 
+@pytest.mark.slow
 def test_w4_lost_but_unmoved_camera_is_reassociated_not_moved(lost_camera):
     rig, rigb, cb, tb, t, p, assoc, det = lost_camera
     a2 = assoc.copy()
@@ -168,6 +171,7 @@ def test_w4_lost_but_unmoved_camera_is_reassociated_not_moved(lost_camera):
     np.testing.assert_allclose(got[np.isfinite(got)], p[0, post][np.isfinite(got)])
 
 
+@pytest.mark.slow
 def test_w4_step_inside_bad_windows_is_demoted():
     """A camera 'rotated' only while two other cameras deliver garbage (broken data at the start):
     the step's short side lies in bad time windows, so it is not reported as a moved camera."""
@@ -190,6 +194,7 @@ def test_w4_step_inside_bad_windows_is_demoted():
     assert name in old.moves.moved
 
 
+@pytest.mark.slow
 def test_w4_camera_lost_from_the_start_is_placed_per_window(lost_camera):
     """The association never had the bumped camera (tracklets crossing the bump were dropped):
     each window is placed on its own; before the bump it fits its old pose, after it a station."""
@@ -205,6 +210,7 @@ def test_w4_camera_lost_from_the_start_is_placed_per_window(lost_camera):
     assert np.isfinite(ev.points[cb, t < tb - 4]).mean() > 0.9
 
 
+@pytest.mark.slow
 def test_w4_translated_camera_station_has_the_translation():
     """A camera shifted (no rotation): detect_moves sees it as a rotation step of the right camera,
     recovery re-places it with the translation (PnP) in the station pose."""
@@ -227,6 +233,7 @@ def test_w4_translated_camera_station_has_the_translation():
     np.testing.assert_allclose(E[:3, 3], synth.to_np(rb.cameras[3].get_extrinsics_mat())[:3, 3], atol=0.003 * s)
 
 
+@pytest.mark.slow
 def test_w4_recovery_splits_a_second_bump():
     rig = synth.load_rig('fisheye_5cam')
     F, Pn, cb = 300, 3, 2
@@ -250,6 +257,7 @@ def test_w4_recovery_splits_a_second_bump():
     np.testing.assert_allclose([cp['step_deg'] for cp in cps], [np.linalg.norm(r1), np.linalg.norm(r2)], atol=0.15)
 
 
+@pytest.mark.slow
 def test_w4_small_reaim_of_a_lost_camera_is_recovered():
     rig = synth.load_rig('fisheye_5cam')
     F, Pn, cb, tb = 300, 3, 2, 16.0
