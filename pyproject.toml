@@ -49,7 +49,7 @@ sync = ["soundfile", "av"]
 all = ["huggingface_hub", "onnxruntime", "onnx", "vggt", "soundfile", "av"]
 
 [project.urls]
-Homepage = "https://github.com/lambdaloop/anipose-lib/tree/pytorch"
+Homepage = "https://github.com/lambdaloop/aniposelib"
 
 [tool.setuptools]
 packages = ["aniposelib", "aniposelib.detectors", "aniposelib.init", "aniposelib.workflows"]
